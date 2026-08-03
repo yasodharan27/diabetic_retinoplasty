@@ -156,6 +156,9 @@ python generate_all_visualizations.py
 Creates comprehensive visualizations for research papers or presentations.
 
 ## 📈 Results
+
+> **Note:** The table below matches the placeholder/sample values hardcoded as fallback data in `Visualization_Scripts/create_publication_tables.py` (used when no real `model_comparison.csv` is present) rather than a verified `classification_report` run on held-out test data. Treat these numbers as illustrative until they are regenerated from an actual evaluation run.
+
 Performance Metrics
 |Model        | No DR  | Mild	| Moderate | Severe | Proliferative | Average |
 |-------------|--------|--------|----------|--------|---------------|---------|

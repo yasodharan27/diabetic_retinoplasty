@@ -5,13 +5,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.models import load_model
-from dotenv import load_dotenv
-load_dotenv()
+from config import BASE_PATH, PROCESSED_IMAGES_DIR, MODEL_PATH, RETRAINED_MODEL_PATH
 
-BASE_PATH = os.environ.get('BASE_PATH')
-PROCESSED_IMAGES_DIR = os.environ.get('PROCESSED_IMAGES_DIR')
-MODEL_PATH = os.environ.get('MODEL_PATH')
-RETRAINED_MODEL_PATH = os.environ.get('RETRAINED_MODEL_PATH')
 BATCH_SIZE = 8
 EPOCHS = 10
 TARGET_SIZE = (224, 224)

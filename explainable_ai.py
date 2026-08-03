@@ -4,8 +4,6 @@ import matplotlib.pyplot as plt
 import cv2
 import os
 from tqdm import tqdm
-from dotenv import load_dotenv
-load_dotenv()
 
 from swin_transformer import (
     PatchEmbed, WindowAttention, SwinTransformerBlock,
@@ -13,6 +11,7 @@ from swin_transformer import (
     window_partition, window_reverse
 )
 from test_hybrid_model import Cast
+from config import BASE_PATH, MODEL_PATH, PROCESSED_TEST_DIR, RESULTS_DIR
 
 physical_devices = tf.config.list_physical_devices('GPU')
 if len(physical_devices) > 0:
@@ -23,10 +22,6 @@ if len(physical_devices) > 0:
     except:
         print("Invalid device or cannot modify virtual devices once initialized")
 
-BASE_PATH = os.environ.get('BASE_PATH')
-MODEL_PATH = os.environ.get('MODEL_PATH')
-PROCESSED_TEST_DIR = os.environ.get('PROCESSED_TEST_DIR')
-RESULTS_DIR = os.environ.get('RESULTS_DIR')
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def load_model():

@@ -1,15 +1,9 @@
 import os
 import tensorflow as tf
-import keras
 from keras import layers, Model, Input
 from keras.applications import EfficientNetB0
 import matplotlib.pyplot as plt
-from dotenv import load_dotenv
-load_dotenv()
-
-BASE_PATH = os.environ.get('BASE_PATH')
-PROCESSED_IMAGES_DIR = os.environ.get('PROCESSED_IMAGES_DIR')
-MODEL_SAVE_PATH = os.environ.get('MODEL_SAVE_PATH')
+from config import BASE_PATH, PROCESSED_IMAGES_DIR, MODEL_SAVE_PATH
 BATCH_SIZE = 8
 IMAGE_SIZE = (224, 224)
 NUM_CLASSES = 5

@@ -5,8 +5,7 @@ import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
 from swin_transformer import create_hybrid_model
 import time
-from dotenv import load_dotenv
-load_dotenv()
+from config import BASE_PATH, PROCESSED_IMAGES_DIR, MODEL_SAVE_PATH
 
 physical_devices = tf.config.list_physical_devices('GPU')
 if len(physical_devices) > 0:
@@ -21,9 +20,6 @@ policy = tf.keras.mixed_precision.Policy('mixed_float16')
 tf.keras.mixed_precision.set_global_policy(policy)
 print("Mixed precision enabled")
 
-BASE_PATH = os.environ.get('BASE_PATH')
-PROCESSED_IMAGES_DIR = os.environ.get('PROCESSED_IMAGES_DIR')
-MODEL_SAVE_PATH = os.environ.get('MODEL_SAVE_PATH')
 BATCH_SIZE = 4
 IMAGE_SIZE = (224, 224)
 NUM_CLASSES = 5

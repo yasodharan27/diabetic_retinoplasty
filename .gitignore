@@ -1,7 +1,30 @@
 .vscode
+.venv/
 basic.txt
 Diabetic-Retinopathy-Detection-A-Hybrid-Bayesian-Transformer-AI-Model.pptx
 Potential Interview Questions for Your Diabetic Re.pdf
 description.docx
 description_text.txt
 diabetic_retinoplasty.code-workspace
+# Datasets
+datasets/
+
+# Trained models
+trained_models/
+
+# Results
+results/
+
+# TensorBoard logs
+logs/
+tensorboard_logs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Trained models
+trained_models/
+models/**/*.keras
+models/**/*.h5
+models/**/*.weights.h5

@@ -6,13 +6,8 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report
 from tqdm import tqdm
-from dotenv import load_dotenv
-load_dotenv()
+from config import BASE_PATH, PROCESSED_TEST_DIR, MODEL_PATH, RESULTS_DIR
 
-BASE_PATH = os.environ.get('BASE_PATH')
-PROCESSED_TEST_DIR = os.environ.get('PROCESSED_TEST_DIR')
-MODEL_PATH = os.environ.get('MODEL_PATH')
-RESULTS_DIR = os.environ.get('RESULTS_DIR')
 TARGET_SIZE = (224, 224)
 BATCH_SIZE = 8
 

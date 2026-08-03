@@ -1,11 +1,8 @@
-import keras
 import tensorflow as tf
 from tensorflow.keras import layers, Model, Input
 import numpy as np
 import os
-import math
-from dotenv import load_dotenv
-load_dotenv()
+import config  # noqa: F401  (ensures .env is loaded once via the shared config module)
 
 class PatchEmbed(layers.Layer):
     def __init__(self, patch_size=4, embed_dim=96, norm_layer=None):

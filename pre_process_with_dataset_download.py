@@ -6,14 +6,8 @@ from sklearn.model_selection import train_test_split
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from dotenv import load_dotenv
-load_dotenv()
+from config import BASE_PATH, CSV_PATH, IMAGE_DIR, OUTPUT_DIR, PROCESSED_IMAGES_DIR
 
-BASE_PATH = os.environ.get('BASE_PATH')
-CSV_PATH = os.environ.get('CSV_PATH')
-IMAGE_DIR = os.environ.get('IMAGE_DIR')
-OUTPUT_DIR = os.environ.get('OUTPUT_DIR')
-PROCESSED_IMAGES_DIR = os.environ.get('PROCESSED_IMAGES_DIR')
 TARGET_SIZE = (224, 224)
 BATCH_SIZE = 8
 

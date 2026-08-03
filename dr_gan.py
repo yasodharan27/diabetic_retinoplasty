@@ -8,8 +8,7 @@ import pandas as pd
 from tqdm import tqdm
 import cv2
 from sklearn.model_selection import train_test_split
-from dotenv import load_dotenv
-load_dotenv()
+from config import BASE_PATH, PROCESSED_IMAGES_DIR, GAN_IMAGES_DIR, MODEL_SAVE_PATH
 
 physical_devices = tf.config.list_physical_devices('GPU')
 if len(physical_devices) > 0:
@@ -20,10 +19,6 @@ if len(physical_devices) > 0:
     except:
         print("Failed to enable memory growth")
 
-BASE_PATH = os.environ.get('BASE_PATH')
-PROCESSED_IMAGES_DIR = os.environ.get('PROCESSED_IMAGES_DIR')
-GAN_IMAGES_DIR = os.environ.get('GAN_IMAGES_DIR')
-MODEL_SAVE_PATH = os.environ.get('MODEL_SAVE_PATH')
 LATENT_DIM = 128
 IMAGE_SIZE = (224, 224)
 CHANNELS = 1
