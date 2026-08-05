@@ -8,8 +8,8 @@ early stopping, ReduceLROnPlateau, TensorBoard, and resume support all come
 from `training.Trainer` and are not reimplemented here.
 
 Per the project's training policy, real training runs happen in Google
-Colab (notebooks/01_image_quality_assessment.ipynb, which calls into the
-same two modules). This script is the equivalent local/CLI entry point,
+Colab (colab/notebooks/01_image_quality_assessment.ipynb, which calls into
+the same two modules). This script is the equivalent local/CLI entry point,
 useful for quick local runs or as the reference the notebook mirrors.
 """
 

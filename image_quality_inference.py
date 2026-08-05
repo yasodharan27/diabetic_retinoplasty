@@ -2,7 +2,7 @@
 Inference for the Image Quality Assessment module.
 
 Loads the exported IQA model (a complete `.keras` model -- see
-train_image_quality.py / notebooks/01_image_quality_assessment.ipynb) and
+train_image_quality.py / colab/notebooks/01_image_quality_assessment.ipynb) and
 exposes reusable prediction functions -- single-image (`predict_quality`)
 and folder-batch (`predict_quality_batch`, `generate_iqa_csv`) -- so later
 pipeline stages (the Step 2 preprocessing gate, and eventually the
@@ -32,7 +32,7 @@ def load_iqa_model(model_path=DEFAULT_MODEL_PATH):
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"No IQA model found at {model_path}. Train the model first "
-            "(train_image_quality.py or notebooks/01_image_quality_assessment.ipynb) "
+            "(train_image_quality.py or colab/notebooks/01_image_quality_assessment.ipynb) "
             "and export the best checkpoint to this location."
         )
     return tf.keras.models.load_model(model_path)
