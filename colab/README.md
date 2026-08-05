@@ -2,8 +2,10 @@
 
 Official Google Colab training environment for this repository, and the reusable infrastructure
 for **every** stage of the 11-stage target pipeline (`PROJECT_CODE.md`, `PROJECT_STRUCTURE.md`) --
-not just Image Quality Assessment. Every stage trains against datasets stored in Google Drive,
-with all outputs written back to Drive so nothing important is lost when a Colab VM recycles.
+not just Image Quality Assessment. Every dataset's master copy lives on Google Drive; each
+session **stages** (copies) the dataset it needs onto the Colab VM's local SSD once, so per-epoch
+training I/O never crosses the slow Drive mount (see "Dataset Staging" below). All outputs are
+written back to Drive so nothing important is lost when a Colab VM recycles.
 
 `colab/common/` holds only Colab-specific orchestration code -- mounting Drive, verifying the
 environment/dataset, managing experiment folders. Actual model/dataset/training/evaluation logic
@@ -24,6 +26,7 @@ colab/
 │   ├── setup.py                   one-call setup: mount Drive, clone repo, install deps, chdir, env vars
 │   ├── verify_environment.py      aborting environment checks, built on environment.py
 │   ├── verify_dataset.py          aborting EyeQ dataset checks (structure, counts, corruption)
+│   ├── dataset_staging.py         copies a dataset from Drive to the local SSD, verifies the copy
 │   └── experiment_manager.py      isolated, timestamped experiment folders + metadata.json
 └── notebooks/
     ├── stage01_iqa.ipynb                       Image Quality Assessment -- fully implemented
@@ -53,7 +56,8 @@ notebook" below before writing training code into one of them.
 | `environment.py` | Low-level, non-aborting info-gathering and setup actions: Python/TensorFlow/Keras/CUDA versions, GPU device/name/memory, git commit hash, missing-package detection. Reuses `training.check_gpu` / `training.enable_mixed_precision` rather than reimplementing them. |
 | `setup.py` | The one function (`setup.setup()`) every stage notebook calls to mount Drive, clone/update the repository, install `requirements.txt`, `cd` into the repository, and point `EYEQ_RAW_DIR` at Drive. Also writes a session log to Drive's global `logs/`. |
 | `verify_environment.py` | Pass/fail checks built on `environment.py`: Python version, TensorFlow version, GPU availability, CUDA, mixed precision, repository path, Google Drive mount, required packages. Every check raises `RuntimeError` with a specific message on failure -- nothing here is caught or swallowed. |
-| `verify_dataset.py` | Verifies the EyeQ dataset: directory/`labels.csv`/image-folder existence, image counts, missing images, a corrupted-image spot check, and class distribution. Reuses `image_quality_dataset._read_labels` / `_decode_image` directly rather than re-implementing file/JPEG checks. Returns a structured `EyeQVerificationReport`; raises on any failed check. EyeQ-specific today (only Stage 1 is implemented) -- see "How to build out a stage notebook" for what a future stage's dataset verification should look like. |
+| `verify_dataset.py` | Verifies the EyeQ dataset: directory/`labels.csv`/image-folder existence, image counts, missing images, a corrupted-image spot check, and class distribution. Reuses `image_quality_dataset._read_labels` / `_decode_image` directly rather than re-implementing file/JPEG checks. Returns a structured `EyeQVerificationReport`; raises on any failed check. EyeQ-specific today (only Stage 1 is implemented), but it doesn't care whether the `raw_dir` it's pointed at is on Drive or the local SSD -- see "Dataset Staging" below. |
+| `dataset_staging.py` | Copies a dataset's Drive master directory to the Colab VM's local SSD once per session (`stage_dataset()`), and verifies the copy (`verify_staged_copy()`). Dataset-agnostic: the caller passes which Drive directory to stage and what to name it locally -- nothing here is hardcoded to EyeQ, so the same functions work for APTOS2019/IDRiD once those stages exist. Read-only with respect to Drive; never writes back to it. See "Dataset Staging" below. |
 | `experiment_manager.py` | Creates a new, isolated, timestamped folder per training run under `experiments/<Module>/`, with `checkpoints/`, `logs/`, `tensorboard/`, `evaluation/`, `predictions/` subfolders and a `metadata.json`. Also supports resuming into an existing experiment folder. Generic across modules -- pass any `colab_config.DRIVE.experiment_dir("<Module>")`. |
 
 ### Purpose of each notebook
@@ -138,6 +142,89 @@ automatically).
 
 ---
 
+## Dataset Staging
+
+### Why
+
+Google Drive's FUSE mount (`/content/drive`) is latency-bound per file open, not
+bandwidth-bound. This project's `tf.data` pipelines (`image_quality_dataset.py`) don't cache
+decoded images, so every training epoch re-reads every training image from its source directory
+-- reading directly from Drive means paying that per-file latency tax on every single epoch, not
+just once. Copying the dataset to the Colab VM's local SSD once, at the start of a session, turns
+every subsequent epoch's reads into fast local I/O instead.
+
+### How it works
+
+1. Each stage notebook calls `dataset_staging.stage_dataset(<drive_dir>, "<name>")` once, near
+   the top of its Dataset Loading section -- `stage01_iqa.ipynb` calls
+   `dataset_staging.stage_dataset(colab_config.EYEQ_RAW_DIR, "EyeQ")`.
+2. Every file under the Drive source directory is copied to `/content/datasets/<name>/` using a
+   16-worker thread pool by default -- Drive's FUSE mount tolerates meaningful concurrency, so
+   overlapping many small-file copies cuts wall-clock staging time substantially versus a naive
+   sequential copy, where each blocking file open is serialized behind the last.
+3. `dataset_staging.verify_staged_copy()` re-counts files and total bytes on the Drive side and
+   compares against the local copy -- a generic, dataset-structure-agnostic check that raises
+   immediately on any mismatch.
+4. The stage's own dataset verifier (e.g. `verify_dataset.verify_eyeq_dataset()`) is run again,
+   this time against the staged local directory, for a deeper check (`labels.csv` presence,
+   per-split image counts, a corrupted-image spot check) -- completely unmodified, since it
+   already accepts any `raw_dir` path and has no idea whether that path is on Drive or local disk.
+5. Every downstream call that reads dataset images (`load_eyeq_datasets()`, `train()`,
+   `evaluate()`, sample predictions) is pointed at the staged local directory
+   (`staged_eyeq.local_dir`), not `colab_config.EYEQ_RAW_DIR`.
+
+Staging is **idempotent**: if `/content/datasets/<name>/` already exists, the copy is skipped
+(pass `force=True` to re-copy from scratch). This matters because a Colab session reconnect, or
+simply re-running the Dataset Loading cell, should not re-copy tens of thousands of files it
+already has.
+
+The Drive master copy is **read-only** from `dataset_staging.py`'s perspective -- it only ever
+reads from the Drive source and writes to the local destination, never the reverse. The staged
+local copy itself is disposable (it lives under `/content`, wiped whenever the Colab VM recycles)
+and is never treated as an output -- checkpoints, logs, evaluation results, and the exported model
+all still go to Google Drive exactly as before (see "Where outputs are saved").
+
+### Making this reusable for a future stage
+
+Nothing in `dataset_staging.py` is EyeQ-specific -- which dataset a notebook stages is entirely
+up to that notebook, not hardcoded in the staging module. A future `stage04_lesion_segmentation.ipynb`
+would stage IDRiD the same way:
+
+```python
+staged_idrid = dataset_staging.stage_dataset(colab_config.IDRID_DATASET_DIR, "IDRiD")
+dataset_staging.verify_staged_copy(staged_idrid)
+# + that stage's own dataset verifier, if one exists, against staged_idrid.local_dir
+```
+
+`colab_config.py` already exposes `EYEQ_RAW_DIR`, `APTOS2019_DATASET_DIR`, and
+`IDRID_DATASET_DIR` for exactly this -- no changes to `colab_config.py` or `dataset_staging.py`
+are needed to stage a different dataset.
+
+### Expected speed improvement (estimate)
+
+**This is an estimate, not a measured benchmark.** It's reasoned from this project's actual,
+verified EyeQ dataset size (12,543 train-pool images, 16,249 held-out test images -- see
+`docs/FIRST_TRAINING_CHECKLIST.md`) and commonly-reported Google Drive FUSE mount latency
+characteristics on Colab, not from a real training run on this specific data (this development
+environment has no GPU/Colab access to measure it directly). `stage_dataset()` prints its own
+real elapsed time and files/s rate every time it runs -- treat that as ground truth once you
+actually run it, and update this section with real numbers from a real session.
+
+| | Reading from Drive (before) | Reading from local SSD (after) |
+|---|---|---|
+| Typical per-file open latency (commonly reported for Colab's Drive FUSE mount vs. local disk) | ~50-200 ms | well under 1 ms |
+| Images read per training epoch | ~12,543 (full train pool: shuffled train split + validation split, re-read every epoch since nothing is cached) | same |
+| Estimated per-epoch I/O-wait cost | on the order of many minutes if requests were fully serialized; `tf.data`'s parallel reads overlap some of this, but Drive FUSE mounts commonly throttle/serialize small-file concurrency more than local disk does, so real-world impact is typically still a large multiple of local-disk time | a small fraction of a second -- I/O effectively stops being the bottleneck; epoch time becomes compute-bound (decode + forward + backward pass) instead |
+| One-time cost this change adds | none | staging ~28,792 files (train + test) once per session -- expect this to take on the order of minutes with the default 16-worker parallel copy; the exact number is printed by `stage_dataset()` |
+
+**Net effect over a full 50-epoch run:** even under a conservative reading, a few minutes spent
+staging once is much smaller than a recurring per-epoch Drive I/O tax paid 50 times over -- this
+should be a large net win for any run beyond a handful of epochs. Exact numbers depend on your
+specific Colab runtime, network conditions, and Drive account tier; run the notebook once and
+read `stage_dataset()`'s printed output for a real, session-specific number.
+
+---
+
 ## How to open a notebook
 
 1. Upload the notebook (e.g. `colab/notebooks/stage01_iqa.ipynb`) to Google Colab (File > Upload
@@ -151,8 +238,11 @@ Run `stage01_iqa.ipynb`'s cells top to bottom (the only stage with real training
 manual edits are required if your Drive matches the layout above. The notebook will:
 
 1. **Setup** -- mount Drive, clone the repo, install requirements, `cd` into it.
-2. **Verification** -- abort with a clear error if the environment or dataset isn't ready.
-3. **Dataset Loading** -- pick a batch size, create a new experiment folder, load EyeQ.
+2. **Verification** -- abort with a clear error if the environment or dataset isn't ready (checked
+   against the Drive master copy).
+3. **Dataset Loading** -- pick a batch size, create a new experiment folder, **stage EyeQ onto the
+   local SSD and verify the copy** (see "Dataset Staging" above), then load EyeQ from the staged
+   local copy.
 4. **Model Creation** -- build and preview the EfficientNetB0 architecture.
 5. **Training** -- call `train_image_quality.train()`, writing checkpoints and TensorBoard logs
    directly to this run's Drive experiment folder.
@@ -227,9 +317,13 @@ implementation:
    `colab/common/verify_environment.py` unchanged; write a stage-specific dataset verification
    function (mirroring `verify_dataset.verify_eyeq_dataset()`'s shape) only if that stage's
    dataset needs different checks than EyeQ's.
-4. Use `experiment_manager.resolve_experiment(colab_config.DRIVE.experiment_dir("<Module>"), ...)`
+4. In Dataset Loading, stage that stage's dataset onto local disk with
+   `dataset_staging.stage_dataset(colab_config.<DATASET>_DIR, "<Name>")` before loading it --
+   don't read training images directly from Drive (see "Dataset Staging" above). Reuse
+   `dataset_staging.py` unchanged; it takes the Drive directory and a name, nothing stage-specific.
+5. Use `experiment_manager.resolve_experiment(colab_config.DRIVE.experiment_dir("<Module>"), ...)`
    for experiment isolation -- do not invent a different output-folder scheme.
-5. Update this README's "Purpose of each notebook" table and `PROJECT_STRUCTURE.md`'s matching
+6. Update this README's "Purpose of each notebook" table and `PROJECT_STRUCTURE.md`'s matching
    pipeline-stage entry to reflect the new status.
 
 ## Common Troubleshooting
@@ -249,6 +343,16 @@ implementation:
 | `verify_google_drive_mounted` raises "Google Drive does not appear to be mounted" | `setup.setup()`'s Drive mount step didn't complete -- re-run Setup, and accept Colab's authorization prompt. |
 | `verify_eyeq_dataset` raises "EyeQ raw dataset directory not found" | Your Drive doesn't match the layout above. Confirm `MyDrive/DiabeticRetinopathy/datasets/EyeQ/raw/{train,test}` exists exactly, with correct capitalization (`DiabeticRetinopathy`, `EyeQ`). |
 | Experiment folders appear to go missing between sessions | Confirm you're mounting the same Google account's Drive every session -- `experiments/` lives under that account's `MyDrive`, not shared/organization Drive unless explicitly configured. |
+
+### Dataset staging issues
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `stage_dataset` raises "does not exist on Drive" | The Drive source directory is wrong or Drive isn't mounted -- confirm `colab_config.EYEQ_RAW_DIR` (or whichever dataset constant you passed) resolves correctly and Section 2's Verification already passed against it. |
+| `verify_staged_copy` raises a file-count or byte-count mismatch | The copy was interrupted (e.g. a Drive disconnect mid-copy) -- re-run the staging cell with `force=True` to discard the partial local copy and re-stage from scratch. |
+| Staging seems to hang or is much slower than expected | Drive may be throttling under high concurrency -- try a lower `max_workers` (e.g. `stage_dataset(..., max_workers=4)`); very large datasets will also simply take longer the first time regardless of concurrency. |
+| Local SSD fills up (`OSError: No space left on device`) | The Colab VM's local disk is finite and shared with the repository clone, pip packages, etc. -- a single dataset should fit comfortably, but staging multiple large datasets in the same session may not; stage only what the current notebook actually needs. |
+| Training still seems Drive-bound after staging | Confirm the training/evaluation calls were actually updated to use `staged_<name>.local_dir`, not the original `colab_config.<DATASET>_DIR` -- staging alone does nothing if downstream code still reads from Drive. |
 
 ### Resume issues
 
@@ -278,10 +382,14 @@ Run Bootstrap + Setup  ---------------------->  Drive mounted, repo cloned, deps
 Run Verification  ---------------------------->  aborts here if environment/dataset isn't ready
         |
         v
-Run Dataset Loading + Model Creation  -------->  new experiment folder created on Drive
+Run Dataset Loading  -------------------------->  dataset staged Drive -> local SSD + verified,
+        |                                          new experiment folder created on Drive
+        v
+Run Model Creation  ---------------------------->  architecture previewed
         |
         v
-Run Training  --------------------------------->  checkpoints + TensorBoard logs stream to Drive
+Run Training  --------------------------------->  reads staged local data; checkpoints + TensorBoard
+        |                                          logs stream to Drive
         |
         v
 Run Evaluation  -------------------------------->  plots + sample predictions written to Drive
