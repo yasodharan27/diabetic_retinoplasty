@@ -9,18 +9,148 @@ A hybrid deep learning framework for automated diabetic retinopathy detection wi
 
 ![Diabetic Retinopathy System](assets/research_summary_dashboard.png)
 
+> **Repository status:** this repository contains two things side by side -- the **original
+> baseline** (documented in the sections below: APTOS-only, Ben Graham preprocessing, the
+> EfficientNet+Swin hybrid model, GAN augmentation, MC Dropout, Grad-CAM) and the **actively
+> developed target architecture**, an 11-stage pipeline being built out incrementally per
+> `PROJECT_CODE.md`. See [Repository Status & Target Architecture](#-repository-status--target-architecture)
+> below for what's real today versus planned, before relying on anything described further down.
+
 ## 📋 Table of Contents
 
-- [Overview](#-overview)
-- [Features](#-features)
-- [Model Architecture](#-model-architecture)
-- [Dataset](#-dataset)
+- [Repository Status & Target Architecture](#-repository-status--target-architecture)
+  - [Pipeline Diagram](#pipeline-diagram)
+  - [Dataset Summary](#dataset-summary)
+  - [Folder Structure](#folder-structure)
+  - [Development Workflow](#development-workflow)
+  - [Training Workflow](#training-workflow)
+  - [Experiment Workflow](#experiment-workflow)
+  - [Current Implementation Status](#current-implementation-status)
+  - [Future Roadmap](#future-roadmap)
+- [Baseline Overview](#-overview)
+- [Baseline Features](#-features)
+- [Baseline Model Architecture](#-model-architecture)
+- [Baseline Dataset](#-dataset)
 - [Installation](#-installation)
-- [Usage](#-usage)
-- [Results](#-results)
-- [Future Work](#-future-work)
+- [Baseline Usage](#-usage)
+- [Baseline Results](#-results)
+- [Future Work (baseline)](#-future-work)
 - [References](#-references)
 - [Contributing](#-contributing)
+
+---
+
+## 🏛️ Repository Status & Target Architecture
+
+The target architecture is an 11-stage, end-to-end diabetic retinopathy pipeline -- full detail
+in `PROJECT_CODE.md` (rules and target design) and `PROJECT_STRUCTURE.md` (master architectural
+reference: every folder's purpose, every stage's input/output/dataset/status, output locations,
+and the project rules). This section is a summary; those two files are authoritative.
+
+### Pipeline Diagram
+
+```
+ [1] Image Quality Assessment  --(Good/Usable only)-->  [2] Image Preprocessing
+                                                                  |
+                                                                  v
+                                          [3] Vessel Segmentation (pretrained, inference-only)
+                                                                  |
+                                                                  v
+                                          [4] Lesion Segmentation (trained on IDRiD)
+                                                                  |
+                        +-----------------------------------------+
+                        v                                         v
+        [5] Local Feature Extraction              [6] Global Feature Extraction
+           (Adaptive Multi-Kernel CNN)               (Dual-Scale Swin Transformer)
+                        |                                         |
+                        +-----------------> [7] Feature Fusion <--+
+                                          (Adaptive Cross-Attention)
+                                                    |
+                                                    v
+                                    [8] CORN Ordinal Classification
+                                        (trained on APTOS 2019)
+                                                    |
+                        +---------------------------+---------------------------+
+                        v                                                       v
+        [9] Uncertainty Estimation                                [10] Explainability
+           (Monte Carlo Dropout)                          (Grad-CAM++, SHAP, Attention Rollout)
+                        |                                                       |
+                        +---------------------------+---------------------------+
+                                                    v
+                                          [11] Evaluation
+                                (end-to-end, held-out test set, real metrics only)
+```
+
+### Dataset Summary
+
+| Dataset | Used by | Status |
+|---|---|---|
+| **EyeQ** | Stage 1 (Image Quality Assessment) | Local copy present, verified (`colab/common/verify_dataset.py`) |
+| **APTOS 2019** | Stage 8 (CORN Classification); also the pre-refactor baseline below | Local copy present |
+| **IDRiD** | Stage 4 (Lesion Segmentation) | Local copy present, not yet consumed by any implemented stage |
+| **EyePACS** | Historical only | Used once, outside this repository, to reconstruct EyeQ. Not present under `datasets/`; not required to run anything here. |
+
+See `PROJECT_STRUCTURE.md`'s Dataset Organization for current vs. future usage per dataset.
+
+### Folder Structure
+
+```
+diabetic_retinoplasty/
+├── *.py                    # flat top-level pipeline modules (no src/ layout)
+├── training/                # reusable training framework (Trainer, callbacks, losses, metrics)
+├── evaluation/               # reusable evaluation framework (Evaluator, metrics, visualization)
+├── pipeline/                  # ABC contracts for future trainable/inference stages
+├── datasets/                   # EyeQ/, APTOS2019/, IDRiD/ -- raw/ is read-only, never modified
+├── colab/                        # official Colab training infrastructure
+│   ├── common/                    # setup, verification, experiment management (shared by every stage)
+│   └── notebooks/                  # stage01_iqa.ipynb (implemented) + stage02-11 (templates)
+├── tests/                          # pytest unit tests, synthetic/temporary data only
+├── docs/                            # operational runbooks (e.g. FIRST_TRAINING_CHECKLIST.md)
+├── research_papers/                  # background reading
+├── PROJECT_CODE.md                    # target architecture + development rules (canonical)
+├── PROJECT_STRUCTURE.md                # master architectural reference (this summary's source)
+├── IMPLEMENTATION_PLAN.md               # baseline-vs-target gap analysis
+└── SEGMENTATION_ARCHITECTURE.md          # Vessel/Lesion Segmentation design
+```
+
+### Development Workflow
+
+Per `PROJECT_CODE.md`: understand the existing implementation, explain why it needs to change,
+propose a plan, wait for approval, implement one module at a time, verify integration, stop.
+Local development happens in VS Code (+ Claude Code for structured implementation work); all real
+model training happens in Google Colab. See `PROJECT_STRUCTURE.md`'s Local Development Workflow
+section for how these tools interact.
+
+### Training Workflow
+
+1. Implement/verify a stage's dataset loader, model, and training entry point locally (small
+   real-data smoke tests only -- no local GPU, no fabricated results).
+2. Open the matching `colab/notebooks/stageNN_*.ipynb` in Google Colab.
+3. Run it top to bottom: Setup -> Verification -> Dataset Loading -> Model Creation -> Training ->
+   Evaluation -> Export (see `colab/README.md`).
+4. Review results locally; commit the exported model deliberately (never automatically).
+
+### Experiment Workflow
+
+Every Colab training run gets its own isolated, timestamped folder on Google Drive under
+`experiments/<Module>/<timestamp>/` (`checkpoints/`, `logs/`, `tensorboard/`, `evaluation/`,
+`predictions/`, `metadata.json`) -- never overwritten, resumable by pointing a later run at the
+same folder. See `colab/README.md`'s "How experiments are organized".
+
+### Current Implementation Status
+
+| Stage | Status |
+|---|---|
+| 1. Image Quality Assessment | **Implemented**, not yet trained for real -- see `docs/FIRST_TRAINING_CHECKLIST.md` |
+| 2. Image Preprocessing | Transform logic exists (`image_preprocessing.py`); not yet wired into a Colab notebook |
+| 3-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
+
+### Future Roadmap
+
+Implement Stages 2-11 one at a time, per `PROJECT_CODE.md`'s "one module at a time, wait for
+approval" rule -- see `IMPLEMENTATION_PLAN.md` for the detailed gap analysis driving this order.
+
+---
 
 ## 🔍 Overview
 
