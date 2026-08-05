@@ -141,9 +141,30 @@ same folder. See `colab/README.md`'s "How experiments are organized".
 
 | Stage | Status |
 |---|---|
-| 1. Image Quality Assessment | **Implemented**, not yet trained for real -- see `docs/FIRST_TRAINING_CHECKLIST.md` |
-| 2. Image Preprocessing | Transform logic exists (`image_preprocessing.py`); not yet wired into a Colab notebook |
+| 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end in Google Colab; see Stage 1 Baseline Results below. |
+| 2. Image Preprocessing | **Ready to Begin.** Transform logic already exists (`image_preprocessing.py`); not yet wired into a Colab notebook. |
 | 3-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
+
+### Stage 1 Baseline Results
+
+Held-out EyeQ test split (16,249 images, never used in training or validation), from the
+completed and verified Stage 1 run (`colab/notebooks/stage01_iqa.ipynb`, experiment
+`2026-08-05_09-11-28`):
+
+| Metric | Value |
+|---|---|
+| Accuracy | 88.05% |
+| F1 Score | 86.12% |
+| AUC | 96.48% |
+| Quadratic Weighted Kappa (QWK) | 0.8987 |
+
+EfficientNetB0 (ImageNet-pretrained) with mixed precision (`mixed_float16`); best validation
+checkpoint occurred at Epoch 2, `ReduceLROnPlateau` reduced the learning rate twice, and
+`EarlyStopping` (patience 8) stopped training at Epoch 10 and restored the Epoch 2 weights -- the
+exported model is that Epoch 2 checkpoint, not the final epoch's. Full detail, including exact
+output locations on Google Drive, is recorded in `colab/notebooks/stage01_iqa.ipynb`'s Section 7
+and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record. No metrics beyond the four above
+are claimed as part of this baseline.
 
 ### Future Roadmap
 

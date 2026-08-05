@@ -91,7 +91,7 @@ implemented and verified today, not aspirational state.
 - **Training dataset:** EyeQ.
 - **Inference output:** `{"label", "class_index", "confidence", "probabilities"}` per image (see `image_quality_inference.predict_quality`).
 - **Dependencies:** None (first stage).
-- **Status:** **Implemented and verified.** `image_quality_dataset.py`, `image_quality_model.py`, `train_image_quality.py`, `evaluate_image_quality.py`, `image_quality_inference.py`, `colab/notebooks/stage01_iqa.ipynb`. Not yet trained for real -- see `docs/FIRST_TRAINING_CHECKLIST.md`.
+- **Status:** **Completed -- Verified -- Baseline Established.** `image_quality_dataset.py`, `image_quality_model.py`, `train_image_quality.py`, `evaluate_image_quality.py`, `image_quality_inference.py`, `colab/notebooks/stage01_iqa.ipynb`. Trained end-to-end in Google Colab (experiment `2026-08-05_09-11-28`) -- held-out test accuracy 88.05%, F1 86.12%, AUC 96.48%, QWK 0.8987; see `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record for full detail.
 
 ### 2. Image Preprocessing
 - **Purpose:** CLAHE, Gamma Correction, Green Channel Extraction, Ben Graham preprocessing, Median Denoising, resizing, augmentation.
@@ -99,8 +99,8 @@ implemented and verified today, not aspirational state.
 - **Output:** Normalized images in `datasets/*/processed/`.
 - **Training dataset:** N/A (deterministic image transform, not a trained model).
 - **Inference output:** Preprocessed image, ready for Stages 3+.
-- **Dependencies:** Stage 1.
-- **Status:** **Partially implemented.** `image_preprocessing.py` (repository root) implements the transforms and `config.py`'s `PREPROCESSING_PROFILES` (`IQA` = no-op, `DR` = full pipeline); not yet wired into a Colab notebook (`colab/notebooks/stage02_preprocessing.ipynb` is a template only).
+- **Dependencies:** Stage 1 (now completed and verified -- see above).
+- **Status:** **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms and `config.py`'s `PREPROCESSING_PROFILES` (`IQA` = no-op, `DR` = full pipeline); not yet wired into a Colab notebook (`colab/notebooks/stage02_preprocessing.ipynb` is a template only).
 
 ### 3. Vessel Segmentation
 - **Purpose:** Segment retinal vasculature.

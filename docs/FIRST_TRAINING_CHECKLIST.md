@@ -4,6 +4,11 @@ Official, step-by-step checklist for the first real Image Quality Assessment tra
 and for every subsequent training run of any stage, once implemented. Run through this in order;
 do not skip to "Full 50-epoch launch" without completing the smoke test steps first.
 
+**Stage 1 has already completed this checklist successfully** -- see "Completed Run Record"
+at the end of this document for the verified baseline results. This checklist remains the
+official process for every future training run (Stage 1 re-runs, or any other stage once
+implemented), not a one-time record.
+
 Every step below maps to a real cell in `colab/notebooks/stage01_iqa.ipynb` and a real function in
 `colab/common/`. Nothing here is aspirational -- if a step's underlying code doesn't exist yet
 for a future stage's notebook, that stage isn't ready for this checklist yet.
@@ -158,3 +163,56 @@ After a completed full run, confirm every one of these exists on Drive under
 - [ ] Once satisfied with real results, update `README.md`'s Results section (currently
       explicitly flagged as placeholder/illustrative baseline data) -- do not leave fabricated or
       stale numbers in place of real ones.
+
+---
+
+## Completed Run Record -- Stage 1 Baseline (2026-08-05)
+
+This checklist has been followed through to a completed, verified Stage 1 run. Recorded here as
+a real example, and as the official Stage 1 baseline -- this section documents what happened, it
+does not replace the checklist above for future runs (of Stage 1 or any other stage).
+
+**Experiment:** `experiments/IQA/2026-08-05_09-11-28` (Google Drive)
+
+**Held-out test-split metrics** (Step 11/13, EyeQ test split, 16,249 images):
+
+| Metric | Value |
+|---|---|
+| Accuracy | 88.05% |
+| F1 Score | 86.12% |
+| AUC | 96.48% |
+| Quadratic Weighted Kappa (QWK) | 0.8987 |
+
+No additional metrics beyond these four are claimed as part of this baseline.
+
+**Training behavior:**
+- EfficientNetB0 with ImageNet-pretrained weights (first 100 layers frozen); 4,378,278 total
+  parameters.
+- Mixed precision (`mixed_float16`) enabled throughout (GPU: Tesla T4).
+- Best validation loss (0.17268) at **Epoch 2**; `ReduceLROnPlateau` reduced the learning rate
+  twice (`1e-4 -> 5e-5` at Epoch 6, `5e-5 -> 2.5e-5` at Epoch 10); `EarlyStopping` (patience 8,
+  monitoring `val_loss`) stopped training at Epoch 10 and restored the Epoch 2 weights.
+- The exported model corresponds exactly to the Epoch 2 best-validation checkpoint, not the
+  final (Epoch 10) weights.
+
+**Output locations (Google Drive):**
+
+```
+MyDrive/
+└── DiabeticRetinopathy/
+    ├── exported_models/
+    │   └── IQA/
+    │       └── best_model.keras          -- 85.26 MB, this run's best checkpoint
+    └── experiments/
+        └── IQA/
+            └── 2026-08-05_09-11-28/
+                ├── checkpoints/          best.keras, last.keras, metrics.csv, epoch_state.json
+                ├── logs/                 TensorBoard event files
+                ├── tensorboard/          archival copy of logs/
+                ├── evaluation/           confusion matrix, ROC curves, calibration, training history
+                ├── predictions/          sample-prediction visualizations
+                └── metadata.json         run metadata (git commit, hyperparameters, versions)
+```
+
+**Repository status:** Stage 01 (Image Quality Assessment) -- Completed, Verified, Baseline
+Established. Stage 02 (Image Preprocessing) -- Ready to Begin.

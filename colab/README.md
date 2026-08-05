@@ -64,8 +64,8 @@ notebook" below before writing training code into one of them.
 
 | Notebook | Stage | Status |
 |---|---|---|
-| `stage01_iqa.ipynb` | 1. Image Quality Assessment | **Implemented.** Setup -> Verification -> Dataset Loading -> Model Creation -> Training -> Evaluation -> Export, calling `image_quality_dataset.py` / `image_quality_model.py` / `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`. |
-| `stage02_preprocessing.ipynb` | 2. Image Preprocessing | Template. `image_preprocessing.py` (repository root) already implements the transforms this stage needs -- not yet orchestrated here. |
+| `stage01_iqa.ipynb` | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end (held-out test accuracy 88.05%, F1 86.12%, AUC 96.48%, QWK 0.8987 -- see Section 7 of the notebook and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record). Setup -> Verification -> Dataset Loading -> Model Creation -> Training -> Evaluation -> Export, calling `image_quality_dataset.py` / `image_quality_model.py` / `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`. |
+| `stage02_preprocessing.ipynb` | 2. Image Preprocessing | Template -- **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms this stage needs -- not yet orchestrated here. |
 | `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Per `SEGMENTATION_ARCHITECTURE.md`, inference-only against a pretrained U-Net -- likely will not need `experiment_manager.py`'s training-run tracking at all. |
 | `stage04_lesion_segmentation.ipynb` | 4. Lesion Segmentation | Template. Trains an Attention U-Net on IDRiD -- see `SEGMENTATION_ARCHITECTURE.md`. |
 | `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. Likely trained jointly with Stages 6-8 -- confirm before implementing independently. |
@@ -233,6 +233,11 @@ read `stage_dataset()`'s printed output for a real, session-specific number.
 2. `Runtime > Change runtime type > Hardware accelerator > GPU` (T4 or better recommended).
 
 ## How to start training
+
+**Stage 1 has already been trained and verified** -- held-out test accuracy 88.05%, F1 86.12%,
+AUC 96.48%, QWK 0.8987 (experiment `2026-08-05_09-11-28`; full detail in the notebook's Section 7
+and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record). The steps below remain the
+official process for re-running Stage 1 or training any future stage.
 
 Run `stage01_iqa.ipynb`'s cells top to bottom (the only stage with real training code today). No
 manual edits are required if your Drive matches the layout above. The notebook will:
