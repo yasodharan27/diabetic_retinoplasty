@@ -3,7 +3,9 @@
 Master architectural reference for this repository. `PROJECT_CODE.md` defines the target
 architecture and development rules; `IMPLEMENTATION_PLAN.md` tracks the gap between the baseline
 and that target; this document describes **where everything actually lives** and **how the
-pieces fit together**, kept in sync with the repository as it exists today.
+pieces fit together**, kept in sync with the repository as it exists today. The canonical
+end-to-end pipeline diagram lives in `README.md`; this document does not repeat it, to avoid two
+diagrams drifting out of sync — see README's "Master Pipeline" section.
 
 ---
 
@@ -15,7 +17,7 @@ pieces fit together**, kept in sync with the repository as it exists today.
 | `training/` | Reusable, model-agnostic training framework (`Trainer`, callbacks, losses, metrics, optimizers). No models or dataset loading. |
 | `evaluation/` | Reusable, model-agnostic evaluation framework (`Evaluator`, metrics, visualization). Operates on prediction arrays only. |
 | `pipeline/` | Abstract base classes (`TrainableStage`, `InferenceStage`, `SegmentationStage`, `ClassificationStage`) fixing the contract future pipeline stages must implement. Defines no models. |
-| `datasets/` | Real, local datasets: `EyeQ/`, `APTOS2019/`, `IDRiD/`. `raw/` subfolders are read-only; never modified in place. |
+| `datasets/` | Real, local datasets: `EyeQ/`, `DRIVE/`, `CHASE_DB1/`, `APTOS2019/`, `IDRiD/`. `raw/` subfolders are read-only; never modified in place. |
 | `colab/` | The official Google Colab training infrastructure -- `common/` (reusable setup/verification/experiment modules) and `notebooks/` (one notebook per pipeline stage). See "Colab Workflow" below. |
 | `tests/` | Pytest unit tests. Use synthetic/temporary data only, per `PROJECT_CODE.md`'s Implementation Rules -- never a substitute for real-data verification. |
 | `docs/` | Operational documentation, e.g. `docs/FIRST_TRAINING_CHECKLIST.md`. |
@@ -34,20 +36,28 @@ expect the repository to be laid out. This is a deliberate, existing convention 
 fill in.
 
 - **`training/`** -- `Trainer` / `TrainingConfig` (mixed precision, checkpointing, early
-  stopping, `ReduceLROnPlateau`, TensorBoard, resume support), plus `losses.py`, `metrics.py`,
-  `optimizers.py`, `callbacks.py`. Any trainable stage builds its own model and dataset, then
-  hands both to `Trainer` -- this is how `train_image_quality.py` already works, and how every
-  future trainable stage should work too.
+  stopping, `ReduceLROnPlateau`, TensorBoard, resume support), plus `losses.py` (including
+  `bce_dice_loss`) and `metrics.py` (including `dice_coefficient`/`iou_score` via
+  `build_metrics("segmentation")`), `optimizers.py`, `callbacks.py`. This entire package is
+  TensorFlow/Keras-based. Any trainable stage implemented in TensorFlow builds its own model
+  and dataset, then hands both to `Trainer` -- this is how `train_image_quality.py` already
+  works, and how Lesion Segmentation (Attention U-Net, fixed to TensorFlow) works too. Vessel
+  Segmentation's framework is deliberately left open (`SEGMENTATION_ARCHITECTURE.md` §6, named
+  "Baseline U-Net" for the same reason) -- it reuses this package only if TensorFlow ends up
+  being its final framework; an equivalent training loop is used otherwise, without changing its
+  documented `pipeline.SegmentationStage` contract.
 - **`evaluation/`** -- `Evaluator` (accuracy/precision/recall/F1/confusion matrix/ROC/AUC/QWK/
   calibration) plus `visualization.py`'s plotting helpers. Operates purely on `(y_true, y_pred,
-  y_proba)` arrays -- no model or dataset coupling, so it's reusable by every classification-style
-  stage (`evaluate_image_quality.py` already uses it this way).
+  y_proba)` arrays -- classification-oriented; segmentation stages (Vessel, Lesion) use
+  `training.metrics`'s Dice/IoU instead, not this module.
 - **`pipeline/`** -- `TrainableStage` / `InferenceStage` / `SegmentationStage` /
   `ClassificationStage` ABCs. Establishes the contract for stages **implemented from this point
-  forward**; the existing IQA module predates this package and does not inherit from it.
+  forward**, including Vessel Segmentation; the existing IQA module predates this package and
+  does not inherit from it.
 - **`datasets/`** -- real data only, `<dataset>/raw/` (read-only) and `<dataset>/processed/`
   (preprocessing output) per dataset, resolved via `config.py`'s `dataset_raw_dir()` /
-  `dataset_processed_dir()` helpers (or the dedicated `EyeQPaths` for EyeQ specifically).
+  `dataset_processed_dir()` helpers (or the dedicated `EyeQPaths` for EyeQ specifically). DRIVE
+  and CHASE_DB1 resolve through the same generic helpers -- no dedicated dataclass needed.
 - **`colab/`** -- see "Colab Workflow" below.
 - **`tests/`** -- `test_config.py`, `test_image_preprocessing.py`, `test_pipeline.py`. Synthetic/
   temporary data only, verifying function-level correctness -- real-data verification happens via
@@ -62,76 +72,114 @@ fill in.
 
 | Dataset | Purpose | Current Usage | Future Usage |
 |---|---|---|---|
-| **EyeQ** | Image quality classification (`Good`/`Usable`/`Reject`) | **Active** -- trains and evaluates Stage 1 (Image Quality Assessment) today, via `image_quality_dataset.py` / `train_image_quality.py` / `colab/notebooks/stage01_iqa.ipynb`. | Continues to gate every later stage: only `Good`/`Usable` images should reach Stage 2 preprocessing. |
+| **EyeQ** | Image quality classification (`Good`/`Usable`/`Reject`) | **Active** -- trains and evaluates Stage 1 (Image Quality Assessment) today, via `image_quality_dataset.py` / `train_image_quality.py` / `colab/notebooks/stage01_iqa.ipynb`. | Continues to gate every later stage: only `Good`/`Usable` images should reach Stage 2 preprocessing. Used only for Stage 1. |
+| **DRIVE** | Retinal vessel segmentation training | Not yet on disk / not yet consumed. | Trains Stage 3 (Vessel Segmentation, Baseline U-Net) — used only for Stage 3 training. |
+| **CHASE_DB1** | Retinal vessel segmentation training | Not yet on disk / not yet consumed. | Trains Stage 3 (Vessel Segmentation, Baseline U-Net), alongside DRIVE — used only for Stage 3 training. |
 | **APTOS2019** | Diabetic retinopathy severity classification (5 classes, 0-4) | Referenced by the pre-refactor baseline scripts (`efficientnet_model.py`, `swin_transformer.py`, `train_hybrid_model.py`) at the repository root. | Primary training set for Stage 8 (CORN Classification) once the target architecture's classification head is implemented. |
-| **IDRiD** | Lesion segmentation (microaneurysms, haemorrhages, hard/soft exudates, optic disc) | Not yet consumed by any implemented stage. | Trains Stage 4 (Lesion Segmentation, Attention U-Net) -- the only segmentation model actually trained in this project (see below). |
+| **IDRiD** | Lesion segmentation (microaneurysms, haemorrhages, hard/soft exudates, optic disc); also grading | Not yet consumed by any implemented stage. | Trains Stage 4 (Lesion Segmentation, Attention U-Net) and supports downstream grading tasks. |
 
 **EyePACS is historical only.** It was used once, outside this repository, to reconstruct the
 official EyeQ dataset via EyeQ's own generation repository. EyePACS is not present under
 `datasets/`, is not read by any script here, and is not required to reproduce or run this
-repository -- see `PROJECT_CODE.md`'s Datasets section for the full history. Do not reintroduce
-EyePACS as an operational data source without updating that section first.
+repository -- see `PROJECT_CODE.md`'s Datasets section for the full history.
 
-**Vessel Segmentation (Stage 3) does not train on any of these datasets.** Per
-`SEGMENTATION_ARCHITECTURE.md`, it uses a pretrained U-Net for inference only -- resolved
-specifically because IDRiD does not reliably provide vessel-specific masks (it is primarily a
-lesion-segmentation dataset).
+**Vessel Segmentation (Stage 3) trains within this project**, on DRIVE + CHASE_DB1 — both newly
+approved specifically to make this possible, since none of EyeQ, APTOS2019, or IDRiD ship
+vessel-level masks. See `SEGMENTATION_ARCHITECTURE.md` for the full specification, including its
+design-history appendix documenting an earlier design (a pretrained, inference-only Vessel
+Segmentation model) that this supersedes.
+
+---
+
+## Dataset Flow
+
+Every dataset consumed by this pipeline follows the same lifecycle — Stage 02 is dataset-independent and is never described separately per dataset:
+
+```
+Raw Dataset (datasets/<name>/raw/, read-only)
+    │
+    ▼
+Stage 01 IQA gate (EyeQ only — the only dataset this gate applies to today;
+    other datasets are not currently gated by IQA)
+    │
+    ▼
+Accepted Images
+    │
+    ▼
+Stage 02 Preprocessing (Gamma Correction → CLAHE, RGB in, RGB out,
+    deterministic, dataset-agnostic)
+    │
+    ▼
+Processed Dataset (datasets/<name>/processed/, generated once, reused by
+    every downstream consumer)
+    │
+    ▼
+Stage-specific Dataset Loader (image_quality_dataset.py,
+    vessel_segmentation_dataset.py, lesion_segmentation_dataset.py, ...)
+    │
+    ▼
+Training / Inference
+```
+
+Ground-truth mask/label data (DRIVE's `1st_manual`, CHASE_DB1's vessel masks, IDRiD's lesion masks and grading CSVs) never enters Stage 02 — only fundus images do. Each stage-specific dataset loader reads mask/label data directly from `raw/`, in parallel with reading the corresponding processed image from `processed/`.
 
 ---
 
 ## Pipeline Overview
 
 The full 11-stage target architecture (`PROJECT_CODE.md`). "Status" reflects what's actually
-implemented and verified today, not aspirational state.
+implemented and verified today, not aspirational state. See README's "Master Pipeline" diagram
+for the visual end-to-end flow.
 
 ### 1. Image Quality Assessment
 - **Purpose:** Gate low-quality fundus images before they reach the rest of the pipeline.
 - **Input:** Raw fundus images (EyeQ, or any unlabeled folder via `image_quality_inference.py`).
 - **Output:** `Good` / `Usable` / `Reject` classification + per-class confidence.
-- **Training dataset:** EyeQ.
+- **Training dataset:** EyeQ. Used only for Stage 1.
 - **Inference output:** `{"label", "class_index", "confidence", "probabilities"}` per image (see `image_quality_inference.predict_quality`).
 - **Dependencies:** None (first stage).
 - **Status:** **Completed -- Verified -- Baseline Established.** `image_quality_dataset.py`, `image_quality_model.py`, `train_image_quality.py`, `evaluate_image_quality.py`, `image_quality_inference.py`, `colab/notebooks/stage01_iqa.ipynb`. Trained end-to-end in Google Colab (experiment `2026-08-05_09-11-28`) -- held-out test accuracy 88.05%, F1 86.12%, AUC 96.48%, QWK 0.8987; see `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record for full detail.
 
 ### 2. Image Preprocessing
-- **Purpose:** CLAHE, Gamma Correction, Green Channel Extraction, Ben Graham preprocessing, Median Denoising, resizing, augmentation.
+- **Purpose:** Gamma Correction and CLAHE only, on RGB images. No green-channel extraction, Ben Graham processing, median denoising, histogram equalization, resizing, or augmentation — all explicitly excluded from Stage 02, per the frozen architecture.
 - **Input:** Images passing Stage 1's quality gate.
-- **Output:** Normalized images in `datasets/*/processed/`.
+- **Output:** Normalized RGB PNG images in `datasets/*/processed/`, at native (unresized) resolution.
 - **Training dataset:** N/A (deterministic image transform, not a trained model).
-- **Inference output:** Preprocessed image, ready for Stages 3+.
+- **Inference output:** Preprocessed RGB image, ready for Stages 3+.
 - **Dependencies:** Stage 1 (now completed and verified -- see above).
-- **Status:** **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms and `config.py`'s `PREPROCESSING_PROFILES` (`IQA` = no-op, `DR` = full pipeline); not yet wired into a Colab notebook (`colab/notebooks/stage02_preprocessing.ipynb` is a template only).
+- **Status:** **Frozen, implementation-ready.** `image_preprocessing.py` (repository root) already implements the transforms via `config.py`'s `PREPROCESSING_PROFILES`; not yet wired into a Colab notebook (`colab/notebooks/stage02_preprocessing.ipynb` is a template only). Stage 02 is model-agnostic by design: any model-specific preprocessing (channel adaptation, resizing, normalization) belongs inside the consuming stage, never here.
 
 ### 3. Vessel Segmentation
 - **Purpose:** Segment retinal vasculature.
-- **Input:** Preprocessed images (Stage 2).
-- **Output:** Vessel masks.
-- **Training dataset:** None -- **inference only**, pretrained U-Net (see `SEGMENTATION_ARCHITECTURE.md`).
-- **Inference output:** Binary/probability vessel mask per image.
+- **Input:** Preprocessed RGB images (Stage 2).
+- **Output:** Single-channel vessel probability map, `(H, W, 1)`, values in `[0, 1]`.
+- **Model:** Baseline U-Net (named to allow the exact architecture to evolve during implementation without a rename).
+- **Training dataset:** DRIVE + CHASE_DB1 — **trained within this project**, not pretrained. Both datasets are run through Stage 02's own pipeline before training, so the model sees the same distribution at training time that it will see at inference time. Used only for Stage 3 training.
 - **Dependencies:** Stage 2.
-- **Status:** Not implemented. `colab/notebooks/stage03_vessel_segmentation.ipynb` is a template only.
+- **Status:** Not implemented. Design finalized (`SEGMENTATION_ARCHITECTURE.md` §1.2/§2); `colab/notebooks/stage03_vessel_segmentation.ipynb` is a template only. Follows the exact same lifecycle *shape* as Stage 1: dataset → training → evaluation → export → inference, mirroring `image_quality_*.py`'s file structure, and reusing the existing Colab infrastructure (`experiment_manager.py`, `dataset_staging.py` -- framework-agnostic) unmodified. Whether it also reuses `training.Trainer` / `training.build_metrics("segmentation")` depends on Stage 3's still-open framework decision (`SEGMENTATION_ARCHITECTURE.md` §6) -- those are TensorFlow-specific and apply only if that's the framework chosen.
 
 ### 4. Lesion Segmentation
 - **Purpose:** Segment DR lesions (microaneurysms, hemorrhages, exudates).
-- **Input:** Preprocessed images (Stage 2).
-- **Output:** Lesion segmentation masks.
-- **Training dataset:** IDRiD.
+- **Input:** Preprocessed RGB image (Stage 2) + vessel probability map (Stage 3), concatenated — `(H, W, 4)`.
+- **Output:** Four lesion probability maps (Microaneurysm, Haemorrhage, Hard Exudate, Soft Exudate) — `(H, W, 4)`.
+- **Training dataset:** IDRiD (segmentation subset).
 - **Inference output:** Per-lesion-class segmentation mask.
-- **Dependencies:** Stage 2.
+- **Dependencies:** Stage 2, Stage 3 (Lesion Segmentation training requires Stage 3's trained model to generate vessel-mask inputs first).
 - **Status:** Not implemented. Design finalized in `SEGMENTATION_ARCHITECTURE.md`; `colab/notebooks/stage04_lesion_segmentation.ipynb` is a template only.
 
 ### 5. Local Feature Extraction
 - **Purpose:** Fine-grained, lesion-level feature extraction (Adaptive Multi-Kernel CNN).
-- **Input:** Preprocessed images (Stage 2) + lesion segmentation maps (Stage 4).
+- **Input:** Preprocessed RGB image (3 channels) + vessel probability map (1 channel) + four lesion probability maps (4 channels), concatenated into a single **8-channel tensor**, `(H, W, 8)`.
 - **Output:** Local feature vectors/maps.
 - **Training dataset:** Likely trained jointly with Stages 6-8 (see note below), not independently.
-- **Dependencies:** Stages 2, 4.
+- **Dependencies:** Stages 2, 3, 4.
 - **Status:** Not implemented.
 
 ### 6. Global Feature Extraction
 - **Purpose:** Whole-image, long-range feature extraction (Dual-Scale Swin Transformer).
-- **Input:** Preprocessed images (Stage 2).
+- **Input:** Preprocessed RGB image (Stage 2), directly — parallel to, not sequential with, Local Feature Extraction.
 - **Output:** Global feature vectors/maps.
+- **Resolution:** Not fixed by Stage 02. If this stage requires a specific input resolution, that resizing is performed internally inside Stage 6 — Stage 02 remains model-agnostic and does not resize. The final input resolution is configurable and will be selected during implementation based on memory and model performance.
 - **Training dataset:** Likely trained jointly with Stages 5, 7, 8.
 - **Dependencies:** Stage 2.
 - **Status:** Not implemented.
@@ -179,6 +227,18 @@ implemented and verified today, not aspirational state.
 
 ---
 
+## Stage Dependencies
+
+Every stage depends on the stage(s) immediately before it in the pipeline; no stage bypasses another:
+
+```
+Stage 01 → Stage 02 → Stage 03 → Stage 04 → Stage 05 → Stage 06 → Stage 07 → Stage 08
+```
+
+Stage 05 additionally depends on Stage 03 and Stage 04 directly (not only transitively through Stage 02), since it consumes both stages' outputs concatenated with the processed image. Stage 06 depends only on Stage 02. Stage 09 and Stage 10 depend on Stage 08's trained classifier and are inference-only branches, not part of the main training chain. Stage 11 depends on every prior stage having a real, trained model — it is never populated with placeholder numbers ahead of that.
+
+---
+
 ## Colab Workflow
 
 Full detail lives in `colab/README.md`; summary here for architectural context.
@@ -192,7 +252,10 @@ Full detail lives in `colab/README.md`; summary here for architectural context.
 - **Experiments** (`colab/common/experiment_manager.py`): every training run gets its own
   timestamped, isolated folder under `experiments/<Module>/YYYY-MM-DD_HH-MM-SS/` on Google Drive
   (`checkpoints/`, `logs/`, `tensorboard/`, `evaluation/`, `predictions/`, `metadata.json`),
-  never overwritten, resumable.
+  never overwritten, resumable. `colab_config.py`'s `PIPELINE_MODULES` already includes
+  `"VesselSegmentation"` alongside `"IQA"`, `"LesionSegmentation"`, and `"FinalClassification"` --
+  this infrastructure was already provisioned for a trainable Vessel Segmentation stage before
+  this refactor, and needs no changes to support it.
 - **Model export:** the best checkpoint from each run is copied to a stable
   `exported_models/<Module>/best_model.keras` on Drive (overwritten by each new "best" run), kept
   separate from that run's own permanent `checkpoints/best.keras` archive.
@@ -200,6 +263,9 @@ Full detail lives in `colab/README.md`; summary here for architectural context.
   experiment's `logs/` can be pointed at directly to review it later.
 - **Resuming:** point `RESUME_EXPERIMENT_DIR` at a previous experiment's folder instead of
   leaving it `None` -- see `colab/README.md`'s "How to resume training".
+- **Stage 3 follows the identical 12-step notebook workflow as Stage 1:** Bootstrap → Setup →
+  Environment Verification → Dataset Staging → Dataset Verification → Hyperparameters →
+  Experiment Creation → Dataset Loading → Training → Evaluation → Export → Final Summary.
 
 ---
 
@@ -230,14 +296,16 @@ the resulting model/evaluation artifacts are reviewed locally before being commi
 
 | Output | Local CLI run (`train_image_quality.py`, etc.) | Colab run |
 |---|---|---|
-| Trained models (`best.keras`, `last.keras`) | `models/<module>/training_run/checkpoints/` | `experiments/<Module>/<timestamp>/checkpoints/` (Drive) |
-| Exported "current best" model | `models/<module>/best_model.keras` | `exported_models/<Module>/best_model.keras` (Drive) |
+| Trained models (`best.keras`, `last.keras` for TensorFlow-based modules) | `models/<module>/training_run/checkpoints/` | `experiments/<Module>/<timestamp>/checkpoints/` (Drive) |
+| Exported "current best" model | `models/<module>/best_model.keras` (TensorFlow-based modules) or `best_model[.ext]` (Vessel Segmentation -- extension depends on its final framework choice, see `SEGMENTATION_ARCHITECTURE.md` §6) | `exported_models/<Module>/best_model.keras` or `best_model[.ext]` accordingly (Drive) |
 | Metrics log (`metrics.csv`) | `models/<module>/training_run/checkpoints/metrics.csv` | `experiments/<Module>/<timestamp>/checkpoints/metrics.csv` (Drive) |
 | TensorBoard logs | `models/<module>/training_run/logs/` | `experiments/<Module>/<timestamp>/logs/` (live) + `.../tensorboard/` (archival copy) (Drive) |
 | Evaluation plots/report | `results/<module>/` | `experiments/<Module>/<timestamp>/evaluation/` (Drive) |
 | Prediction samples | *(module-specific, not centrally defined for CLI runs)* | `experiments/<Module>/<timestamp>/predictions/` (Drive) |
 | Run metadata | *(not tracked for CLI runs)* | `experiments/<Module>/<timestamp>/metadata.json` (Drive) |
 | Session/setup logs | N/A | `logs/setup_<timestamp>.json` (Drive, global) |
+
+Vessel Segmentation (`models/vessel_segmentation/`, `results/vessel_segmentation/`) now follows this table exactly, the same as every other trainable module — it is no longer a special case with no `training_run/` or `results/` directory.
 
 ---
 
@@ -246,7 +314,8 @@ the resulting model/evaluation artifacts are reviewed locally before being commi
 Restated from `PROJECT_CODE.md` (canonical copy) since this document is checked against them:
 
 1. **Never modify `datasets/*/raw`.** Preprocessing output goes to the matching `processed/`
-   folder; nothing ever writes back into `raw/`.
+   folder; nothing ever writes back into `raw/`. Ground-truth masks/labels are never
+   preprocessed — only fundus images pass through Stage 02.
 2. **One stage at a time.** Explain the existing implementation, explain why it needs to change,
    propose a plan, wait for approval, implement, verify integration, stop.
 3. **No fabricated metrics.** If a model has not been trained, state plainly that no real
@@ -256,3 +325,12 @@ Restated from `PROJECT_CODE.md` (canonical copy) since this document is checked 
 5. **Train only in Colab.** All real model training happens in Google Colab, against Drive-hosted
    data; local runs (`train_image_quality.py`, etc.) are for quick smoke tests or as the reference
    a notebook mirrors, not for producing results that get reported.
+6. **Stage 02 stays model-agnostic.** Any model-specific preprocessing (channel adaptation,
+   resizing, normalization) belongs inside the consuming stage's own adapter, never inside Stage 02.
+7. **Stage 02 preprocessing is deterministic and generated once.** Each dataset is preprocessed
+   exactly once; processed outputs are stored and reused by every downstream stage. No downstream
+   stage regenerates deterministic preprocessing outputs.
+8. **Every trainable stage is modular.** It owns its own dataset, model, training, evaluation,
+   inference, and exported model, and communicates with other stages only through its documented
+   input/output contract -- never by depending on another stage's internal implementation
+   (including which framework that stage happens to use).

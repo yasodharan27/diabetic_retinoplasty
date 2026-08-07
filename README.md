@@ -19,7 +19,7 @@ A hybrid deep learning framework for automated diabetic retinopathy detection wi
 ## 📋 Table of Contents
 
 - [Repository Status & Target Architecture](#-repository-status--target-architecture)
-  - [Pipeline Diagram](#pipeline-diagram)
+  - [Master Pipeline](#master-pipeline)
   - [Dataset Summary](#dataset-summary)
   - [Folder Structure](#folder-structure)
   - [Development Workflow](#development-workflow)
@@ -43,17 +43,21 @@ A hybrid deep learning framework for automated diabetic retinopathy detection wi
 ## 🏛️ Repository Status & Target Architecture
 
 The target architecture is an 11-stage, end-to-end diabetic retinopathy pipeline -- full detail
-in `PROJECT_CODE.md` (rules and target design) and `PROJECT_STRUCTURE.md` (master architectural
+in `PROJECT_CODE.md` (rules and target design), `PROJECT_STRUCTURE.md` (master architectural
 reference: every folder's purpose, every stage's input/output/dataset/status, output locations,
-and the project rules). This section is a summary; those two files are authoritative.
+and the project rules), and `SEGMENTATION_ARCHITECTURE.md` (Vessel/Lesion Segmentation design,
+including tensor contracts). This section is a summary; those documents are authoritative.
 
-### Pipeline Diagram
+### Master Pipeline
+
+This is the repository's single, canonical end-to-end architecture diagram — every other document
+references this one rather than repeating a diverging copy.
 
 ```
  [1] Image Quality Assessment  --(Good/Usable only)-->  [2] Image Preprocessing
                                                                   |
                                                                   v
-                                          [3] Vessel Segmentation (pretrained, inference-only)
+                                          [3] Vessel Segmentation (trained on DRIVE + CHASE_DB1)
                                                                   |
                                                                   v
                                           [4] Lesion Segmentation (trained on IDRiD)
@@ -69,7 +73,6 @@ and the project rules). This section is a summary; those two files are authorita
                                                     v
                                     [8] CORN Ordinal Classification
                                         (trained on APTOS 2019)
-                                                    |
                         +---------------------------+---------------------------+
                         v                                                       v
         [9] Uncertainty Estimation                                [10] Explainability
@@ -81,16 +84,20 @@ and the project rules). This section is a summary; those two files are authorita
                                 (end-to-end, held-out test set, real metrics only)
 ```
 
+Every stage depends only on the stage(s) immediately before it — no stage bypasses another. See `PROJECT_STRUCTURE.md`'s "Stage Dependencies" section for the explicit dependency chain.
+
 ### Dataset Summary
 
 | Dataset | Used by | Status |
 |---|---|---|
-| **EyeQ** | Stage 1 (Image Quality Assessment) | Local copy present, verified (`colab/common/verify_dataset.py`) |
+| **EyeQ** | Stage 1 (Image Quality Assessment) — used only for Stage 1 | Local copy present, verified (`colab/common/verify_dataset.py`) |
+| **DRIVE** | Stage 3 (Vessel Segmentation training) — used only for Stage 3 | Not yet on disk |
+| **CHASE_DB1** | Stage 3 (Vessel Segmentation training) — used only for Stage 3 | Not yet on disk |
 | **APTOS 2019** | Stage 8 (CORN Classification); also the pre-refactor baseline below | Local copy present |
-| **IDRiD** | Stage 4 (Lesion Segmentation) | Local copy present, not yet consumed by any implemented stage |
+| **IDRiD** | Stage 4 (Lesion Segmentation) and downstream grading tasks | Local copy present, not yet consumed by any implemented stage |
 | **EyePACS** | Historical only | Used once, outside this repository, to reconstruct EyeQ. Not present under `datasets/`; not required to run anything here. |
 
-See `PROJECT_STRUCTURE.md`'s Dataset Organization for current vs. future usage per dataset.
+DRIVE and CHASE_DB1 are officially approved project datasets, added specifically so Stage 3 (Vessel Segmentation) can be trained within this project rather than relying on a pretrained, external model. See `PROJECT_STRUCTURE.md`'s Dataset Organization for current vs. future usage per dataset, and `SEGMENTATION_ARCHITECTURE.md` for why this design was adopted.
 
 ### Folder Structure
 
@@ -100,7 +107,8 @@ diabetic_retinoplasty/
 ├── training/                # reusable training framework (Trainer, callbacks, losses, metrics)
 ├── evaluation/               # reusable evaluation framework (Evaluator, metrics, visualization)
 ├── pipeline/                  # ABC contracts for future trainable/inference stages
-├── datasets/                   # EyeQ/, APTOS2019/, IDRiD/ -- raw/ is read-only, never modified
+├── datasets/                   # EyeQ/, DRIVE/, CHASE_DB1/, APTOS2019/, IDRiD/ -- raw/ is
+│                                 read-only, never modified
 ├── colab/                        # official Colab training infrastructure
 │   ├── common/                    # setup, verification, experiment management (shared by every stage)
 │   └── notebooks/                  # stage01_iqa.ipynb (implemented) + stage02-11 (templates)
@@ -142,8 +150,9 @@ same folder. See `colab/README.md`'s "How experiments are organized".
 | Stage | Status |
 |---|---|
 | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end in Google Colab; see Stage 1 Baseline Results below. |
-| 2. Image Preprocessing | **Ready to Begin.** Transform logic already exists (`image_preprocessing.py`); not yet wired into a Colab notebook. |
-| 3-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
+| 2. Image Preprocessing | **Frozen, implementation-ready.** RGB → Gamma Correction → CLAHE only (`image_preprocessing.py`); no green-channel extraction, Ben Graham, median denoising, resizing, or augmentation. Not yet wired into a Colab notebook. |
+| 3. Vessel Segmentation | **Design finalized, not yet implemented.** Now trainable within this project (Baseline U-Net, DRIVE + CHASE_DB1) — see `SEGMENTATION_ARCHITECTURE.md`. |
+| 4-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
 
 ### Stage 1 Baseline Results
 
@@ -305,6 +314,8 @@ Generates Generates Grad-CAM visualizations highlighting regions that influence 
 python generate_all_visualizations.py
 ```
 Creates comprehensive visualizations for research papers or presentations.
+
+> **Note:** Steps 1–7 above describe the **pre-refactor baseline** scripts, unchanged and still present at the repository root. They are unrelated to the target 11-stage pipeline's Stage 02 (`image_preprocessing.py`, RGB → Gamma → CLAHE only, no green-channel extraction, Ben Graham, or denoising) -- see [Repository Status & Target Architecture](#-repository-status--target-architecture) above for which one actually reflects the current, frozen architecture.
 
 ## 📈 Results
 

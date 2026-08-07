@@ -42,18 +42,25 @@ Reuse these components wherever appropriate instead of replacing them unnecessar
 
 ## Preprocessing
 
-The preprocessing pipeline should include:
+Stage 02 (Image Preprocessing) is the single, canonical, dataset-agnostic preprocessing pipeline used by every later stage. It is deterministic and model-agnostic:
 
-- Image Quality Assessment (EfficientNetB0)
-- CLAHE
 - Gamma Correction
-- Green Channel Extraction
-- Ben Graham Preprocessing
-- Median Denoising
-- Image Resizing
-- Data Augmentation
+- CLAHE
 
-Reuse existing preprocessing wherever possible and extend it only when necessary.
+Image Quality Assessment (Stage 01) is a separate, upstream classifier (EfficientNetB0) and is not part of Stage 02's transform list — it gates which images reach Stage 02, it does not preprocess them.
+
+Green Channel Extraction, Ben Graham Preprocessing, Median Denoising, and Histogram Equalization are explicitly **not** part of Stage 02. Resizing and Data Augmentation are also excluded from Stage 02's stored output — resizing is performed independently by whichever downstream stage requires it (different stages have different resolution needs), and augmentation is applied at training time, in-graph, by each trainable stage — never baked into a static preprocessed file. See `SEGMENTATION_ARCHITECTURE.md` and `PROJECT_STRUCTURE.md` for the full rationale and the per-stage detail.
+
+### Stage 02 Preprocessing Policy
+
+This is the repository's official preprocessing policy, binding on every dataset and every downstream stage:
+
+> Stage 02 preprocessing is deterministic.
+> Each dataset is preprocessed exactly once.
+> Processed outputs are stored and reused by every downstream stage.
+> No downstream stage should regenerate deterministic preprocessing outputs.
+
+Any model-specific adaptation of Stage 02's output (channel handling, resizing, normalization) happens inside the consuming stage's own adapter, at load time, on top of the already-generated processed file — it never re-runs or duplicates Stage 02's own Gamma/CLAHE computation.
 
 ---
 
@@ -62,7 +69,7 @@ Reuse existing preprocessing wherever possible and extend it only when necessary
 | Module | Model |
 |---------|-------|
 | Image Quality Assessment | EfficientNetB0 |
-| Vessel Segmentation | U-Net |
+| Vessel Segmentation | Baseline U-Net (trained within this project) |
 | Lesion Segmentation | Attention U-Net |
 | Local Feature Extraction | Adaptive Multi-Kernel CNN |
 | Global Feature Extraction | Dual-Scale Swin Transformer |
@@ -70,6 +77,8 @@ Reuse existing preprocessing wherever possible and extend it only when necessary
 | Classification | CORN Ordinal Classification |
 | Uncertainty | Monte Carlo Dropout |
 | Explainability | Grad-CAM++, SHAP, Attention Rollout |
+
+Vessel Segmentation is named "Baseline U-Net" rather than "Standard U-Net" deliberately: the exact architecture may evolve during implementation, and this table should not need renaming when it does.
 
 ---
 
@@ -79,18 +88,29 @@ Datasets
 
 - EyeQ
   - Image Quality Assessment
-  - Generated from EyePACS using the official EyeQ generation repository.
+  - Reconstructed (one-time) from EyePACS using the official EyeQ generation repository. The reconstructed EyeQ dataset is the dataset actually used for IQA; EyePACS itself is not part of this project (see "EyePACS" below).
+  - Used only for Stage 01.
+
+- DRIVE
+  - Vessel Segmentation training (Stage 03).
+  - Used only for Stage 03 training.
+
+- CHASE_DB1
+  - Vessel Segmentation training (Stage 03).
+  - Used only for Stage 03 training.
 
 - APTOS 2019
-  - Diabetic Retinopathy Classification
-
-- EyePACS
-  - Additional training and fine-tuning
-  - Source dataset for EyeQ generation
+  - Ordinal DR Classification (Stage 08) and other downstream grading/classification stages.
 
 - IDRiD
-  - Vessel Segmentation
-  - Lesion Segmentation
+  - Lesion Segmentation (Attention U-Net, Stage 04) and downstream grading tasks.
+
+- EyePACS (historical only)
+  - Used once to reconstruct the official EyeQ dataset.
+  - Not part of the implemented training or inference pipeline.
+  - Not required to reproduce or run this repository.
+
+DRIVE and CHASE_DB1 are officially approved project datasets, added specifically to make Stage 03 (Vessel Segmentation) trainable within this project. No other datasets are permitted without explicit request.
 
 ---
 
@@ -137,6 +157,21 @@ For every trainable model:
 - Add comments only where necessary.
 - Do not generate placeholder implementations.
 - Do not fabricate evaluation metrics or results.
+
+## Implementation Rules
+
+This is a production/research project, not a demonstration project.
+
+1. Do not implement placeholder logic, simulated outputs, fake metrics, or dummy pipelines.
+2. Unit tests may use synthetic or temporary data only, to verify correctness of individual functions.
+3. All actual project functionality must operate on the real datasets: EyeQ, DRIVE, CHASE_DB1, APTOS2019, IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see Datasets section).
+4. Do not create "toy" implementations intended to be replaced later.
+5. Every module should be fully implementable and immediately usable in the final pipeline.
+6. If verification of a full dataset would require hours of execution, perform lightweight correctness tests only -- never replace the actual implementation with a simplified version.
+7. Do not fabricate evaluation results or performance metrics. If a model has not been trained, clearly state that no real evaluation exists.
+8. Every trainable module must include: dataset loader, model, training, evaluation, inference, and a deployment interface (see Deployment Requirement below).
+
+The final objective is a real-world end-to-end diabetic retinopathy diagnosis pipeline, not an academic prototype.
 
 ## Development Workflow
 
@@ -194,6 +229,8 @@ All preprocessing outputs must be written to the corresponding `processed` folde
 
 The original datasets must always remain untouched.
 
+Ground-truth mask/label data (e.g. DRIVE's `1st_manual`, CHASE_DB1's vessel masks, IDRiD's lesion masks and grading CSVs) is never run through Stage 02 preprocessing. Only fundus images pass through Stage 02; masks and labels are read directly from `raw/` by each stage's own dataset loader.
+
 -----
 ## Deployment Requirement
 
@@ -206,4 +243,26 @@ The final project must integrate all inference modules into a single end-to-end 
 
 No module should exist only for training.
 -----
-Compare the existing preprocessing pipeline with the target preprocessing pipeline and retain only the useful components. Add the missing preprocessing steps (such as CLAHE and Gamma Correction) only if they are not already implemented. Avoid duplicate preprocessing operations
+
+## Modular Stage Principle
+
+This is a repository-wide architectural rule, not specific to any one stage:
+
+Every trainable stage owns its own:
+
+- dataset (loader)
+- model
+- training
+- evaluation
+- inference
+- exported model
+
+Stages communicate with each other **only** through their documented input/output contracts (e.g. `pipeline.SegmentationStage`'s `predict()` return shape, or a stage's documented tensor contract in `SEGMENTATION_ARCHITECTURE.md`). No stage may directly depend on another stage's internal implementation — its model class, its training loop, its private helper functions, or its choice of framework. A stage's internals may change freely (including which framework it's implemented in — see `SEGMENTATION_ARCHITECTURE.md` §6 for where this already applies to Stage 03) as long as its documented contract stays the same.
+
+This formalizes and generalizes the Deployment Requirement above: it is not just about every trainable module having both a training and an inference half, but about every stage being independently replaceable without touching any other stage's code.
+
+-----
+
+## Architecture Freeze
+
+The architecture described in this document, `IMPLEMENTATION_PLAN.md`, `PROJECT_STRUCTURE.md`, `SEGMENTATION_ARCHITECTURE.md`, `README.md`, and `colab/README.md` is frozen as of the documentation refactor that finalized Stage 02 (RGB, Gamma, CLAHE, deterministic, generated once per the Stage 02 Preprocessing Policy above) and Stage 03 (trainable Baseline U-Net on DRIVE + CHASE_DB1, framework-agnostic model storage per `SEGMENTATION_ARCHITECTURE.md` §6). Earlier alternatives considered for these two stages (a single-channel canonical image; a pretrained, inference-only Vessel Segmentation model; a TensorFlow-only model storage format for Stage 03) are retained only in `SEGMENTATION_ARCHITECTURE.md`'s dedicated design-history appendix, not restated as live guidance anywhere else. Implementation of Stage 02 and Stage 03 may now proceed, one module at a time, per the Development Workflow above and the Modular Stage Principle above.

@@ -1,18 +1,37 @@
 # Implementation Plan — Diabetic Retinopathy Detection
 
-This document compares the current baseline repository against the target architecture defined in `PROJECT_CODE.md` and lays out a module-by-module roadmap to close the gap. No code has been changed to produce this document.
+This document compares the current baseline repository against the target architecture defined in `PROJECT_CODE.md` and lays out a module-by-module roadmap to close the gap. Sections describing the pre-refactor baseline (§1) are historical and unaffected by the architecture freeze; sections describing the target architecture (§2 onward) reflect the frozen design in `PROJECT_CODE.md` / `SEGMENTATION_ARCHITECTURE.md` / `PROJECT_STRUCTURE.md`.
+
+---
+
+## 0. Implementation Rules
+
+Canonical copy lives in `PROJECT_CODE.md` under "Implementation Rules" -- restated here since this is the document each roadmap step gets checked against:
+
+This is a production/research project, not a demonstration project.
+
+1. Do not implement placeholder logic, simulated outputs, fake metrics, or dummy pipelines.
+2. Unit tests may use synthetic or temporary data only, to verify correctness of individual functions.
+3. All actual project functionality must operate on the real datasets: EyeQ, DRIVE, CHASE_DB1, APTOS2019, and IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see `PROJECT_CODE.md`'s Datasets section).
+4. Do not create "toy" implementations intended to be replaced later.
+5. Every module should be fully implementable and immediately usable in the final pipeline.
+6. If verification of a full dataset would require hours of execution, perform lightweight correctness tests only -- never replace the actual implementation with a simplified version.
+7. Do not fabricate evaluation results or performance metrics. If a model has not been trained, clearly state that no real evaluation exists.
+8. Every trainable module must include: dataset loader, model, training, evaluation, inference, and a deployment interface.
+
+The final objective is a real-world end-to-end diabetic retinopathy diagnosis pipeline, not an academic prototype.
 
 ---
 
 ## 1. Current Architecture (as implemented today)
 
 ### 1.1 Configuration
-All scripts load path/config values from environment variables via `python-dotenv` (`.env_sample` lists the expected keys: `BASE_PATH`, `MODEL_PATH`, `PROCESSED_TEST_DIR`, `RESULTS_DIR`, `PROCESSED_IMAGES_DIR`, `GAN_IMAGES_DIR`, `IMAGE_DIR`, `TEST_IMAGE_DIR`, `CSV_PATH`, `RETRAINED_MODEL_PATH`, `OUTPUT_DIR`, `MODEL_SAVE_PATH`, `RESULTS_PATH`, `IMAGE_SIZE`, `CHANNELS`, `NUM_CLASSES`, `BATCH_SIZE`, `EPOCHS`, `LATENT_DIM`). There is no config/package structure — every stage is a standalone top-level script, and shared model code is imported directly between scripts (e.g. `train_hybrid_model.py` imports `create_hybrid_model` from `swin_transformer.py`).
+All scripts load path/config values from environment variables via `python-dotenv` (`.env_sample` lists the expected keys: `BASE_PATH`, `MODEL_PATH`, `PROCESSED_TEST_DIR`, `RESULTS_DIR`, `PROCESSED_IMAGES_DIR`, `GAN_IMAGES_DIR`, `IMAGE_DIR`, `TEST_IMAGE_DIR`, `CSV_PATH`, `RETRAINED_MODEL_PATH`, `OUTPUT_DIR`, `MODEL_SAVE_PATH`, `RESULTS_PATH`, `IMAGE_SIZE`, `CHANNELS`, `NUM_CLASSES`, `BATCH_SIZE`, `EPOCHS`, `LATENT_DIM`). `config.py` now centralizes this (see `PROJECT_STRUCTURE.md`); the description below documents the historical, pre-refactor baseline scripts, which still exist unmodified in the repository root.
 
 ### 1.2 Data
-The pipeline is built around the **APTOS 2019** CSV format (`id_code`, `diagnosis` columns, PNG fundus images, 5 severity classes 0–4). There is no EyeQ or EyePACS ingestion code.
+The pre-refactor baseline is built around the **APTOS 2019** CSV format (`id_code`, `diagnosis` columns, PNG fundus images, 5 severity classes 0–4). There is no EyeQ or EyePACS ingestion code in the baseline scripts.
 
-### 1.3 Preprocessing (`pre_process_with_dataset_download.py`, `pre_process_test_and_train.py`)
+### 1.3 Preprocessing (`pre_process_with_dataset_download.py`, `pre_process_test_and_train.py`) — historical baseline, superseded by Stage 02
 Both scripts implement the same pipeline (the second variant adds a test-set branch):
 - Green channel extraction (`image[:, :, 1]`)
 - Ben Graham preprocessing (`cv2.addWeighted` with Gaussian blur — local contrast enhancement)
@@ -21,7 +40,8 @@ Both scripts implement the same pipeline (the second variant adds a test-set bra
 - Resize to 224×224
 - Normalize to [0,1], output single-channel array
 - Stratified train/val split saved as CSVs, `tf.data.Dataset` generators built from disk
-- No Gamma Correction, no dedicated Image Quality Assessment gate, no augmentation (augmentation only appears later, inside `train_hybrid_model.py`, not as a preprocessing-stage artifact)
+
+This baseline pipeline is **not** the target architecture's Stage 02. Per the frozen architecture (`PROJECT_CODE.md`, `SEGMENTATION_ARCHITECTURE.md`), Stage 02 is Gamma Correction + CLAHE only, on RGB, with no green-channel extraction, Ben Graham processing, median denoising, resizing, or augmentation. See §3 below for the finalized gap analysis.
 
 ### 1.4 Classification models
 Three parallel, only loosely related classification paths exist:
@@ -50,14 +70,14 @@ Standard (non-plus-plus) Grad-CAM: builds a sub-model exposing the `swin_refine`
 
 ---
 
-## 2. Target Architecture (per `PROJECT_CODE.md`)
+## 2. Target Architecture (frozen, per `PROJECT_CODE.md` / `SEGMENTATION_ARCHITECTURE.md`)
 
 11-stage pipeline:
 
 1. Image Quality Assessment — EfficientNetB0
-2. Image Preprocessing — CLAHE, Gamma Correction, Green Channel Extraction, Ben Graham, Median Denoising, Resize, Augmentation
-3. Vessel Segmentation — U-Net
-4. Lesion Segmentation — Attention U-Net
+2. Image Preprocessing — Gamma Correction, CLAHE (RGB in, RGB out; no green-channel extraction, Ben Graham, median denoise, histogram equalization, resizing, or augmentation)
+3. Vessel Segmentation — Baseline U-Net, **trained within this project** on DRIVE + CHASE_DB1
+4. Lesion Segmentation — Attention U-Net, trained on IDRiD
 5. Local Feature Extraction — Adaptive Multi-Kernel CNN
 6. Global Feature Extraction — Dual-Scale Swin Transformer
 7. Feature Fusion — Adaptive Cross-Attention
@@ -66,7 +86,7 @@ Standard (non-plus-plus) Grad-CAM: builds a sub-model exposing the `swin_refine`
 10. Explainability — Grad-CAM++, SHAP, Attention Rollout
 11. Evaluation
 
-Approved datasets: **EyeQ** (image quality), **APTOS 2019** (classification), **EyePACS** (additional fine-tuning). No other datasets permitted without explicit request.
+Approved datasets: **EyeQ** (image quality, Stage 01 only), **DRIVE** and **CHASE_DB1** (Vessel Segmentation training, Stage 03 only), **APTOS 2019** (classification), and **IDRiD** (lesion segmentation and grading). EyePACS itself is not part of the implemented training or inference pipeline and is not required to reproduce it. No other datasets permitted without explicit request.
 
 ---
 
@@ -74,21 +94,21 @@ Approved datasets: **EyeQ** (image quality), **APTOS 2019** (classification), **
 
 | # | Target Module | Target Model | Current State | Status |
 |---|---|---|---|---|
-| 1 | Image Quality Assessment | EfficientNetB0 (quality classifier) | No code exists. `EfficientNetB0` is currently only used as a *diagnosis* classifier, not a quality gate. | **Missing** |
-| 2 | Image Preprocessing | CLAHE, Gamma Correction, Green Channel, Ben Graham, Median Denoise, Resize, Augmentation | Green channel ✅, Ben Graham ✅, CLAHE ✅, Median denoise ✅, Resize ✅. Gamma Correction ❌. Augmentation exists only inside `train_hybrid_model.py` (in-graph Keras layers), not as a reusable preprocessing-stage step, and is absent from the other three training scripts. | **Partially implemented** |
-| 3 | Vessel Segmentation | U-Net | No code exists. | **Missing** |
-| 4 | Lesion Segmentation | Attention U-Net | No code exists. | **Missing** |
-| 5 | Local Feature Extraction | Adaptive Multi-Kernel CNN | No dedicated "local" feature extractor; `EfficientNetB0`/`B2` are used as whole-image, single-scale feature extractors. | **Missing** |
-| 6 | Global Feature Extraction | Dual-Scale Swin Transformer | A complete, hand-written single-scale Swin Transformer exists (`swin_transformer.py`: `PatchEmbed`, `WindowAttention`, `SwinTransformerBlock`, `BasicLayer`, `PatchMerging`, full `SwinTransformer` model), and `create_swin_tiny_model()` runs it standalone. However, the *hybrid* model only bolts on a single `SwinTransformerBlock` for feature refinement after a CNN backbone — no dual-scale windowing exists. Reusable foundation, wrong topology. | **Partially implemented** |
+| 1 | Image Quality Assessment | EfficientNetB0 (quality classifier) | Implemented, trained, verified — see `PROJECT_STRUCTURE.md`'s Stage 1 results. | **Completed** |
+| 2 | Image Preprocessing | Gamma Correction, CLAHE only (RGB in/out, deterministic, generated once) | `image_preprocessing.py` implements exactly this. No green-channel extraction, Ben Graham, median denoise, or resize — all explicitly excluded from Stage 02 per the frozen architecture. | **Frozen / implementation-ready** |
+| 3 | Vessel Segmentation | Baseline U-Net, trained on DRIVE + CHASE_DB1 | No code exists yet. Design finalized: DRIVE and CHASE_DB1 are now approved project datasets specifically to make this stage trainable within the project (see `SEGMENTATION_ARCHITECTURE.md` §1.2/§2, and its design-history appendix for why an earlier design used a pretrained, inference-only model instead). | **Missing — design finalized, ready to implement** |
+| 4 | Lesion Segmentation | Attention U-Net | No code exists. Design finalized in `SEGMENTATION_ARCHITECTURE.md` §3 — input is the processed RGB image concatenated with Stage 3's vessel probability map (4 channels total). | **Missing — design finalized** |
+| 5 | Local Feature Extraction | Adaptive Multi-Kernel CNN | No dedicated "local" feature extractor exists. Input contract finalized: RGB image + vessel map + 4 lesion maps, concatenated into an 8-channel tensor (`SEGMENTATION_ARCHITECTURE.md` §4). | **Missing** |
+| 6 | Global Feature Extraction | Dual-Scale Swin Transformer | A complete, hand-written single-scale Swin Transformer exists (`swin_transformer.py`), and `create_swin_tiny_model()` runs it standalone. The *hybrid* model only bolts on a single `SwinTransformerBlock` for feature refinement after a CNN backbone — no dual-scale windowing exists. Reusable foundation, wrong topology. Consumes the processed RGB image directly; any resizing it needs is internal to this stage (Stage 02 stays model-agnostic and unresized). | **Partially implemented** |
 | 7 | Feature Fusion | Adaptive Cross-Attention | The current "fusion" is a linear sequence (CNN → one Swin block → GlobalAveragePooling2D → Dense), not an attention-based fusion of two independent feature streams. | **Missing** |
-| 8 | Ordinal Classification | CORN | All classifiers (`efficientnet_model.py`, `swin_transformer.create_hybrid_model`, `dr_classifier.py`, `retrain_efficientnet.py`) use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK (quadratic weighted kappa) metric anywhere despite it being the standard metric for ordinal DR grading. | **Missing** |
+| 8 | Ordinal Classification | CORN | All classifiers use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK metric in the baseline scripts (QWK is, however, already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py`). | **Missing** |
 | 9 | Uncertainty Estimation | Monte Carlo Dropout | Fully implemented in `bayesian_inference.py`: MC sampling, mean/std, predictive entropy, uncertainty visualizations. Reliability diagram uses simulated labels (documented limitation, not a bug). Will need re-pointing at whatever model results from steps 5–8. | **Implemented** (needs integration once the classifier changes) |
 | 10 | Explainability | Grad-CAM++, SHAP, Attention Rollout | Only vanilla Grad-CAM exists (`explainable_ai.py`), hard-coded to the `swin_refine` layer name from the current hybrid model. Grad-CAM++, SHAP, and Attention Rollout are all absent. | **Partially implemented** |
-| 11 | Evaluation | — | Confusion matrix, classification report, accuracy/AUC exist per-script (`dr_classifier.py`, `test_hybrid_model.py`, `testing_efficientnet_model.py`) but are duplicated across files rather than a single evaluation module, and none compute ordinal-appropriate metrics (QWK) or real (non-simulated) calibration. | **Partially implemented** |
+| 11 | Evaluation | — | Confusion matrix, classification report, accuracy/AUC exist per-script but are duplicated across files rather than a single evaluation module, and none compute ordinal-appropriate metrics (QWK) or real (non-simulated) calibration against the target architecture's models. | **Partially implemented** |
 
-**Non-target component present in the repo:** `dr_gan.py` (conditional GAN for synthetic minority-class oversampling) is real and working but is not part of the 11-stage target pipeline. Per the "reuse existing components" rule, it should be kept and can still feed the ordinal classifier's training data (mirroring what `dr_classifier.py` already does), but it is not one of the roadmap's numbered modules.
+**Non-target component present in the repo:** `dr_gan.py` (conditional GAN for synthetic minority-class oversampling) is real and working but is not part of the 11-stage target pipeline. Per the "reuse existing components" rule, it should be kept and can still feed the ordinal classifier's training data, but it is not one of the roadmap's numbered modules.
 
-**Dataset gap to flag now:** Vessel Segmentation (U-Net) and Lesion Segmentation (Attention U-Net) both require pixel-level mask ground truth (e.g. vessel masks, exudate/hemorrhage/microaneurysm masks). None of the three approved datasets (EyeQ, APTOS 2019, EyePACS) ship such masks — APTOS/EyePACS are image-level diagnosis labels only, and EyeQ is quality labels only. This is a conflict between the target pipeline and the "use only these datasets" rule that needs your decision before step 3/4 can start (options: request approval for an additional masked dataset such as DRIVE/IDRiD, or use weak/pseudo-labels derived from the approved data, or use pretrained segmentation weights without fine-tuning). Flagged here, not resolved.
+**Dataset gap — resolved.** Vessel Segmentation (Stage 3) and Lesion Segmentation (Stage 4) both require pixel-level mask ground truth. Neither EyeQ, APTOS 2019, nor IDRiD's grading/localization subsets ship vessel masks; IDRiD's segmentation subset ships lesion (and Optic Disc) masks only. This gap is resolved by adding **DRIVE and CHASE_DB1** as officially approved project datasets, used exclusively to train Stage 3's Baseline U-Net; Lesion Segmentation continues to train on IDRiD's segmentation subset. Both Vessel Segmentation and Lesion Segmentation are now trained within this project — see `SEGMENTATION_ARCHITECTURE.md` for the full specification, including the design-history appendix documenting the earlier pretrained-inference-only alternative that this supersedes.
 
 ---
 
@@ -97,105 +117,74 @@ Approved datasets: **EyeQ** (image quality), **APTOS 2019** (classification), **
 Ordered to match the target pipeline's numbering, since each stage after preprocessing consumes the previous stage's output. A "Step 0" is added first for shared infrastructure every later step depends on.
 
 ### Step 0 — Shared Infrastructure & Config Extension
-- **Why:** New datasets (EyeQ, EyePACS) and new model stages (segmentation, fusion, ordinal head) need new path/config variables before any of them can be built, following the repo's existing `.env`-driven convention.
-- **Files to modify:** `.env_sample` (append new keys, don't remove existing ones).
-- **New files:** none.
-- **Expected output:** an extended `.env_sample` documenting the additional variables the new modules will need (e.g. EyeQ dataset paths, EyePACS dataset paths, vessel/lesion mask paths, per-stage model-save paths). No behavior change to existing scripts.
+- **Why:** New datasets (DRIVE, CHASE_DB1, IDRiD) and new model stages (segmentation, fusion, ordinal head) need new path/config variables before any of them can be built, following the repo's existing `.env`-driven convention.
+- **Files to modify:** `.env_sample` (append new keys, don't remove existing ones); `config.py` (add `VESSEL_SEG_MODEL_DIR` / `VESSEL_SEG_RESULTS_DIR`, mirroring `IQA_MODEL_DIR` / `IQA_RESULTS_DIR` — DRIVE/CHASE_DB1 raw+processed paths need no new dataclass, they resolve through the existing generic `dataset_raw_dir()` / `dataset_processed_dir()` helpers).
+- **Expected output:** extended config documenting the additional variables Stage 3 needs. No behavior change to existing scripts.
 
 ### Step 1 — Image Quality Assessment (EfficientNetB0)
-- **Why:** First gate in the target pipeline; determines whether an image proceeds to preprocessing/diagnosis at all.
-- **Reuses:** the `EfficientNetB0` transfer-learning pattern already proven in `efficientnet_model.py` (freeze first N layers, GAP, dense head) — same architecture family, different label space (binary/multi-class "quality" instead of DR severity) and different dataset (EyeQ).
-- **Files to modify:** none required (kept isolated so the existing baseline keeps working untouched).
-- **New files:** an EyeQ dataset loader/downloader script (mirrors `pre_process_with_dataset_download.py`'s structure) and an image-quality model script (mirrors `efficientnet_model.py`'s structure: `build`, `train`, `plot_training_history`).
-- **Colab notebook:** yes — dedicated IQA training notebook, exporting best weights back into `MODEL_SAVE_PATH`.
-- **Expected output:** a trained quality-classifier `.h5`/weights file and a callable quality-check function that can be inserted at the front of the pipeline.
+**Status: Completed, verified, trained, exported.** See `PROJECT_STRUCTURE.md` for full detail. No further action.
 
-### Step 2 — Preprocessing Extension (Gamma Correction + unified augmentation)
-- **Why:** `PROJECT_CODE.md` explicitly calls out retaining CLAHE/Ben Graham/green-channel/denoise/resize as-is and only adding what's missing — Gamma Correction is the one listed transform that isn't implemented anywhere; augmentation currently exists in only one of four training scripts.
-- **Files to modify:** `pre_process_with_dataset_download.py` and `pre_process_test_and_train.py` (add a gamma-correction step into the existing `preprocess_image` pipeline, after/alongside CLAHE — exact ordering to be confirmed before implementation, not decided here since no code is being written yet).
-- **New files:** none strictly required; augmentation could be centralized into a small shared helper imported by all training scripts instead of being duplicated, if that's desired — a decision to make at implementation time, not now.
-- **Colab notebook:** no (preprocessing is CPU/OpenCV based, no training).
-- **Expected output:** preprocessed images that additionally include gamma correction, with existing CLAHE/Ben Graham/denoise behavior unchanged; a documented, single augmentation policy reused by all training entry points.
+### Step 2 — Preprocessing (Gamma Correction + CLAHE)
+- **Why:** `PROJECT_CODE.md` specifies Stage 02 as exactly Gamma Correction + CLAHE on RGB — no other transform.
+- **Status:** `image_preprocessing.py` already implements this. Frozen and implementation-ready; no further architectural decision remains before Stage 02 is wired into `colab/notebooks/stage02_preprocessing.ipynb` and run once, per-dataset, per `PROJECT_CODE.md`'s Dataset Policy.
 
-### Step 3 — Vessel Segmentation (U-Net)
-- **Why:** Vessel maps are a prerequisite input for the Local/Global feature-extraction stages in the target architecture.
-- **Blocked on:** the dataset conflict noted in Section 3 (no vessel-mask dataset in the approved list) — needs your decision before implementation starts.
-- **Files to modify:** none.
-- **New files:** a new `vessel_segmentation.py` (U-Net architecture + train/infer functions), following the same standalone-script convention as `swin_transformer.py`.
-- **Colab notebook:** yes — dedicated segmentation training notebook.
-- **Expected output:** a trained U-Net producing binary/probability vessel maps for a given fundus image, saved weights integrated back via `MODEL_SAVE_PATH`/`MODEL_PATH`-style env vars.
+### Step 3 — Vessel Segmentation (Baseline U-Net)
+- **Why:** Vessel maps are a prerequisite input for Lesion Segmentation (Stage 4) and Local Feature Extraction (Stage 5) in the target architecture.
+- **Datasets:** DRIVE + CHASE_DB1, run through Stage 02's own RGB → Gamma → CLAHE pipeline before training, so the model trains on the same distribution it will see at inference time on EyeQ/APTOS/IDRiD-derived images.
+- **New files:** `vessel_segmentation_dataset.py`, `vessel_segmentation_model.py`, `train_vessel_segmentation.py`, `evaluate_vessel_segmentation.py`, `vessel_segmentation_inference.py` — mirroring Stage 1's exact file set and structure (dataset → model → train → evaluate → inference).
+- **Colab notebook:** yes — `colab/notebooks/stage03_vessel_segmentation.ipynb`, following the same 12-step workflow as `stage01_iqa.ipynb`.
+- **Reuse:** `colab/common/experiment_manager.py` and `dataset_staging.py` (framework-agnostic, already dataset-agnostic, no changes needed regardless of Stage 3's final framework), `colab_config.py`'s existing `"VesselSegmentation"` entry in `PIPELINE_MODULES`. `training.Trainer`, `training.get_loss("bce_dice")`, and `training.build_metrics("segmentation")` are TensorFlow/Keras-specific and are reusable as-is only if Stage 3 is implemented in TensorFlow — see `SEGMENTATION_ARCHITECTURE.md` §6 for why this stage's framework is deliberately left open (named "Baseline U-Net," not "Standard U-Net," for the same reason).
+- **Expected output:** a trained Baseline U-Net producing single-channel vessel probability maps, `(H, W, 1)`, values in `[0, 1]`, exported to `models/vessel_segmentation/best_model` (file extension depends on the final framework choice — see `SEGMENTATION_ARCHITECTURE.md` §6).
 
 ### Step 4 — Lesion Segmentation (Attention U-Net)
 - **Why:** Same rationale as Step 3, for lesion (exudate/hemorrhage/microaneurysm) maps.
-- **Blocked on:** same dataset conflict as Step 3.
-- **Files to modify:** none.
-- **New files:** `lesion_segmentation.py` (Attention U-Net + train/infer functions).
+- **Depends on:** Step 3's trained model, since Lesion Segmentation's training input requires a vessel-mask channel generated by running the (now project-trained, not pretrained) Vessel Segmentation model over every IDRiD/segmentation image first.
+- **New files:** `lesion_segmentation_dataset.py`, `lesion_segmentation_model.py` (Attention U-Net + train/infer functions).
+- **Input:** processed RGB image + vessel probability map, concatenated — `(H, W, 4)`.
+- **Output:** 4 lesion probability maps (Microaneurysm, Haemorrhage, Hard Exudate, Soft Exudate) — `(H, W, 4)`.
 - **Colab notebook:** yes.
-- **Expected output:** a trained Attention U-Net producing lesion probability maps, weights integrated the same way as Step 3.
 
 ### Step 5 — Local Feature Extraction (Adaptive Multi-Kernel CNN)
-- **Why:** Consumes the vessel/lesion maps (and/or the preprocessed image) to extract fine-grained local features, as distinct from the whole-image global branch.
-- **Depends on:** Steps 3–4 outputs (or, if those are deferred, this can initially run on the preprocessed image alone — a scoping decision for when this step starts).
-- **Files to modify:** none.
+- **Why:** Consumes the vessel/lesion maps and the preprocessed image to extract fine-grained local features, as distinct from the whole-image global branch.
+- **Depends on:** Steps 3–4 outputs.
+- **Input:** RGB image (3) + vessel map (1) + 4 lesion maps (4), concatenated — `(H, W, 8)`.
 - **New files:** `local_feature_extractor.py` (multi-kernel/multi-branch CNN block, adaptively weighted).
-- **Colab notebook:** yes, if trained end-to-end as part of the full model rather than pretrained separately (to be decided at implementation time, likely trained jointly with fusion + classification in Step 8's notebook rather than standalone).
 - **Expected output:** a callable Keras layer/sub-model producing a local feature tensor, unit-tested in isolation (shape/sanity checks) before wiring into fusion.
 
 ### Step 6 — Global Feature Extraction (Dual-Scale Swin Transformer)
-- **Why:** The existing `swin_transformer.py` already provides every low-level building block (`PatchEmbed`, `WindowAttention`, `SwinTransformerBlock`, `BasicLayer`, `PatchMerging`) needed for this — the gap is topology (single-scale block used for refinement) vs. target (a genuine dual-scale backbone).
-- **Files to modify:** `swin_transformer.py` — extend with a new `create_dual_scale_swin_model()` (or similarly named) builder that reuses the existing layer classes at two window/patch scales and merges them, **without deleting or altering** `create_swin_tiny_model()` or `create_hybrid_model()`, which the current baseline (`train_hybrid_model.py`, `test_hybrid_model.py`, `explainable_ai.py`, `bayesian_inference.py`) still depends on.
-- **New files:** none required if the new builder lives in `swin_transformer.py` alongside the existing ones; a separate file is also an option, decided at implementation time.
-- **Colab notebook:** likely folded into Step 8's end-to-end training notebook rather than trained standalone, since a backbone in isolation has no classification signal.
-- **Expected output:** a callable dual-scale Swin feature extractor with verified output shapes, existing single-block hybrid path still functional and untouched.
+- **Why:** The existing `swin_transformer.py` already provides every low-level building block needed for this — the gap is topology (single-scale block used for refinement) vs. target (a genuine dual-scale backbone).
+- **Input:** the processed RGB image directly (parallel branch, not sequential with Local Feature Extraction). Any resizing this stage needs is internal to it — Stage 02 does not resize, and no fixed resolution is documented here; the final input resolution is configurable and will be selected during implementation based on memory and model performance.
+- **Files to modify:** `swin_transformer.py` — extend with a new `create_dual_scale_swin_model()` builder, without deleting or altering `create_swin_tiny_model()` or `create_hybrid_model()`, which the current baseline still depends on.
 
 ### Step 7 — Feature Fusion (Adaptive Cross-Attention)
-- **Why:** Combines the Local (Step 5) and Global (Step 6) feature streams — the one part of the pipeline with no existing analog at all.
-- **Depends on:** Steps 5 and 6.
-- **Files to modify:** none.
-- **New files:** `feature_fusion.py` (cross-attention module: local features attend to global features and vice versa, adaptively weighted/gated combination).
-- **Colab notebook:** folded into Step 8's notebook (fusion has no standalone objective).
-- **Expected output:** a callable fusion module producing a single fused feature vector/map, shape-verified against both input streams.
+- **Why:** Combines the Local (Step 5) and Global (Step 6) feature streams.
+- **New files:** `feature_fusion.py` (cross-attention module).
 
 ### Step 8 — Ordinal Classification (CORN)
-- **Why:** Replaces the current nominal softmax heads with a rank-consistent ordinal head appropriate for DR severity grading (0–4 is an ordered scale, which softmax cross-entropy ignores).
-- **Depends on:** Step 7's fused features as input.
-- **Files to modify:** none required for the new head itself; `train_hybrid_model.py`'s focal-loss pattern (class weighting under imbalance) is worth reusing conceptually for the CORN training loop rather than being replaced outright.
-- **New files:** `ordinal_classifier.py` (CORN head + CORN loss + rank-to-class decoding), and a new end-to-end training script (e.g. `train_dr_pipeline.py`) that wires Preprocessing → (Vessel/Lesion) → Local → Global → Fusion → CORN together, mirroring how `train_hybrid_model.py` currently wires preprocessing output → `create_hybrid_model`.
-- **Colab notebook:** yes — this is the main end-to-end training notebook for the new architecture.
-- **Expected output:** a trained full-pipeline model, plus QWK (quadratic weighted kappa) added to the evaluation metrics since it's the standard ordinal-grading metric and is currently absent everywhere in the repo.
+- **Why:** Replaces the current nominal softmax heads with a rank-consistent ordinal head appropriate for DR severity grading.
+- **New files:** `ordinal_classifier.py` (CORN head + CORN loss + rank-to-class decoding), and an end-to-end training script wiring Preprocessing → Vessel/Lesion → Local → Global → Fusion → CORN together.
+- **Colab notebook:** yes — the main end-to-end training notebook.
 
 ### Step 9 — Uncertainty Estimation (Monte Carlo Dropout) — integration only
-- **Why:** Already implemented and correct in `bayesian_inference.py`; this step is about re-pointing it at the new model, not rebuilding it.
-- **Files to modify:** `bayesian_inference.py` — update the `custom_objects` dict and `last_conv_layer`/feature-source references to match the new architecture's layer names (the same pattern already used to support `swin_refine` + the custom `Cast` layer today).
-- **New files:** none.
-- **Expected output:** MC-Dropout uncertainty outputs (mean prediction, std, predictive entropy, reliability diagram) working against the new ordinal model; the "simulated ground truth" caveat in the reliability diagram should be revisited once real held-out labels are available from Step 8's training run.
+- **Why:** Already implemented and correct in `bayesian_inference.py`; this step re-points it at the new model.
 
 ### Step 10 — Explainability (Grad-CAM++, SHAP, Attention Rollout)
-- **Why:** Current `explainable_ai.py` only implements vanilla Grad-CAM against a single hard-coded layer name; target wants three complementary techniques (Grad-CAM++ for better multi-instance localization, SHAP for feature-attribution outside the conv/attention structure, Attention Rollout specifically for the Swin branch).
-- **Files to modify:** `explainable_ai.py` — generalize `make_gradcam_heatmap` into Grad-CAM++ and parameterize the target layer instead of hard-coding `'swin_refine'`, so it keeps working for whichever model is passed in.
-- **New files:** an Attention Rollout module (operates on the dual-scale Swin branch's attention maps from Step 6) and a SHAP-based explainer module (likely `shap.DeepExplainer` or `GradientExplainer` over the fused feature/classification path).
-- **Colab notebook:** no (inference-time visualization, not training).
-- **Expected output:** three explanation modalities producible for any given test image and the new ordinal model, saved alongside the existing Grad-CAM output convention (`RESULTS_DIR`).
+- **Why:** Current `explainable_ai.py` only implements vanilla Grad-CAM against a single hard-coded layer name; generalize and add the two missing techniques.
 
 ### Step 11 — Evaluation
-- **Why:** Consolidate the currently-duplicated evaluation logic (confusion matrix / classification report scattered across `dr_classifier.py`, `test_hybrid_model.py`, `testing_efficientnet_model.py`) into one module, and add the ordinal-appropriate metrics that are missing everywhere (QWK, per-class sensitivity/specificity relevant to clinical screening).
-- **Files to modify:** none required to existing files (they can keep working as-is per "preserve existing functionality").
-- **New files:** `evaluate_pipeline.py` — a single evaluation entry point for the new end-to-end model: confusion matrix, classification report, QWK, calibration (using real labels this time), and comparison against the existing EfficientNet/hybrid baselines' saved metrics (reusing `test_hybrid_model.py`'s existing `create_comparison_with_baseline()` pattern of comparing prediction CSVs).
-- **Colab notebook:** no (can run locally or in Colab against exported test predictions).
-- **Expected output:** a single evaluation report (metrics CSV + plots) for the new pipeline, directly comparable to the existing baseline's `classification_report.csv`/`model_comparison.csv` outputs.
+- **Why:** Consolidate the currently-duplicated evaluation logic into one module, and add QWK / real calibration for the new end-to-end model.
 
 ---
 
 ## 5. Open Questions Before Implementation Begins
 
-1. **Segmentation datasets (Steps 3–4):** none of the three approved datasets include vessel/lesion masks. Need a decision: approve an additional masked dataset, use pseudo-labels/pretrained weights, or descope segmentation to weak supervision.
-2. **Gamma Correction placement (Step 2):** before or after CLAHE, and on which channel (green channel vs. full image) — needs a decision at implementation time, not assumed here.
-3. **Augmentation centralization (Step 2):** whether to keep augmentation duplicated per training script (current pattern) or factor it into one shared helper used by all training entry points.
-4. **`dr_gan.py`'s role going forward:** keep feeding the new ordinal classifier's training set the same way it currently feeds `dr_classifier.py`, or treat it as legacy/optional.
-5. **Local Feature Extraction's input (Step 5):** raw preprocessed image only, or the vessel/lesion maps from Steps 3–4 — affects whether Step 5 can start before Steps 3–4 are unblocked.
+1. **Segmentation datasets (Steps 3–4) — resolved.** DRIVE and CHASE_DB1 are now approved datasets, used to train Stage 3 within this project; IDRiD's segmentation subset trains Stage 4. See `SEGMENTATION_ARCHITECTURE.md`.
+2. **`dr_gan.py`'s role going forward:** keep feeding the new ordinal classifier's training set the same way it currently feeds `dr_classifier.py`, or treat it as legacy/optional — undecided, out of scope for this refactor.
+3. **Local Feature Extraction's input (Step 5) — resolved.** RGB image + vessel map + lesion maps, concatenated into an 8-channel tensor (§4 of `SEGMENTATION_ARCHITECTURE.md`).
+4. **DRIVE test-set masks and CHASE_DB1's train/test split convention** — need verification once the raw files are actually placed on disk; see the migration plan associated with this refactor.
 
 ---
 
 ## 6. Next Step
 
-Per the development workflow in `PROJECT_CODE.md`, implementation should proceed one module at a time in the order above, starting with **Step 0 (infrastructure)** and **Step 1 (Image Quality Assessment)**, with explicit approval requested before writing code for each step.
+Stage 1 is complete. Stage 2 is architecturally frozen and implementation-ready (no further design decision remains). Per the "one module at a time, wait for approval" rule, the next implementation target is **Stage 2's Colab wiring**, followed by **Stage 3 (Vessel Segmentation)** — the first newly-trainable module under the frozen architecture — with explicit approval requested before writing code for each.

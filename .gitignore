@@ -8,6 +8,7 @@ description_text.txt
 diabetic_retinoplasty.code-workspace
 # Datasets
 datasets/
+datasets.zip.tmp
 
 # Trained models
 trained_models/

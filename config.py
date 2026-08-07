@@ -27,7 +27,7 @@ of scope for this module.
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -139,3 +139,109 @@ RESULTS_DIR = RESULTS.results_dir
 EYEQ_RAW_DIR = EYEQ.raw_dir
 IQA_MODEL_DIR = EYEQ.model_dir
 IQA_RESULTS_DIR = EYEQ.results_dir
+
+
+# --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---
+# Every dataset under datasets/ follows the same raw/ (read-only) -> processed/
+# (preprocessing output) convention already scaffolded on disk. Rather than
+# adding a fixed field per dataset, these resolve the pair generically by
+# name, each overridable via a `<NAME>_RAW_DIR` / `<NAME>_PROCESSED_DIR`
+# environment variable (e.g. EYEPACS_RAW_DIR, APTOS2019_PROCESSED_DIR).
+
+def dataset_raw_dir(dataset_name):
+    """Path to datasets/<dataset_name>/raw. Read-only -- never written to."""
+    return os.environ.get(f'{dataset_name.upper()}_RAW_DIR') or os.path.join(
+        _REPO_ROOT, 'datasets', dataset_name, 'raw'
+    )
+
+
+def dataset_processed_dir(dataset_name):
+    """Path to datasets/<dataset_name>/processed -- where preprocessing outputs go."""
+    return os.environ.get(f'{dataset_name.upper()}_PROCESSED_DIR') or os.path.join(
+        _REPO_ROOT, 'datasets', dataset_name, 'processed'
+    )
+
+
+# --- Preprocessing configuration (Step 2: Gamma Correction + CLAHE) ---
+
+def _env_float(name, default):
+    """Parse an environment variable as float; `default` when unset/empty."""
+    value = os.environ.get(name)
+    return default if value is None or value == '' else float(value)
+
+
+def _env_int(name, default):
+    """Parse an environment variable as int; `default` when unset/empty."""
+    value = os.environ.get(name)
+    return default if value is None or value == '' else int(value)
+
+
+@dataclass(frozen=True)
+class PreprocessingConfig:
+    """Default Gamma Correction / CLAHE parameters used by
+    image_preprocessing.py. Each field is read from its environment
+    variable when set, otherwise falls back to the documented default
+    below -- these are real, working values meant to be experimented with,
+    not placeholders. image_preprocessing.py's own function arguments
+    always take precedence over these: every function there defaults to
+    `None`, which resolves to the matching field here only when the caller
+    doesn't supply an explicit value."""
+    DEFAULT_GAMMA: float
+    DEFAULT_CLAHE_CLIP_LIMIT: float
+    DEFAULT_CLAHE_TILE_GRID_SIZE: Tuple[int, int]
+
+
+PREPROCESSING = PreprocessingConfig(
+    DEFAULT_GAMMA=_env_float('DEFAULT_GAMMA', 1.2),
+    DEFAULT_CLAHE_CLIP_LIMIT=_env_float('DEFAULT_CLAHE_CLIP_LIMIT', 2.0),
+    DEFAULT_CLAHE_TILE_GRID_SIZE=(
+        _env_int('DEFAULT_CLAHE_TILE_GRID_WIDTH', 8),
+        _env_int('DEFAULT_CLAHE_TILE_GRID_HEIGHT', 8),
+    ),
+)
+
+
+# --- Preprocessing profiles ---
+# Named recipes consumed by image_preprocessing.py's `profile=` argument --
+# different pipeline consumers need different preprocessing behavior from
+# the same module, without each caller having to restate every parameter.
+
+@dataclass(frozen=True)
+class PreprocessingProfile:
+    """A single named preprocessing recipe: which parameters to use, and
+    whether CLAHE runs at all (`clahe_enabled`)."""
+    gamma: float
+    clahe_enabled: bool
+    clip_limit: float
+    tile_grid_size: Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PreprocessingProfiles:
+    """The two preprocessing profiles currently defined:
+
+    - IQA: no preprocessing (gamma=1.0 is an identity transform, CLAHE
+      disabled) -- the Image Quality Assessment model (Step 1) is trained
+      on, and must continue to see, the original unprocessed RGB EyeQ
+      images.
+    - DR: the full approved Step 2 pipeline (Gamma Correction + CLAHE),
+      using PREPROCESSING's centralized defaults.
+    """
+    IQA: PreprocessingProfile
+    DR: PreprocessingProfile
+
+
+PREPROCESSING_PROFILES = PreprocessingProfiles(
+    IQA=PreprocessingProfile(
+        gamma=1.0,
+        clahe_enabled=False,
+        clip_limit=PREPROCESSING.DEFAULT_CLAHE_CLIP_LIMIT,
+        tile_grid_size=PREPROCESSING.DEFAULT_CLAHE_TILE_GRID_SIZE,
+    ),
+    DR=PreprocessingProfile(
+        gamma=PREPROCESSING.DEFAULT_GAMMA,
+        clahe_enabled=True,
+        clip_limit=PREPROCESSING.DEFAULT_CLAHE_CLIP_LIMIT,
+        tile_grid_size=PREPROCESSING.DEFAULT_CLAHE_TILE_GRID_SIZE,
+    ),
+)

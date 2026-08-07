@@ -9,12 +9,12 @@ so this module (and everything that imports it) stays importable outside
 Colab -- e.g. for the static validation this project's workflow requires.
 
 Bootstrapping note: this module itself lives inside the repository (under
-`colab/`), so it cannot be imported until *after* the repository has been
-cloned. The notebook's first cell necessarily duplicates a minimal version
-of `clone_or_update_repo()` for that one bootstrap step -- see
-`colab/notebooks/01_image_quality_assessment.ipynb`. `setup()` calls the
-real `clone_or_update_repo()` again afterwards (idempotent -- a `git pull`
-if already cloned), so the two never drift apart.
+`colab/common/`), so it cannot be imported until *after* the repository has
+been cloned. Every stage notebook's first cell necessarily duplicates a
+minimal version of `clone_or_update_repo()` for that one bootstrap step --
+see `colab/notebooks/stage01_iqa.ipynb`. `setup()` calls the real
+`clone_or_update_repo()` again afterwards (idempotent -- a `git pull` if
+already cloned), so the two never drift apart.
 """
 
 import json
@@ -42,7 +42,7 @@ def clone_or_update_repo(repo_url=colab_config.REPO_URL, repo_dir=colab_config.R
         print(f"Repository already present at {repo_dir}; pulling latest {branch} ...")
         subprocess.run(["git", "-C", repo_dir, "pull", "origin", branch], check=True)
 
-    for path in (repo_dir, posixpath.join(repo_dir, "colab")):
+    for path in (repo_dir, posixpath.join(repo_dir, "colab", "common")):
         if path not in sys.path:
             sys.path.insert(0, path)
     return repo_dir

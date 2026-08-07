@@ -66,7 +66,7 @@ notebook" below before writing training code into one of them.
 |---|---|---|
 | `stage01_iqa.ipynb` | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end (held-out test accuracy 88.05%, F1 86.12%, AUC 96.48%, QWK 0.8987 -- see Section 7 of the notebook and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record). Setup -> Verification -> Dataset Loading -> Model Creation -> Training -> Evaluation -> Export, calling `image_quality_dataset.py` / `image_quality_model.py` / `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`. |
 | `stage02_preprocessing.ipynb` | 2. Image Preprocessing | Template -- **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms this stage needs -- not yet orchestrated here. |
-| `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Per `SEGMENTATION_ARCHITECTURE.md`, inference-only against a pretrained U-Net -- likely will not need `experiment_manager.py`'s training-run tracking at all. |
+| `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Trains a Baseline U-Net on DRIVE + CHASE_DB1 -- see `SEGMENTATION_ARCHITECTURE.md`. Follows the same lifecycle as `stage01_iqa.ipynb` (Setup -> Verification -> Dataset Staging -> Dataset Loading -> Training -> Evaluation -> Export) and uses `experiment_manager.py`'s training-run tracking the same way. |
 | `stage04_lesion_segmentation.ipynb` | 4. Lesion Segmentation | Template. Trains an Attention U-Net on IDRiD -- see `SEGMENTATION_ARCHITECTURE.md`. |
 | `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. Likely trained jointly with Stages 6-8 -- confirm before implementing independently. |
 | `stage06_global_feature_extraction.ipynb` | 6. Global Feature Extraction | Template. Likely trained jointly with Stages 5, 7, 8. |
@@ -87,11 +87,13 @@ here creates, assumes, or depends on any folder beyond it:
 MyDrive/
 └── DiabeticRetinopathy/
     ├── datasets/                      (real data -- never created or modified by this workflow)
-    │   ├── EyeQ/
+    │   ├── EyeQ/                      (Stage 1 only)
     │   │   ├── raw/
     │   │   │   ├── train/{images/, labels.csv}
     │   │   │   └── test/{images/, labels.csv}
     │   │   └── processed/
+    │   ├── DRIVE/                     (Stage 3 training only -- not yet staged here)
+    │   ├── CHASE_DB1/                 (Stage 3 training only -- not yet staged here)
     │   ├── APTOS2019/
     │   └── IDRiD/
     │
@@ -123,9 +125,10 @@ MyDrive/
 
 `experiments/` currently has four module buckets (`IQA`, `VesselSegmentation`, `LesionSegmentation`,
 `FinalClassification`), not eleven -- this matches `PROJECT_CODE.md`'s Models table, since
-Stages 5-8 are very likely trained as one combined `FinalClassification` model, and Stages 3, 9,
-10 don't train a new model at all (inference-only against an upstream checkpoint). See
-`PROJECT_STRUCTURE.md`'s Pipeline Overview for the full stage-to-module mapping.
+Stages 5-8 are very likely trained as one combined `FinalClassification` model, and Stages 9-10
+don't train a new model at all (inference-only against the Stage 8 checkpoint). Stage 3
+(`VesselSegmentation`) and Stage 4 (`LesionSegmentation`) each train their own model within this
+project. See `PROJECT_STRUCTURE.md`'s Pipeline Overview for the full stage-to-module mapping.
 
 `datasets/*/raw` is **never** written to by anything in `colab/` -- it must already contain real,
 uploaded data. `experiments/`, `tensorboard/`, `exported_models/`, and `logs/` (and their module
@@ -197,8 +200,10 @@ dataset_staging.verify_staged_copy(staged_idrid)
 ```
 
 `colab_config.py` already exposes `EYEQ_RAW_DIR`, `APTOS2019_DATASET_DIR`, and
-`IDRID_DATASET_DIR` for exactly this -- no changes to `colab_config.py` or `dataset_staging.py`
-are needed to stage a different dataset.
+`IDRID_DATASET_DIR` for exactly this -- no changes to `dataset_staging.py` itself are needed to
+stage a different dataset. `DRIVE_DATASET_DIR` / `CHASE_DB1_DATASET_DIR` constants do not exist
+in `colab_config.py` yet and will need to be added (mirroring the existing ones) when Stage 3 is
+implemented -- a small, additive `colab_config.py` change, not a `dataset_staging.py` one.
 
 ### Expected speed improvement (estimate)
 
@@ -258,7 +263,9 @@ manual edits are required if your Drive matches the layout above. The notebook w
 ## Where outputs are saved
 
 Everything lands on Google Drive, isolated per run under `experiments/<Module>/<timestamp>/` (see
-the layout above), plus the module's single stable `exported_models/<Module>/best_model.keras`.
+the layout above), plus the module's single stable `exported_models/<Module>/best_model.keras`
+(TensorFlow-based modules) -- `VesselSegmentation`'s exported filename depends on its final
+framework choice (`best_model[.ext]`), per `SEGMENTATION_ARCHITECTURE.md` §6.
 **Nothing important is left on the Colab VM** -- if the runtime disconnects or recycles, only the
 ephemeral repository clone is lost, never your data.
 
@@ -315,8 +322,11 @@ implementation:
 2. Implement that stage's dataset loader, model, and training entry point as top-level repository
    modules (mirroring `image_quality_dataset.py` / `image_quality_model.py` /
    `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`), using
-   `training.Trainer` / `evaluation.Evaluator` internally -- do not reimplement checkpointing,
-   early stopping, or evaluation metrics inside the notebook.
+   `training.Trainer` / `evaluation.Evaluator` internally if that stage is implemented in
+   TensorFlow -- do not reimplement checkpointing, early stopping, or evaluation metrics inside
+   the notebook. If a stage's framework is deliberately left open (e.g. Stage 3 -- see
+   `SEGMENTATION_ARCHITECTURE.md` §6), use an equivalent tool for that framework instead, without
+   changing the stage's documented `pipeline.SegmentationStage` / `ClassificationStage` contract.
 3. Follow `stage01_iqa.ipynb`'s section structure: Setup -> Verification -> Dataset Loading ->
    Model Creation -> Training -> Evaluation -> Export. Reuse `colab/common/setup.py` and
    `colab/common/verify_environment.py` unchanged; write a stage-specific dataset verification
@@ -400,7 +410,7 @@ Run Training  --------------------------------->  reads staged local data; check
 Run Evaluation  -------------------------------->  plots + sample predictions written to Drive
         |
         v
-Run Export  -------------------------------------->  best_model.keras confirmed in exported_models/<Module>/
+Run Export  -------------------------------------->  best_model[.ext] confirmed in exported_models/<Module>/
         |
         v
 Session ends / VM recycles  ------------------------>  every output already safe on Drive

@@ -1,26 +1,36 @@
 """
-Reusable EyeQ dataset verification for the Colab training workflow.
+Reusable dataset verification for the Colab training workflow.
 
-Reuses `image_quality_dataset`'s own loading/decoding functions
-(`_read_labels`, `_decode_image`) instead of reimplementing file-existence
-or JPEG-decoding logic, so a pass here means "the exact code path
+`verify_eyeq_dataset()` is EyeQ-specific (Stage 1): it reuses
+`image_quality_dataset`'s own loading/decoding functions (`_read_labels`,
+`_decode_image`) instead of reimplementing file-existence or JPEG-decoding
+logic, so a pass here means "the exact code path
 `image_quality_dataset.load_eyeq_datasets` will use also works," not just
 "these files happen to exist."
 
+`verify_image_folder()` is generic and dataset-agnostic (Stage 2 and beyond):
+unlike EyeQ, most datasets Stage 2 preprocesses (APTOS2019, IDRiD, ...) are
+plain image folders with no `labels.csv` / quality-class structure to check
+-- it verifies only what's true of any such folder (exists, non-empty,
+a corruption spot check), and is reused for both a raw input folder before
+preprocessing and a processed output folder after.
+
 Every `verify_*` function raises `RuntimeError` with a clear message on
-failure. `verify_eyeq_dataset()` is the entry point the notebook calls; it
-returns a structured `EyeQVerificationReport` once every check passes.
+failure and returns a structured report once every check passes.
 """
 
 import os
+import random
 from dataclasses import dataclass, field
 
+import cv2
 import pandas as pd
 
 import image_quality_dataset as iqd
 
 SAMPLE_SIZE = 50
 CORRUPTION_ABORT_FRACTION = 0.20
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 
 @dataclass(frozen=True)
@@ -144,4 +154,70 @@ def verify_eyeq_dataset(raw_dir, val_split=0.15, sample_size=SAMPLE_SIZE):
         test=split_reports["test"],
         expected_train_split_count=expected_train,
         expected_val_split_count=expected_val,
+    )
+
+
+@dataclass(frozen=True)
+class ImageFolderReport:
+    path: str
+    image_count: int
+    corruption_sampled: int
+    corruption_failures: int
+
+
+def verify_image_folder(path, min_images=1, sample_size=SAMPLE_SIZE):
+    """Generic, dataset-structure-agnostic verification for a flat folder of
+    images -- used by Stage 2 (Image Preprocessing) and any future stage
+    that consumes a plain image folder (APTOS2019, IDRiD, DRIVE, CHASE_DB1,
+    ...), none of which have EyeQ's `labels.csv` / quality-class structure
+    for `verify_eyeq_dataset()` to check.
+
+    Checks, in order: the directory exists; it contains at least
+    `min_images` files with a recognized image extension (matching
+    `image_preprocessing.IMAGE_EXTENSIONS`'s own filter, non-recursive,
+    same as `preprocess_folder()`'s own listing); and a random sample of up
+    to `sample_size` of them decode successfully via `cv2.imread` (a spot
+    check, not a full-folder scan -- mirrors `verify_eyeq_dataset()`'s own
+    `_spot_check_corruption` approach and abort threshold).
+
+    Reusable for both a raw input folder (before preprocessing) and a
+    processed output folder (after) -- it has no opinion on which.
+
+    Raises `RuntimeError` with a specific message on any failed check;
+    returns a structured `ImageFolderReport` once every check passes.
+    """
+    if not os.path.isdir(path):
+        raise RuntimeError(f"Dataset verification failed: {path} is not a directory.")
+
+    image_files = sorted(
+        f for f in os.listdir(path) if f.lower().endswith(IMAGE_EXTENSIONS)
+    )
+    if len(image_files) < min_images:
+        raise RuntimeError(
+            f"Dataset verification failed: {path} contains {len(image_files)} image file(s), "
+            f"expected at least {min_images}."
+        )
+
+    sample = random.Random(42).sample(image_files, k=min(sample_size, len(image_files)))
+    failures = []
+    for name in sample:
+        if cv2.imread(os.path.join(path, name)) is None:
+            failures.append(name)
+
+    if len(sample) > 0 and len(failures) / len(sample) > CORRUPTION_ABORT_FRACTION:
+        raise RuntimeError(
+            f"Dataset verification failed: {len(failures)}/{len(sample)} sampled images in "
+            f"{path} failed to decode ({len(failures) / len(sample):.0%} > "
+            f"{CORRUPTION_ABORT_FRACTION:.0%} threshold). The folder may be corrupted or "
+            "incompletely staged/uploaded."
+        )
+
+    print(
+        f"[{path}] {len(image_files)} images | corrupted (of {len(sample)} sampled): {len(failures)}"
+    )
+    return ImageFolderReport(
+        path=path,
+        image_count=len(image_files),
+        corruption_sampled=len(sample),
+        corruption_failures=len(failures),
     )
