@@ -67,6 +67,20 @@ class ResultsPaths:
 
 
 @dataclass(frozen=True)
+class VesselSegmentationPaths:
+    """Vessel Segmentation (Stage 03) model and results paths.
+
+    Unlike `EyeQPaths`/`ModelPaths` above, `model_dir` holds a vendored
+    pretrained checkpoint (LWNet), not this project's own training output --
+    see SEGMENTATION_ARCHITECTURE.md Sec 1.2/2/6. `results_dir` is used only
+    for smoke-test / qualitative-verification artifacts (sample predictions,
+    visualizations), not a training evaluation report, since this stage has
+    no training or benchmark run of its own yet."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -116,6 +130,11 @@ EYEQ = EyeQPaths(
     results_dir=os.environ.get('IQA_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'image_quality_assessment'),
 )
 
+VESSEL_SEGMENTATION = VesselSegmentationPaths(
+    model_dir=os.environ.get('VESSEL_SEG_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'vessel_segmentation'),
+    results_dir=os.environ.get('VESSEL_SEG_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'vessel_segmentation'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -139,6 +158,9 @@ RESULTS_DIR = RESULTS.results_dir
 EYEQ_RAW_DIR = EYEQ.raw_dir
 IQA_MODEL_DIR = EYEQ.model_dir
 IQA_RESULTS_DIR = EYEQ.results_dir
+
+VESSEL_SEG_MODEL_DIR = VESSEL_SEGMENTATION.model_dir
+VESSEL_SEG_RESULTS_DIR = VESSEL_SEGMENTATION.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---
@@ -174,6 +196,14 @@ def _env_int(name, default):
     """Parse an environment variable as int; `default` when unset/empty."""
     value = os.environ.get(name)
     return default if value is None or value == '' else int(value)
+
+
+def _env_bool(name, default):
+    """Parse an environment variable as bool; `default` when unset/empty."""
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 @dataclass(frozen=True)
@@ -245,3 +275,16 @@ PREPROCESSING_PROFILES = PreprocessingProfiles(
         tile_grid_size=PREPROCESSING.DEFAULT_CLAHE_TILE_GRID_SIZE,
     ),
 )
+
+
+# --- Vessel Segmentation configuration (Step 3: pretrained LWNet inference) ---
+# Only test-time augmentation is exposed here -- everything else about this
+# stage (architecture, checkpoint, FOV-crop/resize/threshold procedure) is
+# fixed by the vendored checkpoint itself (see vessel_segmentation_model.py /
+# vessel_segmentation_inference.py), not a tunable knob.
+
+# Default True: matches the LWNet authors' own default (`tta='from_preds'`
+# in their predict_one_image.py) -- 4-view flip-averaged prediction. Set
+# VESSEL_SEG_TTA=false to run a single forward pass per image instead
+# (faster, e.g. for large-batch pipeline runs), without editing code.
+VESSEL_SEG_TTA = _env_bool('VESSEL_SEG_TTA', True)

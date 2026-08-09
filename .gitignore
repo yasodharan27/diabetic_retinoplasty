@@ -29,3 +29,8 @@ trained_models/
 models/**/*.keras
 models/**/*.h5
 models/**/*.weights.h5
+
+# Vendored pretrained checkpoints (not committed to git, same as trained
+# TensorFlow models above -- staged from Google Drive per the Colab
+# workflow instead; see SEGMENTATION_ARCHITECTURE.md Sec 6)
+models/vessel_segmentation/best_model.pth
