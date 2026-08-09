@@ -69,7 +69,7 @@ Any model-specific adaptation of Stage 02's output (channel handling, resizing, 
 | Module | Model |
 |---------|-------|
 | Image Quality Assessment | EfficientNetB0 |
-| Vessel Segmentation | Baseline U-Net (trained within this project) |
+| Vessel Segmentation | Pretrained LWNet (external, inference only — not trained within this project) |
 | Lesion Segmentation | Attention U-Net |
 | Local Feature Extraction | Adaptive Multi-Kernel CNN |
 | Global Feature Extraction | Dual-Scale Swin Transformer |
@@ -78,7 +78,7 @@ Any model-specific adaptation of Stage 02's output (channel handling, resizing, 
 | Uncertainty | Monte Carlo Dropout |
 | Explainability | Grad-CAM++, SHAP, Attention Rollout |
 
-Vessel Segmentation is named "Baseline U-Net" rather than "Standard U-Net" deliberately: the exact architecture may evolve during implementation, and this table should not need renaming when it does.
+Vessel Segmentation uses [`lwnet`](https://github.com/agaldran/lwnet) ("The Little W-Net That Could," Galdrán et al., MIT-licensed), a pretrained, externally-sourced vessel segmentation model, for inference only. This reverses an earlier, since-superseded design ("Baseline U-Net," trained within this project on DRIVE + CHASE_DB1); see `SEGMENTATION_ARCHITECTURE.md` §1.2/§2 and its Appendix for the full design history.
 
 ---
 
@@ -91,14 +91,6 @@ Datasets
   - Reconstructed (one-time) from EyePACS using the official EyeQ generation repository. The reconstructed EyeQ dataset is the dataset actually used for IQA; EyePACS itself is not part of this project (see "EyePACS" below).
   - Used only for Stage 01.
 
-- DRIVE
-  - Vessel Segmentation training (Stage 03).
-  - Used only for Stage 03 training.
-
-- CHASE_DB1
-  - Vessel Segmentation training (Stage 03).
-  - Used only for Stage 03 training.
-
 - APTOS 2019
   - Ordinal DR Classification (Stage 08) and other downstream grading/classification stages.
 
@@ -110,7 +102,7 @@ Datasets
   - Not part of the implemented training or inference pipeline.
   - Not required to reproduce or run this repository.
 
-DRIVE and CHASE_DB1 are officially approved project datasets, added specifically to make Stage 03 (Vessel Segmentation) trainable within this project. No other datasets are permitted without explicit request.
+DRIVE and CHASE_DB1 are **not** project datasets. They were approved under an earlier, since-superseded design that trained Vessel Segmentation within this project; Stage 03 now runs a pretrained external checkpoint (LWNet) instead and requires no dataset of its own — see `SEGMENTATION_ARCHITECTURE.md`'s Appendix A.1 for the history. No other datasets are permitted without explicit request.
 
 ---
 
@@ -164,7 +156,7 @@ This is a production/research project, not a demonstration project.
 
 1. Do not implement placeholder logic, simulated outputs, fake metrics, or dummy pipelines.
 2. Unit tests may use synthetic or temporary data only, to verify correctness of individual functions.
-3. All actual project functionality must operate on the real datasets: EyeQ, DRIVE, CHASE_DB1, APTOS2019, IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see Datasets section).
+3. All actual project functionality must operate on the real datasets: EyeQ, APTOS2019, IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see Datasets section). Vessel Segmentation (Stage 03) uses a vendored pretrained checkpoint and requires no project dataset of its own.
 4. Do not create "toy" implementations intended to be replaced later.
 5. Every module should be fully implementable and immediately usable in the final pipeline.
 6. If verification of a full dataset would require hours of execution, perform lightweight correctness tests only -- never replace the actual implementation with a simplified version.
@@ -229,7 +221,7 @@ All preprocessing outputs must be written to the corresponding `processed` folde
 
 The original datasets must always remain untouched.
 
-Ground-truth mask/label data (e.g. DRIVE's `1st_manual`, CHASE_DB1's vessel masks, IDRiD's lesion masks and grading CSVs) is never run through Stage 02 preprocessing. Only fundus images pass through Stage 02; masks and labels are read directly from `raw/` by each stage's own dataset loader.
+Ground-truth mask/label data (e.g. IDRiD's lesion masks and grading CSVs) is never run through Stage 02 preprocessing. Only fundus images pass through Stage 02; masks and labels are read directly from `raw/` by each stage's own dataset loader.
 
 -----
 ## Deployment Requirement
@@ -257,7 +249,7 @@ Every trainable stage owns its own:
 - inference
 - exported model
 
-Stages communicate with each other **only** through their documented input/output contracts (e.g. `pipeline.SegmentationStage`'s `predict()` return shape, or a stage's documented tensor contract in `SEGMENTATION_ARCHITECTURE.md`). No stage may directly depend on another stage's internal implementation — its model class, its training loop, its private helper functions, or its choice of framework. A stage's internals may change freely (including which framework it's implemented in — see `SEGMENTATION_ARCHITECTURE.md` §6 for where this already applies to Stage 03) as long as its documented contract stays the same.
+Stages communicate with each other **only** through their documented input/output contracts (e.g. `pipeline.SegmentationStage`'s `predict()` return shape, or a stage's documented tensor contract in `SEGMENTATION_ARCHITECTURE.md`). No stage may directly depend on another stage's internal implementation — its model class, its training loop, its private helper functions, or its choice of framework. A stage's internals may change freely (including which framework it's implemented in, or whether it is trained within this project at all — see `SEGMENTATION_ARCHITECTURE.md` §6/Appendix A.1 for how Stage 03 changed both) as long as its documented contract stays the same.
 
 This formalizes and generalizes the Deployment Requirement above: it is not just about every trainable module having both a training and an inference half, but about every stage being independently replaceable without touching any other stage's code.
 
@@ -265,4 +257,4 @@ This formalizes and generalizes the Deployment Requirement above: it is not just
 
 ## Architecture Freeze
 
-The architecture described in this document, `IMPLEMENTATION_PLAN.md`, `PROJECT_STRUCTURE.md`, `SEGMENTATION_ARCHITECTURE.md`, `README.md`, and `colab/README.md` is frozen as of the documentation refactor that finalized Stage 02 (RGB, Gamma, CLAHE, deterministic, generated once per the Stage 02 Preprocessing Policy above) and Stage 03 (trainable Baseline U-Net on DRIVE + CHASE_DB1, framework-agnostic model storage per `SEGMENTATION_ARCHITECTURE.md` §6). Earlier alternatives considered for these two stages (a single-channel canonical image; a pretrained, inference-only Vessel Segmentation model; a TensorFlow-only model storage format for Stage 03) are retained only in `SEGMENTATION_ARCHITECTURE.md`'s dedicated design-history appendix, not restated as live guidance anywhere else. Implementation of Stage 02 and Stage 03 may now proceed, one module at a time, per the Development Workflow above and the Modular Stage Principle above.
+The architecture described in this document, `IMPLEMENTATION_PLAN.md`, `PROJECT_STRUCTURE.md`, `SEGMENTATION_ARCHITECTURE.md`, `README.md`, and `colab/README.md` is frozen as of the documentation refactor that finalized Stage 02 (RGB, Gamma, CLAHE, deterministic, generated once per the Stage 02 Preprocessing Policy above) and, most recently, revised Stage 03 to a **pretrained LWNet model, run for inference only** (`SEGMENTATION_ARCHITECTURE.md` §1.2/§2), reversing an intermediate design that trained a "Baseline U-Net" within this project on DRIVE + CHASE_DB1. Earlier alternatives considered for these stages (a single-channel canonical image; a trainable Baseline U-Net on DRIVE + CHASE_DB1; a framework-agnostic, still-undecided model storage format for Stage 03) are retained only in `SEGMENTATION_ARCHITECTURE.md`'s dedicated design-history appendix, not restated as live guidance anywhere else. Implementation of Stage 02 (complete) and Stage 03 (LWNet integration) may now proceed, one module at a time, per the Development Workflow above and the Modular Stage Principle above.

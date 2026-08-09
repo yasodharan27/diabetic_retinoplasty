@@ -17,7 +17,7 @@ diagrams drifting out of sync — see README's "Master Pipeline" section.
 | `training/` | Reusable, model-agnostic training framework (`Trainer`, callbacks, losses, metrics, optimizers). No models or dataset loading. |
 | `evaluation/` | Reusable, model-agnostic evaluation framework (`Evaluator`, metrics, visualization). Operates on prediction arrays only. |
 | `pipeline/` | Abstract base classes (`TrainableStage`, `InferenceStage`, `SegmentationStage`, `ClassificationStage`) fixing the contract future pipeline stages must implement. Defines no models. |
-| `datasets/` | Real, local datasets: `EyeQ/`, `DRIVE/`, `CHASE_DB1/`, `APTOS2019/`, `IDRiD/`. `raw/` subfolders are read-only; never modified in place. |
+| `datasets/` | Real, local datasets: `EyeQ/`, `APTOS2019/`, `IDRiD/`. `raw/` subfolders are read-only; never modified in place. Vessel Segmentation (Stage 3) uses a vendored pretrained checkpoint, not a dataset here. |
 | `colab/` | The official Google Colab training infrastructure -- `common/` (reusable setup/verification/experiment modules) and `notebooks/` (one notebook per pipeline stage). See "Colab Workflow" below. |
 | `tests/` | Pytest unit tests. Use synthetic/temporary data only, per `PROJECT_CODE.md`'s Implementation Rules -- never a substitute for real-data verification. |
 | `docs/` | Operational documentation, e.g. `docs/FIRST_TRAINING_CHECKLIST.md`. |
@@ -42,10 +42,9 @@ fill in.
   TensorFlow/Keras-based. Any trainable stage implemented in TensorFlow builds its own model
   and dataset, then hands both to `Trainer` -- this is how `train_image_quality.py` already
   works, and how Lesion Segmentation (Attention U-Net, fixed to TensorFlow) works too. Vessel
-  Segmentation's framework is deliberately left open (`SEGMENTATION_ARCHITECTURE.md` §6, named
-  "Baseline U-Net" for the same reason) -- it reuses this package only if TensorFlow ends up
-  being its final framework; an equivalent training loop is used otherwise, without changing its
-  documented `pipeline.SegmentationStage` contract.
+  Segmentation does not use this package at all: it is a pretrained PyTorch checkpoint (LWNet,
+  `SEGMENTATION_ARCHITECTURE.md` §2/§6), integrated for inference only, with no training loop of
+  its own in this project.
 - **`evaluation/`** -- `Evaluator` (accuracy/precision/recall/F1/confusion matrix/ROC/AUC/QWK/
   calibration) plus `visualization.py`'s plotting helpers. Operates purely on `(y_true, y_pred,
   y_proba)` arrays -- classification-oriented; segmentation stages (Vessel, Lesion) use
@@ -56,8 +55,7 @@ fill in.
   does not inherit from it.
 - **`datasets/`** -- real data only, `<dataset>/raw/` (read-only) and `<dataset>/processed/`
   (preprocessing output) per dataset, resolved via `config.py`'s `dataset_raw_dir()` /
-  `dataset_processed_dir()` helpers (or the dedicated `EyeQPaths` for EyeQ specifically). DRIVE
-  and CHASE_DB1 resolve through the same generic helpers -- no dedicated dataclass needed.
+  `dataset_processed_dir()` helpers (or the dedicated `EyeQPaths` for EyeQ specifically).
 - **`colab/`** -- see "Colab Workflow" below.
 - **`tests/`** -- `test_config.py`, `test_image_preprocessing.py`, `test_pipeline.py`. Synthetic/
   temporary data only, verifying function-level correctness -- real-data verification happens via
@@ -73,8 +71,6 @@ fill in.
 | Dataset | Purpose | Current Usage | Future Usage |
 |---|---|---|---|
 | **EyeQ** | Image quality classification (`Good`/`Usable`/`Reject`) | **Active** -- trains and evaluates Stage 1 (Image Quality Assessment) today, via `image_quality_dataset.py` / `train_image_quality.py` / `colab/notebooks/stage01_iqa.ipynb`. | Continues to gate every later stage: only `Good`/`Usable` images should reach Stage 2 preprocessing. Used only for Stage 1. |
-| **DRIVE** | Retinal vessel segmentation training | Not yet on disk / not yet consumed. | Trains Stage 3 (Vessel Segmentation, Baseline U-Net) — used only for Stage 3 training. |
-| **CHASE_DB1** | Retinal vessel segmentation training | Not yet on disk / not yet consumed. | Trains Stage 3 (Vessel Segmentation, Baseline U-Net), alongside DRIVE — used only for Stage 3 training. |
 | **APTOS2019** | Diabetic retinopathy severity classification (5 classes, 0-4) | Referenced by the pre-refactor baseline scripts (`efficientnet_model.py`, `swin_transformer.py`, `train_hybrid_model.py`) at the repository root. | Primary training set for Stage 8 (CORN Classification) once the target architecture's classification head is implemented. |
 | **IDRiD** | Lesion segmentation (microaneurysms, haemorrhages, hard/soft exudates, optic disc); also grading | Not yet consumed by any implemented stage. | Trains Stage 4 (Lesion Segmentation, Attention U-Net) and supports downstream grading tasks. |
 
@@ -83,11 +79,13 @@ official EyeQ dataset via EyeQ's own generation repository. EyePACS is not prese
 `datasets/`, is not read by any script here, and is not required to reproduce or run this
 repository -- see `PROJECT_CODE.md`'s Datasets section for the full history.
 
-**Vessel Segmentation (Stage 3) trains within this project**, on DRIVE + CHASE_DB1 — both newly
-approved specifically to make this possible, since none of EyeQ, APTOS2019, or IDRiD ship
-vessel-level masks. See `SEGMENTATION_ARCHITECTURE.md` for the full specification, including its
-design-history appendix documenting an earlier design (a pretrained, inference-only Vessel
-Segmentation model) that this supersedes.
+**Vessel Segmentation (Stage 3) does not train within this project.** It integrates a pretrained,
+externally-sourced checkpoint (LWNet, trained by its own authors on DRIVE) for inference only, and
+needs no dataset of its own under `datasets/`. An intermediate design added DRIVE and CHASE_DB1 as
+project datasets specifically to train a "Baseline U-Net" within this project instead; that design
+was itself superseded by the current pretrained-LWNet design — neither DRIVE nor CHASE_DB1 is a
+project dataset today. See `SEGMENTATION_ARCHITECTURE.md` for the full specification, including
+its design-history appendix documenting this full chronology.
 
 ---
 
@@ -115,13 +113,15 @@ Processed Dataset (datasets/<name>/processed/, generated once, reused by
     │
     ▼
 Stage-specific Dataset Loader (image_quality_dataset.py,
-    vessel_segmentation_dataset.py, lesion_segmentation_dataset.py, ...)
+    lesion_segmentation_dataset.py, ...)
     │
     ▼
 Training / Inference
 ```
 
-Ground-truth mask/label data (DRIVE's `1st_manual`, CHASE_DB1's vessel masks, IDRiD's lesion masks and grading CSVs) never enters Stage 02 — only fundus images do. Each stage-specific dataset loader reads mask/label data directly from `raw/`, in parallel with reading the corresponding processed image from `processed/`.
+Ground-truth mask/label data (IDRiD's lesion masks and grading CSVs) never enters Stage 02 — only fundus images do. Each stage-specific dataset loader reads mask/label data directly from `raw/`, in parallel with reading the corresponding processed image from `processed/`.
+
+Vessel Segmentation (Stage 3) does not appear in this lifecycle at all as a *dataset* consumer — it has no `datasets/<name>/` directory of its own. It still consumes Stage 02's processed output as its *inference* input, the same as every other downstream stage; it just has no dataset loader or training step to reach that point.
 
 ---
 
@@ -153,10 +153,10 @@ for the visual end-to-end flow.
 - **Purpose:** Segment retinal vasculature.
 - **Input:** Preprocessed RGB images (Stage 2).
 - **Output:** Single-channel vessel probability map, `(H, W, 1)`, values in `[0, 1]`.
-- **Model:** Baseline U-Net (named to allow the exact architecture to evolve during implementation without a rename).
-- **Training dataset:** DRIVE + CHASE_DB1 — **trained within this project**, not pretrained. Both datasets are run through Stage 02's own pipeline before training, so the model sees the same distribution at training time that it will see at inference time. Used only for Stage 3 training.
+- **Model:** Pretrained LWNet (`wnet`, MIT-licensed, external) — **inference only, not trained within this project.**
+- **Training dataset:** None. LWNet's vendored checkpoint was trained by its original authors on DRIVE, entirely outside this project; Stage 3 stages, trains, or evaluates nothing.
 - **Dependencies:** Stage 2.
-- **Status:** Not implemented. Design finalized (`SEGMENTATION_ARCHITECTURE.md` §1.2/§2); `colab/notebooks/stage03_vessel_segmentation.ipynb` is a template only. Follows the exact same lifecycle *shape* as Stage 1: dataset → training → evaluation → export → inference, mirroring `image_quality_*.py`'s file structure, and reusing the existing Colab infrastructure (`experiment_manager.py`, `dataset_staging.py` -- framework-agnostic) unmodified. Whether it also reuses `training.Trainer` / `training.build_metrics("segmentation")` depends on Stage 3's still-open framework decision (`SEGMENTATION_ARCHITECTURE.md` §6) -- those are TensorFlow-specific and apply only if that's the framework chosen.
+- **Status:** Not implemented. Design finalized (`SEGMENTATION_ARCHITECTURE.md` §1.2/§2); `colab/notebooks/stage03_vessel_segmentation.ipynb` is a template only. Unlike every other trainable stage, this one has no dataset → training → evaluation → export lifecycle — it vendors a pretrained checkpoint and exposes only `load()`/`predict()`/`predict_batch()` (`pipeline.SegmentationStage`, §5). `training.Trainer` / `training.build_metrics("segmentation")` (TensorFlow-specific) do not apply to this stage.
 
 ### 4. Lesion Segmentation
 - **Purpose:** Segment DR lesions (microaneurysms, hemorrhages, exudates).
@@ -252,10 +252,11 @@ Full detail lives in `colab/README.md`; summary here for architectural context.
 - **Experiments** (`colab/common/experiment_manager.py`): every training run gets its own
   timestamped, isolated folder under `experiments/<Module>/YYYY-MM-DD_HH-MM-SS/` on Google Drive
   (`checkpoints/`, `logs/`, `tensorboard/`, `evaluation/`, `predictions/`, `metadata.json`),
-  never overwritten, resumable. `colab_config.py`'s `PIPELINE_MODULES` already includes
+  never overwritten, resumable. `colab_config.py`'s `PIPELINE_MODULES` still includes
   `"VesselSegmentation"` alongside `"IQA"`, `"LesionSegmentation"`, and `"FinalClassification"` --
-  this infrastructure was already provisioned for a trainable Vessel Segmentation stage before
-  this refactor, and needs no changes to support it.
+  this entry is now used only to resolve `exported_models/VesselSegmentation/` (where the vendored
+  LWNet checkpoint lands), since Stage 3 never populates `experiments/VesselSegmentation/` with an
+  actual training run.
 - **Model export:** the best checkpoint from each run is copied to a stable
   `exported_models/<Module>/best_model.keras` on Drive (overwritten by each new "best" run), kept
   separate from that run's own permanent `checkpoints/best.keras` archive.
@@ -263,9 +264,10 @@ Full detail lives in `colab/README.md`; summary here for architectural context.
   experiment's `logs/` can be pointed at directly to review it later.
 - **Resuming:** point `RESUME_EXPERIMENT_DIR` at a previous experiment's folder instead of
   leaving it `None` -- see `colab/README.md`'s "How to resume training".
-- **Stage 3 follows the identical 12-step notebook workflow as Stage 1:** Bootstrap → Setup →
-  Environment Verification → Dataset Staging → Dataset Verification → Hyperparameters →
-  Experiment Creation → Dataset Loading → Training → Evaluation → Export → Final Summary.
+- **Stage 3 does not follow Stage 1's 12-step training workflow.** It has no dataset to stage, no
+  training loop, and no evaluation run — its notebook is scoped to Bootstrap → Setup →
+  Environment Verification → Checkpoint Integration → Inference Verification → Export/Final
+  Summary, confirming the vendored LWNet checkpoint loads and predicts correctly.
 
 ---
 
@@ -297,7 +299,7 @@ the resulting model/evaluation artifacts are reviewed locally before being commi
 | Output | Local CLI run (`train_image_quality.py`, etc.) | Colab run |
 |---|---|---|
 | Trained models (`best.keras`, `last.keras` for TensorFlow-based modules) | `models/<module>/training_run/checkpoints/` | `experiments/<Module>/<timestamp>/checkpoints/` (Drive) |
-| Exported "current best" model | `models/<module>/best_model.keras` (TensorFlow-based modules) or `best_model[.ext]` (Vessel Segmentation -- extension depends on its final framework choice, see `SEGMENTATION_ARCHITECTURE.md` §6) | `exported_models/<Module>/best_model.keras` or `best_model[.ext]` accordingly (Drive) |
+| Exported "current best" model | `models/<module>/best_model.keras` (TensorFlow-based modules) or `models/vessel_segmentation/best_model.pth` (vendored LWNet checkpoint, not a training output — see `SEGMENTATION_ARCHITECTURE.md` §6) | `exported_models/<Module>/best_model.keras` or `exported_models/VesselSegmentation/best_model.pth` accordingly (Drive) |
 | Metrics log (`metrics.csv`) | `models/<module>/training_run/checkpoints/metrics.csv` | `experiments/<Module>/<timestamp>/checkpoints/metrics.csv` (Drive) |
 | TensorBoard logs | `models/<module>/training_run/logs/` | `experiments/<Module>/<timestamp>/logs/` (live) + `.../tensorboard/` (archival copy) (Drive) |
 | Evaluation plots/report | `results/<module>/` | `experiments/<Module>/<timestamp>/evaluation/` (Drive) |
@@ -305,7 +307,7 @@ the resulting model/evaluation artifacts are reviewed locally before being commi
 | Run metadata | *(not tracked for CLI runs)* | `experiments/<Module>/<timestamp>/metadata.json` (Drive) |
 | Session/setup logs | N/A | `logs/setup_<timestamp>.json` (Drive, global) |
 
-Vessel Segmentation (`models/vessel_segmentation/`, `results/vessel_segmentation/`) now follows this table exactly, the same as every other trainable module — it is no longer a special case with no `training_run/` or `results/` directory.
+Vessel Segmentation (`models/vessel_segmentation/`) is a special case in this table: it has no `training_run/` and no `results/` directory, since nothing about it is trained or evaluated within this project — only the vendored checkpoint itself lands there.
 
 ---
 

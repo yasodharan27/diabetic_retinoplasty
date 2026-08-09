@@ -66,7 +66,7 @@ notebook" below before writing training code into one of them.
 |---|---|---|
 | `stage01_iqa.ipynb` | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end (held-out test accuracy 88.05%, F1 86.12%, AUC 96.48%, QWK 0.8987 -- see Section 7 of the notebook and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record). Setup -> Verification -> Dataset Loading -> Model Creation -> Training -> Evaluation -> Export, calling `image_quality_dataset.py` / `image_quality_model.py` / `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`. |
 | `stage02_preprocessing.ipynb` | 2. Image Preprocessing | Template -- **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms this stage needs -- not yet orchestrated here. |
-| `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Trains a Baseline U-Net on DRIVE + CHASE_DB1 -- see `SEGMENTATION_ARCHITECTURE.md`. Follows the same lifecycle as `stage01_iqa.ipynb` (Setup -> Verification -> Dataset Staging -> Dataset Loading -> Training -> Evaluation -> Export) and uses `experiment_manager.py`'s training-run tracking the same way. |
+| `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Integrates a pretrained LWNet checkpoint for inference only -- see `SEGMENTATION_ARCHITECTURE.md`. Does **not** follow `stage01_iqa.ipynb`'s Dataset Staging -> Training -> Evaluation lifecycle: no dataset to stage, no training loop, no `experiment_manager.py` training run. Scoped to Setup -> Verification -> Checkpoint Integration -> Inference Verification -> Export. |
 | `stage04_lesion_segmentation.ipynb` | 4. Lesion Segmentation | Template. Trains an Attention U-Net on IDRiD -- see `SEGMENTATION_ARCHITECTURE.md`. |
 | `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. Likely trained jointly with Stages 6-8 -- confirm before implementing independently. |
 | `stage06_global_feature_extraction.ipynb` | 6. Global Feature Extraction | Template. Likely trained jointly with Stages 5, 7, 8. |
@@ -92,10 +92,9 @@ MyDrive/
     │   │   │   ├── train/{images/, labels.csv}
     │   │   │   └── test/{images/, labels.csv}
     │   │   └── processed/
-    │   ├── DRIVE/                     (Stage 3 training only -- not yet staged here)
-    │   ├── CHASE_DB1/                 (Stage 3 training only -- not yet staged here)
     │   ├── APTOS2019/
-    │   └── IDRiD/
+    │   └── IDRiD/                     (no DRIVE/ or CHASE_DB1/ -- Stage 3 uses a vendored
+    │                                    pretrained checkpoint, not a staged dataset)
     │
     ├── experiments/                   (auto-created)
     │   ├── IQA/
@@ -126,9 +125,11 @@ MyDrive/
 `experiments/` currently has four module buckets (`IQA`, `VesselSegmentation`, `LesionSegmentation`,
 `FinalClassification`), not eleven -- this matches `PROJECT_CODE.md`'s Models table, since
 Stages 5-8 are very likely trained as one combined `FinalClassification` model, and Stages 9-10
-don't train a new model at all (inference-only against the Stage 8 checkpoint). Stage 3
-(`VesselSegmentation`) and Stage 4 (`LesionSegmentation`) each train their own model within this
-project. See `PROJECT_STRUCTURE.md`'s Pipeline Overview for the full stage-to-module mapping.
+don't train a new model at all (inference-only against the Stage 8 checkpoint). Of the two
+segmentation stages, only Stage 4 (`LesionSegmentation`) actually produces a training run under
+`experiments/`; Stage 3 (`VesselSegmentation`) never does; its bucket under `exported_models/`
+holds a vendored pretrained checkpoint instead of a training output. See `PROJECT_STRUCTURE.md`'s
+Pipeline Overview for the full stage-to-module mapping.
 
 `datasets/*/raw` is **never** written to by anything in `colab/` -- it must already contain real,
 uploaded data. `experiments/`, `tensorboard/`, `exported_models/`, and `logs/` (and their module
@@ -201,9 +202,9 @@ dataset_staging.verify_staged_copy(staged_idrid)
 
 `colab_config.py` already exposes `EYEQ_RAW_DIR`, `APTOS2019_DATASET_DIR`, and
 `IDRID_DATASET_DIR` for exactly this -- no changes to `dataset_staging.py` itself are needed to
-stage a different dataset. `DRIVE_DATASET_DIR` / `CHASE_DB1_DATASET_DIR` constants do not exist
-in `colab_config.py` yet and will need to be added (mirroring the existing ones) when Stage 3 is
-implemented -- a small, additive `colab_config.py` change, not a `dataset_staging.py` one.
+stage a different dataset. Stage 3 (Vessel Segmentation) does not need a dataset constant here at
+all: it integrates a vendored pretrained checkpoint rather than staging a dataset, so
+`dataset_staging.py` is not part of its notebook.
 
 ### Expected speed improvement (estimate)
 
@@ -264,8 +265,9 @@ manual edits are required if your Drive matches the layout above. The notebook w
 
 Everything lands on Google Drive, isolated per run under `experiments/<Module>/<timestamp>/` (see
 the layout above), plus the module's single stable `exported_models/<Module>/best_model.keras`
-(TensorFlow-based modules) -- `VesselSegmentation`'s exported filename depends on its final
-framework choice (`best_model[.ext]`), per `SEGMENTATION_ARCHITECTURE.md` §6.
+(TensorFlow-based modules) -- `exported_models/VesselSegmentation/best_model.pth` is the vendored
+LWNet checkpoint, uploaded once rather than produced by a training run, per
+`SEGMENTATION_ARCHITECTURE.md` §6.
 **Nothing important is left on the Colab VM** -- if the runtime disconnects or recycles, only the
 ephemeral repository clone is lost, never your data.
 
@@ -324,11 +326,14 @@ implementation:
    `train_image_quality.py` / `evaluate_image_quality.py` / `image_quality_inference.py`), using
    `training.Trainer` / `evaluation.Evaluator` internally if that stage is implemented in
    TensorFlow -- do not reimplement checkpointing, early stopping, or evaluation metrics inside
-   the notebook. If a stage's framework is deliberately left open (e.g. Stage 3 -- see
-   `SEGMENTATION_ARCHITECTURE.md` §6), use an equivalent tool for that framework instead, without
-   changing the stage's documented `pipeline.SegmentationStage` / `ClassificationStage` contract.
+   the notebook. Stage 3 (Vessel Segmentation) is the one exception to this whole step: it has no
+   dataset loader or training entry point at all, only a model-loading + inference module wrapping
+   a vendored pretrained checkpoint (PyTorch, fixed -- see `SEGMENTATION_ARCHITECTURE.md` §6),
+   without changing the stage's documented `pipeline.SegmentationStage` contract.
 3. Follow `stage01_iqa.ipynb`'s section structure: Setup -> Verification -> Dataset Loading ->
-   Model Creation -> Training -> Evaluation -> Export. Reuse `colab/common/setup.py` and
+   Model Creation -> Training -> Evaluation -> Export (Stage 3 instead follows the reduced
+   Setup -> Verification -> Checkpoint Integration -> Inference Verification -> Export shape noted
+   in the notebook table above). Reuse `colab/common/setup.py` and
    `colab/common/verify_environment.py` unchanged; write a stage-specific dataset verification
    function (mirroring `verify_dataset.verify_eyeq_dataset()`'s shape) only if that stage's
    dataset needs different checks than EyeQ's.

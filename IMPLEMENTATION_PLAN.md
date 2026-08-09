@@ -12,7 +12,7 @@ This is a production/research project, not a demonstration project.
 
 1. Do not implement placeholder logic, simulated outputs, fake metrics, or dummy pipelines.
 2. Unit tests may use synthetic or temporary data only, to verify correctness of individual functions.
-3. All actual project functionality must operate on the real datasets: EyeQ, DRIVE, CHASE_DB1, APTOS2019, and IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see `PROJECT_CODE.md`'s Datasets section).
+3. All actual project functionality must operate on the real datasets: EyeQ, APTOS2019, and IDRiD. EyePACS was used only once, historically, to reconstruct EyeQ, and is not required to reproduce or run this repository (see `PROJECT_CODE.md`'s Datasets section). Vessel Segmentation (Stage 03) uses a vendored pretrained checkpoint and requires no project dataset of its own.
 4. Do not create "toy" implementations intended to be replaced later.
 5. Every module should be fully implementable and immediately usable in the final pipeline.
 6. If verification of a full dataset would require hours of execution, perform lightweight correctness tests only -- never replace the actual implementation with a simplified version.
@@ -76,7 +76,7 @@ Standard (non-plus-plus) Grad-CAM: builds a sub-model exposing the `swin_refine`
 
 1. Image Quality Assessment — EfficientNetB0
 2. Image Preprocessing — Gamma Correction, CLAHE (RGB in, RGB out; no green-channel extraction, Ben Graham, median denoise, histogram equalization, resizing, or augmentation)
-3. Vessel Segmentation — Baseline U-Net, **trained within this project** on DRIVE + CHASE_DB1
+3. Vessel Segmentation — Pretrained LWNet, **inference only, not trained within this project**
 4. Lesion Segmentation — Attention U-Net, trained on IDRiD
 5. Local Feature Extraction — Adaptive Multi-Kernel CNN
 6. Global Feature Extraction — Dual-Scale Swin Transformer
@@ -86,7 +86,7 @@ Standard (non-plus-plus) Grad-CAM: builds a sub-model exposing the `swin_refine`
 10. Explainability — Grad-CAM++, SHAP, Attention Rollout
 11. Evaluation
 
-Approved datasets: **EyeQ** (image quality, Stage 01 only), **DRIVE** and **CHASE_DB1** (Vessel Segmentation training, Stage 03 only), **APTOS 2019** (classification), and **IDRiD** (lesion segmentation and grading). EyePACS itself is not part of the implemented training or inference pipeline and is not required to reproduce it. No other datasets permitted without explicit request.
+Approved datasets: **EyeQ** (image quality, Stage 01 only), **APTOS 2019** (classification), and **IDRiD** (lesion segmentation and grading). EyePACS itself is not part of the implemented training or inference pipeline and is not required to reproduce it. Vessel Segmentation (Stage 03) uses a vendored pretrained checkpoint (LWNet) and needs no dataset of its own — DRIVE and CHASE_DB1, approved under an earlier superseded design, are no longer project datasets (see `SEGMENTATION_ARCHITECTURE.md` Appendix A.1). No other datasets permitted without explicit request.
 
 ---
 
@@ -96,7 +96,7 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **DRIVE** and **CHAS
 |---|---|---|---|---|
 | 1 | Image Quality Assessment | EfficientNetB0 (quality classifier) | Implemented, trained, verified — see `PROJECT_STRUCTURE.md`'s Stage 1 results. | **Completed** |
 | 2 | Image Preprocessing | Gamma Correction, CLAHE only (RGB in/out, deterministic, generated once) | `image_preprocessing.py` implements exactly this. No green-channel extraction, Ben Graham, median denoise, or resize — all explicitly excluded from Stage 02 per the frozen architecture. | **Frozen / implementation-ready** |
-| 3 | Vessel Segmentation | Baseline U-Net, trained on DRIVE + CHASE_DB1 | No code exists yet. Design finalized: DRIVE and CHASE_DB1 are now approved project datasets specifically to make this stage trainable within the project (see `SEGMENTATION_ARCHITECTURE.md` §1.2/§2, and its design-history appendix for why an earlier design used a pretrained, inference-only model instead). | **Missing — design finalized, ready to implement** |
+| 3 | Vessel Segmentation | Pretrained LWNet, inference only | No code exists yet. Design finalized: Stage 03 integrates the externally-sourced, MIT-licensed `lwnet` checkpoint for inference only, not trained within this project (see `SEGMENTATION_ARCHITECTURE.md` §1.2/§2, and its design-history appendix for why an intermediate design trained a Baseline U-Net on DRIVE + CHASE_DB1 instead, and why that was reversed). | **Missing — design finalized, ready to implement** |
 | 4 | Lesion Segmentation | Attention U-Net | No code exists. Design finalized in `SEGMENTATION_ARCHITECTURE.md` §3 — input is the processed RGB image concatenated with Stage 3's vessel probability map (4 channels total). | **Missing — design finalized** |
 | 5 | Local Feature Extraction | Adaptive Multi-Kernel CNN | No dedicated "local" feature extractor exists. Input contract finalized: RGB image + vessel map + 4 lesion maps, concatenated into an 8-channel tensor (`SEGMENTATION_ARCHITECTURE.md` §4). | **Missing** |
 | 6 | Global Feature Extraction | Dual-Scale Swin Transformer | A complete, hand-written single-scale Swin Transformer exists (`swin_transformer.py`), and `create_swin_tiny_model()` runs it standalone. The *hybrid* model only bolts on a single `SwinTransformerBlock` for feature refinement after a CNN backbone — no dual-scale windowing exists. Reusable foundation, wrong topology. Consumes the processed RGB image directly; any resizing it needs is internal to this stage (Stage 02 stays model-agnostic and unresized). | **Partially implemented** |
@@ -108,7 +108,7 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **DRIVE** and **CHAS
 
 **Non-target component present in the repo:** `dr_gan.py` (conditional GAN for synthetic minority-class oversampling) is real and working but is not part of the 11-stage target pipeline. Per the "reuse existing components" rule, it should be kept and can still feed the ordinal classifier's training data, but it is not one of the roadmap's numbered modules.
 
-**Dataset gap — resolved.** Vessel Segmentation (Stage 3) and Lesion Segmentation (Stage 4) both require pixel-level mask ground truth. Neither EyeQ, APTOS 2019, nor IDRiD's grading/localization subsets ship vessel masks; IDRiD's segmentation subset ships lesion (and Optic Disc) masks only. This gap is resolved by adding **DRIVE and CHASE_DB1** as officially approved project datasets, used exclusively to train Stage 3's Baseline U-Net; Lesion Segmentation continues to train on IDRiD's segmentation subset. Both Vessel Segmentation and Lesion Segmentation are now trained within this project — see `SEGMENTATION_ARCHITECTURE.md` for the full specification, including the design-history appendix documenting the earlier pretrained-inference-only alternative that this supersedes.
+**Dataset gap — resolved differently for each stage.** Lesion Segmentation (Stage 4) requires pixel-level mask ground truth and is trained within this project on IDRiD's segmentation subset. Vessel Segmentation (Stage 3) also needs pixel-level vessel ground truth, but rather than sourcing a dataset and training within this project, it integrates a pretrained external checkpoint (LWNet, trained by its own authors on DRIVE) for inference only — so Stage 3 needs no project dataset of its own. An intermediate design added DRIVE and CHASE_DB1 as project datasets to train a "Baseline U-Net" within this project instead; that design was itself superseded by the current pretrained-LWNet design — see `SEGMENTATION_ARCHITECTURE.md`'s design-history appendix for the full chronology.
 
 ---
 
@@ -117,8 +117,8 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **DRIVE** and **CHAS
 Ordered to match the target pipeline's numbering, since each stage after preprocessing consumes the previous stage's output. A "Step 0" is added first for shared infrastructure every later step depends on.
 
 ### Step 0 — Shared Infrastructure & Config Extension
-- **Why:** New datasets (DRIVE, CHASE_DB1, IDRiD) and new model stages (segmentation, fusion, ordinal head) need new path/config variables before any of them can be built, following the repo's existing `.env`-driven convention.
-- **Files to modify:** `.env_sample` (append new keys, don't remove existing ones); `config.py` (add `VESSEL_SEG_MODEL_DIR` / `VESSEL_SEG_RESULTS_DIR`, mirroring `IQA_MODEL_DIR` / `IQA_RESULTS_DIR` — DRIVE/CHASE_DB1 raw+processed paths need no new dataclass, they resolve through the existing generic `dataset_raw_dir()` / `dataset_processed_dir()` helpers).
+- **Why:** New datasets (IDRiD) and new model stages (segmentation, fusion, ordinal head) need new path/config variables before any of them can be built, following the repo's existing `.env`-driven convention.
+- **Files to modify:** `.env_sample` (append new keys, don't remove existing ones); `config.py` (add `VESSEL_SEG_MODEL_DIR`, mirroring `IQA_MODEL_DIR`, pointed at the vendored LWNet checkpoint rather than a training-run output — no `VESSEL_SEG_RESULTS_DIR` needed since Stage 03 has no evaluation run of its own).
 - **Expected output:** extended config documenting the additional variables Stage 3 needs. No behavior change to existing scripts.
 
 ### Step 1 — Image Quality Assessment (EfficientNetB0)
@@ -128,17 +128,17 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 - **Why:** `PROJECT_CODE.md` specifies Stage 02 as exactly Gamma Correction + CLAHE on RGB — no other transform.
 - **Status:** `image_preprocessing.py` already implements this. Frozen and implementation-ready; no further architectural decision remains before Stage 02 is wired into `colab/notebooks/stage02_preprocessing.ipynb` and run once, per-dataset, per `PROJECT_CODE.md`'s Dataset Policy.
 
-### Step 3 — Vessel Segmentation (Baseline U-Net)
-- **Why:** Vessel maps are a prerequisite input for Lesion Segmentation (Stage 4) and Local Feature Extraction (Stage 5) in the target architecture.
-- **Datasets:** DRIVE + CHASE_DB1, run through Stage 02's own RGB → Gamma → CLAHE pipeline before training, so the model trains on the same distribution it will see at inference time on EyeQ/APTOS/IDRiD-derived images.
-- **New files:** `vessel_segmentation_dataset.py`, `vessel_segmentation_model.py`, `train_vessel_segmentation.py`, `evaluate_vessel_segmentation.py`, `vessel_segmentation_inference.py` — mirroring Stage 1's exact file set and structure (dataset → model → train → evaluate → inference).
-- **Colab notebook:** yes — `colab/notebooks/stage03_vessel_segmentation.ipynb`, following the same 12-step workflow as `stage01_iqa.ipynb`.
-- **Reuse:** `colab/common/experiment_manager.py` and `dataset_staging.py` (framework-agnostic, already dataset-agnostic, no changes needed regardless of Stage 3's final framework), `colab_config.py`'s existing `"VesselSegmentation"` entry in `PIPELINE_MODULES`. `training.Trainer`, `training.get_loss("bce_dice")`, and `training.build_metrics("segmentation")` are TensorFlow/Keras-specific and are reusable as-is only if Stage 3 is implemented in TensorFlow — see `SEGMENTATION_ARCHITECTURE.md` §6 for why this stage's framework is deliberately left open (named "Baseline U-Net," not "Standard U-Net," for the same reason).
-- **Expected output:** a trained Baseline U-Net producing single-channel vessel probability maps, `(H, W, 1)`, values in `[0, 1]`, exported to `models/vessel_segmentation/best_model` (file extension depends on the final framework choice — see `SEGMENTATION_ARCHITECTURE.md` §6).
+### Step 3 — Vessel Segmentation (pretrained LWNet integration)
+- **Why:** Vessel maps are a prerequisite input for Lesion Segmentation (Stage 4) and Local Feature Extraction (Stage 5) in the target architecture. Unlike every other trainable stage, this one integrates an already-trained, externally-sourced model rather than training a new one.
+- **Datasets:** None. LWNet's vendored checkpoint was trained by its original authors on DRIVE; this project stages, trains, or evaluates nothing for this stage. Stage 03 runs inference directly on Stage 02's RGB output.
+- **New files:** `vessel_segmentation_model.py` (loads the vendored checkpoint, wraps LWNet's `wnet` architecture), `vessel_segmentation_inference.py` (FOV crop/resize/normalize + `predict`/`predict_batch`, adapted from the upstream repo's `predict_one_image.py`) — no dataset loader, training, or evaluation script, since none apply to a pretrained-only stage.
+- **Colab notebook:** yes — `colab/notebooks/stage03_vessel_segmentation.ipynb`, but scoped to checkpoint integration and inference verification, not the Setup → Training → Evaluation → Export workflow every trainable stage otherwise follows.
+- **Reuse:** `colab/common/setup.py`, `verify_environment.py` (environment checks only — no dataset staging needed, since Stage 03 has no dataset). `colab_config.py`'s existing `"VesselSegmentation"` entry in `PIPELINE_MODULES` still applies (to hold the vendored checkpoint under `exported_models/VesselSegmentation/`), even though no training run ever populates `experiments/VesselSegmentation/`. `training.Trainer` and `training.build_metrics("segmentation")` (TensorFlow/Keras-specific) do not apply to this stage at all — LWNet is PyTorch, and this stage is inference-only regardless of framework.
+- **Expected output:** the vendored LWNet checkpoint (`models/vessel_segmentation/best_model.pth` + `config.cfg`) producing single-channel vessel probability maps, `(H, W, 1)`, values in `[0, 1]`, at Stage 02's native resolution — see `SEGMENTATION_ARCHITECTURE.md` §2/§6.
 
 ### Step 4 — Lesion Segmentation (Attention U-Net)
 - **Why:** Same rationale as Step 3, for lesion (exudate/hemorrhage/microaneurysm) maps.
-- **Depends on:** Step 3's trained model, since Lesion Segmentation's training input requires a vessel-mask channel generated by running the (now project-trained, not pretrained) Vessel Segmentation model over every IDRiD/segmentation image first.
+- **Depends on:** Step 3's vendored checkpoint, since Lesion Segmentation's training input requires a vessel-mask channel generated by running the pretrained LWNet model over every IDRiD/segmentation image first — a checkpoint-availability dependency, not a training-order one (Step 3 never trains).
 - **New files:** `lesion_segmentation_dataset.py`, `lesion_segmentation_model.py` (Attention U-Net + train/infer functions).
 - **Input:** processed RGB image + vessel probability map, concatenated — `(H, W, 4)`.
 - **Output:** 4 lesion probability maps (Microaneurysm, Haemorrhage, Hard Exudate, Soft Exudate) — `(H, W, 4)`.
@@ -178,13 +178,13 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 
 ## 5. Open Questions Before Implementation Begins
 
-1. **Segmentation datasets (Steps 3–4) — resolved.** DRIVE and CHASE_DB1 are now approved datasets, used to train Stage 3 within this project; IDRiD's segmentation subset trains Stage 4. See `SEGMENTATION_ARCHITECTURE.md`.
+1. **Segmentation datasets (Steps 3–4) — resolved.** Stage 3 needs no project dataset — it integrates a pretrained external checkpoint (LWNet) for inference only; IDRiD's segmentation subset trains Stage 4. See `SEGMENTATION_ARCHITECTURE.md`.
 2. **`dr_gan.py`'s role going forward:** keep feeding the new ordinal classifier's training set the same way it currently feeds `dr_classifier.py`, or treat it as legacy/optional — undecided, out of scope for this refactor.
 3. **Local Feature Extraction's input (Step 5) — resolved.** RGB image + vessel map + lesion maps, concatenated into an 8-channel tensor (§4 of `SEGMENTATION_ARCHITECTURE.md`).
-4. **DRIVE test-set masks and CHASE_DB1's train/test split convention** — need verification once the raw files are actually placed on disk; see the migration plan associated with this refactor.
+4. **LWNet integration details** — exact FOV-mask/resize/threshold behavior to vendor from the upstream `predict_one_image.py`, and how much of `external/lwnet/` (temporary, inspection-only) can be discarded once integration is complete, per `SEGMENTATION_ARCHITECTURE.md` §2.
 
 ---
 
 ## 6. Next Step
 
-Stage 1 is complete. Stage 2 is architecturally frozen and implementation-ready (no further design decision remains). Per the "one module at a time, wait for approval" rule, the next implementation target is **Stage 2's Colab wiring**, followed by **Stage 3 (Vessel Segmentation)** — the first newly-trainable module under the frozen architecture — with explicit approval requested before writing code for each.
+Stage 1 and Stage 2 are complete. Per the "one module at a time, wait for approval" rule, the next implementation target is **Stage 3 (Vessel Segmentation)** — integrating the pretrained LWNet checkpoint for inference, not training a new model — with explicit approval requested before writing code.

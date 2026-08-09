@@ -57,7 +57,7 @@ references this one rather than repeating a diverging copy.
  [1] Image Quality Assessment  --(Good/Usable only)-->  [2] Image Preprocessing
                                                                   |
                                                                   v
-                                          [3] Vessel Segmentation (trained on DRIVE + CHASE_DB1)
+                                          [3] Vessel Segmentation (pretrained LWNet, inference only)
                                                                   |
                                                                   v
                                           [4] Lesion Segmentation (trained on IDRiD)
@@ -91,13 +91,11 @@ Every stage depends only on the stage(s) immediately before it — no stage bypa
 | Dataset | Used by | Status |
 |---|---|---|
 | **EyeQ** | Stage 1 (Image Quality Assessment) — used only for Stage 1 | Local copy present, verified (`colab/common/verify_dataset.py`) |
-| **DRIVE** | Stage 3 (Vessel Segmentation training) — used only for Stage 3 | Not yet on disk |
-| **CHASE_DB1** | Stage 3 (Vessel Segmentation training) — used only for Stage 3 | Not yet on disk |
 | **APTOS 2019** | Stage 8 (CORN Classification); also the pre-refactor baseline below | Local copy present |
 | **IDRiD** | Stage 4 (Lesion Segmentation) and downstream grading tasks | Local copy present, not yet consumed by any implemented stage |
 | **EyePACS** | Historical only | Used once, outside this repository, to reconstruct EyeQ. Not present under `datasets/`; not required to run anything here. |
 
-DRIVE and CHASE_DB1 are officially approved project datasets, added specifically so Stage 3 (Vessel Segmentation) can be trained within this project rather than relying on a pretrained, external model. See `PROJECT_STRUCTURE.md`'s Dataset Organization for current vs. future usage per dataset, and `SEGMENTATION_ARCHITECTURE.md` for why this design was adopted.
+Stage 3 (Vessel Segmentation) needs no project dataset: it integrates a pretrained, externally-sourced model (LWNet) for inference only, not trained within this project. DRIVE and CHASE_DB1 were approved under an earlier, since-superseded design that trained Vessel Segmentation within this project; neither is a project dataset today. See `PROJECT_STRUCTURE.md`'s Dataset Organization for current usage per dataset, and `SEGMENTATION_ARCHITECTURE.md`'s design-history appendix for why this reversal happened.
 
 ### Folder Structure
 
@@ -107,8 +105,9 @@ diabetic_retinoplasty/
 ├── training/                # reusable training framework (Trainer, callbacks, losses, metrics)
 ├── evaluation/               # reusable evaluation framework (Evaluator, metrics, visualization)
 ├── pipeline/                  # ABC contracts for future trainable/inference stages
-├── datasets/                   # EyeQ/, DRIVE/, CHASE_DB1/, APTOS2019/, IDRiD/ -- raw/ is
-│                                 read-only, never modified
+├── datasets/                   # EyeQ/, APTOS2019/, IDRiD/ -- raw/ is read-only, never
+│                                 modified. Vessel Segmentation uses a vendored pretrained
+│                                 checkpoint, not a dataset here.
 ├── colab/                        # official Colab training infrastructure
 │   ├── common/                    # setup, verification, experiment management (shared by every stage)
 │   └── notebooks/                  # stage01_iqa.ipynb (implemented) + stage02-11 (templates)
@@ -151,7 +150,7 @@ same folder. See `colab/README.md`'s "How experiments are organized".
 |---|---|
 | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end in Google Colab; see Stage 1 Baseline Results below. |
 | 2. Image Preprocessing | **Frozen, implementation-ready.** RGB → Gamma Correction → CLAHE only (`image_preprocessing.py`); no green-channel extraction, Ben Graham, median denoising, resizing, or augmentation. Not yet wired into a Colab notebook. |
-| 3. Vessel Segmentation | **Design finalized, not yet implemented.** Now trainable within this project (Baseline U-Net, DRIVE + CHASE_DB1) — see `SEGMENTATION_ARCHITECTURE.md`. |
+| 3. Vessel Segmentation | **Design finalized, not yet implemented.** Pretrained LWNet, inference only — not trained within this project. See `SEGMENTATION_ARCHITECTURE.md`. |
 | 4-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
 
 ### Stage 1 Baseline Results
