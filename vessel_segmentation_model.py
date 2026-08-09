@@ -41,6 +41,20 @@ CONV_BRIDGE = True
 SHORTCUT = True
 
 
+def resolve_device(device=None):
+    """Single source of truth for which `torch.device` this project's
+    Vessel Segmentation stage runs on: `device` (if given -- a string or an
+    already-built `torch.device`) takes precedence, otherwise CUDA is used
+    when available, else CPU. Both this module's checkpoint loader and
+    `vessel_segmentation_inference.py`'s prediction functions call this
+    same function, rather than each independently re-implementing "cuda if
+    available else cpu" -- that duplication is exactly how a model and its
+    input tensors can silently end up on different devices."""
+    if device is not None:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _conv1x1(in_planes, out_planes):
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=1, bias=False)
 
@@ -239,17 +253,27 @@ def build_vessel_segmentation_model():
     return model
 
 
-def load_state_dict_from_checkpoint(model, checkpoint_path, device="cpu"):
+def load_state_dict_from_checkpoint(model, checkpoint_path, device=None):
     """Load the vendored checkpoint's `model_state_dict` into `model`
     in-place and return it, with `model.eval()` (the real `nn.Module`
     train/eval-mode switch -- distinct from, and in addition to, the
     `model.mode` attribute already set by `build_vessel_segmentation_model()`)
     called before returning, since this stage is inference-only.
 
+    `device=None` (the default) resolves via `resolve_device()` -- CUDA
+    when available, else CPU -- the same resolution every other device
+    decision in this stage uses. `torch.load(..., map_location=device)`
+    ensures the checkpoint's tensors land directly on the target device
+    (not CPU-then-moved), and `model.to(device)` then places every other
+    parameter/buffer (e.g. freshly-initialized-but-about-to-be-overwritten
+    ones) there too, so the returned model is *fully* on one device, never
+    split across two.
+
     Only `model_state_dict` is read -- the checkpoint's `optimizer_state_dict`
     and `stats` entries (present because the upstream repo's `save_model()`
     always writes them) are training-run bookkeeping this project never uses.
     """
+    device = resolve_device(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)

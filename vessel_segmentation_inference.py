@@ -42,7 +42,11 @@ from torchvision import transforms
 
 import config
 from pipeline import SegmentationStage
-from vessel_segmentation_model import build_vessel_segmentation_model, load_state_dict_from_checkpoint
+from vessel_segmentation_model import (
+    build_vessel_segmentation_model,
+    load_state_dict_from_checkpoint,
+    resolve_device,
+)
 
 DEFAULT_MODEL_PATH = os.path.join(config.VESSEL_SEG_MODEL_DIR, "best_model.pth")
 
@@ -59,10 +63,6 @@ _INPUT_TRANSFORM = transforms.Compose([
     transforms.Resize((MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)),
     transforms.ToTensor(),  # HxWxC uint8 [0,255] -> CxHxW float32 [0,1]; no mean/std normalization
 ])
-
-
-def _default_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # --- FOV mask (ported from predict_one_image.py, skimage.draw.circle -> disk) ---
@@ -200,10 +200,12 @@ def _predict_probability_map(model, tensor, fov_mask, coords_crop, crop_shape, t
 
 def load_vessel_model(model_path=DEFAULT_MODEL_PATH, device=None):
     """Build the vessel segmentation architecture and load the vendored
-    LWNet checkpoint's weights into it. Raises FileNotFoundError with a
-    clear message if the checkpoint hasn't been placed at `model_path` --
-    this stage has no training entry point that could produce one."""
-    device = device or _default_device()
+    LWNet checkpoint's weights into it. `device=None` (the default)
+    resolves to CUDA when available, else CPU (`resolve_device()`). Raises
+    FileNotFoundError with a clear message if the checkpoint hasn't been
+    placed at `model_path` -- this stage has no training entry point that
+    could produce one."""
+    device = resolve_device(device)
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"No vessel segmentation checkpoint found at {model_path}. "
@@ -227,6 +229,15 @@ def predict_vessel_mask(image, model=None, model_path=DEFAULT_MODEL_PATH,
     reuse it across many calls; otherwise it is loaded from `model_path` on
     every call. `tta=None` (the default) resolves to `config.VESSEL_SEG_TTA`.
 
+    `device` only controls where a *freshly-loaded* model ends up (when
+    `model` is not given) -- once a model exists (whether just loaded here
+    or passed in by the caller), every input tensor is placed on **that
+    model's own actual device** (`next(model.parameters()).device`), never
+    on a separately/independently guessed device. This is what makes it
+    impossible for a caller to end up with a "model on CUDA, tensor on CPU"
+    (or vice versa) mismatch: there is exactly one place device placement
+    is decided, and it always follows the model, not the other way around.
+
     Returns a dict:
       - "probability_map": (H, W, 1) float32 in [0, 1] -- the primary output.
       - "binary_mask": (H, W, 1) uint8 {0, 1}, thresholded at `threshold`.
@@ -238,9 +249,9 @@ def predict_vessel_mask(image, model=None, model_path=DEFAULT_MODEL_PATH,
       - "input_shape": (H, W) of `image`, which "probability_map" and
         "binary_mask" always match exactly.
     """
-    device = device or _default_device()
     if model is None:
         model = load_vessel_model(model_path, device=device)
+    device = next(model.parameters()).device
     if tta is None:
         tta = config.VESSEL_SEG_TTA
 
@@ -294,14 +305,17 @@ def predict_vessel_mask_batch(images, model=None, model_path=DEFAULT_MODEL_PATH,
     as `images`, each augmented with "filename"/"path" when the
     corresponding input was a file path.
     """
-    device = device or _default_device()
     if model is None:
         model = load_vessel_model(model_path, device=device)
 
     results = []
     for image in images:
+        # No `device=` passed through here: predict_vessel_mask always
+        # derives it from `model` itself once a model exists, so every
+        # image in this loop is guaranteed to run on the same device this
+        # (single, shared) model actually lives on.
         result = predict_vessel_mask(
-            image, model=model, tta=tta, device=device, threshold=threshold,
+            image, model=model, tta=tta, threshold=threshold,
         )
         if isinstance(image, str):
             result["path"] = image
@@ -318,7 +332,11 @@ class VesselSegmentationStage(SegmentationStage):
     with an explanatory message rather than silently no-op-ing."""
 
     def __init__(self, device=None):
-        self.device = device or _default_device()
+        # Only controls where load() places a freshly-loaded model --
+        # predict()/predict_batch() always defer to self.model's own actual
+        # device afterward (see predict_vessel_mask's docstring), so this
+        # is never a second, independent source of truth.
+        self.device = resolve_device(device)
         self.model = None
 
     def load(self, path=DEFAULT_MODEL_PATH):
@@ -328,12 +346,12 @@ class VesselSegmentationStage(SegmentationStage):
     def predict(self, input_data):
         if self.model is None:
             raise RuntimeError("VesselSegmentationStage.load() must be called before predict().")
-        return predict_vessel_mask(input_data, model=self.model, device=self.device)["probability_map"]
+        return predict_vessel_mask(input_data, model=self.model)["probability_map"]
 
     def predict_batch(self, inputs):
         if self.model is None:
             raise RuntimeError("VesselSegmentationStage.load() must be called before predict_batch().")
-        results = predict_vessel_mask_batch(inputs, model=self.model, device=self.device)
+        results = predict_vessel_mask_batch(inputs, model=self.model)
         return [r["probability_map"] for r in results]
 
     def train(self, train_data, val_data=None, **kwargs):
