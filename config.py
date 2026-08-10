@@ -81,6 +81,18 @@ class VesselSegmentationPaths:
 
 
 @dataclass(frozen=True)
+class LesionSegmentationPaths:
+    """Lesion Segmentation (Stage 04) model and results paths.
+
+    Unlike `VesselSegmentationPaths`, `model_dir` holds this project's own
+    trained `.keras` output, not a vendored checkpoint -- Lesion
+    Segmentation has a full training workflow of its own within this
+    project (SEGMENTATION_ARCHITECTURE.md Sec 3/6/7.0)."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -135,6 +147,11 @@ VESSEL_SEGMENTATION = VesselSegmentationPaths(
     results_dir=os.environ.get('VESSEL_SEG_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'vessel_segmentation'),
 )
 
+LESION_SEGMENTATION = LesionSegmentationPaths(
+    model_dir=os.environ.get('LESION_SEG_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'lesion_segmentation'),
+    results_dir=os.environ.get('LESION_SEG_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'lesion_segmentation'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -161,6 +178,9 @@ IQA_RESULTS_DIR = EYEQ.results_dir
 
 VESSEL_SEG_MODEL_DIR = VESSEL_SEGMENTATION.model_dir
 VESSEL_SEG_RESULTS_DIR = VESSEL_SEGMENTATION.results_dir
+
+LESION_SEG_MODEL_DIR = LESION_SEGMENTATION.model_dir
+LESION_SEG_RESULTS_DIR = LESION_SEGMENTATION.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---
