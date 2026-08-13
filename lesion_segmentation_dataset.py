@@ -181,6 +181,14 @@ def _load_binary_mask(path, shape):
     if not os.path.exists(path):
         return np.zeros(shape, dtype=np.uint8)
     mask = np.array(Image.open(path))
+    if mask.ndim == 3:
+        # Some IDRiD mask TIFFs are stored multi-channel (e.g. RGB/RGBA)
+        # rather than single-channel palette images (observed: IDRiD_81_EX.tif
+        # loads as (H, W, 4)) -- collapse to one 2D mask by treating a pixel
+        # as foreground if ANY channel is non-zero, before the shape check
+        # below. Never resized -- a genuine spatial (H, W) mismatch must
+        # still raise, not be silently papered over.
+        mask = np.any(mask != 0, axis=-1)
     if mask.shape != shape:
         raise RuntimeError(
             f"Mask shape {mask.shape} at {path} does not match its image's shape {shape}."

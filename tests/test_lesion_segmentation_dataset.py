@@ -216,6 +216,58 @@ class MissingSoftExudateMaskTests(unittest.TestCase):
             )
 
 
+class MultiChannelMaskTests(unittest.TestCase):
+    """Regression test for the real IDRiD_81_EX.tif bug: some IDRiD mask
+    TIFFs are stored multi-channel (observed: (H, W, 4)) rather than the
+    usual single-channel palette image -- _load_binary_mask() must collapse
+    these to a 2D binary mask (foreground wherever ANY channel is nonzero)
+    before the shape-mismatch check, not crash or silently resize."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="multichannel_mask_test_")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+
+    def test_multichannel_mask_collapses_to_2d_binary_mask(self):
+        h, w = 10, 12
+        mask_4ch = np.zeros((h, w, 4), dtype=np.uint8)
+        mask_4ch[2, 3, 0] = 255   # foreground via channel 0 only
+        mask_4ch[5, 5, 3] = 1     # foreground via channel 3 only (alpha)
+        # (7, 8) left all-zero across every channel -- must stay background
+        path = os.path.join(self.tmp_dir, "multichannel_mask.tif")
+        Image.fromarray(mask_4ch, mode="RGBA").save(path)
+
+        result = lsd._load_binary_mask(path, (h, w))
+
+        self.assertEqual(result.shape, (h, w))
+        self.assertEqual(result.dtype, np.uint8)
+        self.assertTrue(np.isin(result, [0, 1]).all())
+        self.assertEqual(result[2, 3], 1, "foreground pixel via a single non-alpha channel")
+        self.assertEqual(result[5, 5], 1, "foreground pixel via a single (alpha) channel")
+        self.assertEqual(result[7, 8], 0, "pixel with every channel zero must stay background")
+
+    def test_genuinely_wrong_spatial_shape_still_raises(self):
+        h, w = 10, 12
+        mask_4ch = np.zeros((h, w, 4), dtype=np.uint8)
+        path = os.path.join(self.tmp_dir, "wrong_shape_mask.tif")
+        Image.fromarray(mask_4ch, mode="RGBA").save(path)
+
+        with self.assertRaises(RuntimeError):
+            lsd._load_binary_mask(path, (h + 1, w))  # real (H, W) mismatch -- must still raise
+
+    def test_normal_2d_mask_behavior_is_unchanged(self):
+        h, w = 10, 12
+        mask_2d = np.zeros((h, w), dtype=np.uint8)
+        mask_2d[4, 6] = 1
+        path = os.path.join(self.tmp_dir, "2d_mask.tif")
+        Image.fromarray(mask_2d, mode="L").save(path)
+
+        result = lsd._load_binary_mask(path, (h, w))
+
+        self.assertEqual(result.shape, (h, w))
+        self.assertEqual(result[4, 6], 1)
+        self.assertEqual(result.sum(), 1)
+
+
 class SampleShapeAndValueTests(unittest.TestCase):
     def setUp(self):
         self.vessel_model = _build_synthetic_vessel_model()
