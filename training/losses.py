@@ -34,15 +34,36 @@ def focal_loss(gamma=2.0, alpha=0.25):
 
 
 def dice_loss(smooth=1.0):
-    """Soft Dice loss for binary/probability segmentation masks."""
+    """Soft Dice loss for binary/probability segmentation masks.
+
+    For a multi-channel tensor shaped `(batch, ..., channels)` (rank >= 4 --
+    e.g. Lesion Segmentation's `(batch, H, W, 4)` multi-label output), Dice is
+    computed independently per channel (spatial axes flattened, channel axis
+    preserved) and then averaged across channels, so one channel with a much
+    larger foreground area (e.g. HardExudate) cannot dominate another's
+    (e.g. Microaneurysm's) contribution to the loss. For lower-rank tensors
+    (already single-channel, e.g. a pre-sliced `(batch, H, W)` mask) there is
+    no channel axis to preserve, so the tensor is fully flattened exactly as
+    before. Returns one loss value per batch element, per Keras' loss
+    convention -- unchanged for the single-channel case."""
 
     def _dice_loss(y_true, y_pred):
         y_true = tf.cast(y_true, y_pred.dtype)
-        y_true_f = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
-        y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
-        intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=-1)
-        union = tf.reduce_sum(y_true_f, axis=-1) + tf.reduce_sum(y_pred_f, axis=-1)
-        dice = (2.0 * intersection + smooth) / (union + smooth)
+        if y_true.shape.rank is not None and y_true.shape.rank >= 4:
+            batch = tf.shape(y_true)[0]
+            channels = y_true.shape[-1]
+            y_true_f = tf.reshape(y_true, [batch, -1, channels])
+            y_pred_f = tf.reshape(y_pred, [batch, -1, channels])
+            intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=1)
+            union = tf.reduce_sum(y_true_f, axis=1) + tf.reduce_sum(y_pred_f, axis=1)
+            dice_per_channel = (2.0 * intersection + smooth) / (union + smooth)
+            dice = tf.reduce_mean(dice_per_channel, axis=-1)
+        else:
+            y_true_f = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
+            y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
+            intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=-1)
+            union = tf.reduce_sum(y_true_f, axis=-1) + tf.reduce_sum(y_pred_f, axis=-1)
+            dice = (2.0 * intersection + smooth) / (union + smooth)
         return 1.0 - dice
 
     return _dice_loss
@@ -50,7 +71,15 @@ def dice_loss(smooth=1.0):
 
 def bce_dice_loss(dice_weight=0.5, smooth=1.0):
     """Weighted combination of binary cross-entropy and Dice loss -- a common,
-    generic default for segmentation tasks (vessel/lesion masks)."""
+    generic default for segmentation tasks (vessel/lesion masks).
+
+    The Dice component (`dice_loss`, above) is now channel-independent for
+    multi-channel masks; BCE is unchanged (`tf.keras.losses.BinaryCrossentropy`'s
+    own default reduction -- a single mean over every pixel and channel in the
+    batch, no per-class weighting). `bce(...)` returns a scalar and
+    `_dice(...)` returns one value per batch element; the two broadcast
+    together exactly as they did before this change, since only what
+    `_dice(...)` averages over (channels, not batch) has changed."""
     _dice = dice_loss(smooth=smooth)
     bce = tf.keras.losses.BinaryCrossentropy()
 

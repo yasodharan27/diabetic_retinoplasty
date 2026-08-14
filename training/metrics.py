@@ -11,7 +11,27 @@ import tensorflow as tf
 
 
 def dice_coefficient(y_true, y_pred, smooth=1.0):
+    """Dice coefficient. For a multi-channel tensor shaped
+    `(batch, ..., channels)` (rank >= 4 -- e.g. Lesion Segmentation's
+    `(batch, H, W, 4)` multi-label output), Dice is computed independently
+    per channel (spatial axes flattened, channel axis preserved) and then
+    averaged across channels, rather than pooling every channel's pixels
+    together -- pooling would let a channel with a much larger foreground
+    area (e.g. HardExudate) dominate the score of a much smaller one (e.g.
+    Microaneurysm). For lower-rank tensors (already single-channel, e.g. a
+    pre-sliced `(batch, H, W)` mask), there is no channel axis to preserve,
+    so behavior is unchanged: the tensor is fully flattened and one scalar
+    Dice value is returned, exactly as before."""
     y_true = tf.cast(y_true, y_pred.dtype)
+    if y_true.shape.rank is not None and y_true.shape.rank >= 4:
+        batch = tf.shape(y_true)[0]
+        channels = y_true.shape[-1]
+        y_true_f = tf.reshape(y_true, [batch, -1, channels])
+        y_pred_f = tf.reshape(y_pred, [batch, -1, channels])
+        intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=1)
+        union = tf.reduce_sum(y_true_f, axis=1) + tf.reduce_sum(y_pred_f, axis=1)
+        dice_per_channel = (2.0 * intersection + smooth) / (union + smooth)
+        return tf.reduce_mean(dice_per_channel, axis=-1)
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
@@ -21,7 +41,19 @@ def dice_coefficient(y_true, y_pred, smooth=1.0):
 
 
 def iou_score(y_true, y_pred, smooth=1.0):
+    """Intersection-over-Union. Channel handling mirrors `dice_coefficient`
+    above: independently per channel then averaged for rank >= 4 tensors,
+    fully pooled (unchanged) for lower-rank/already-single-channel tensors."""
     y_true = tf.cast(y_true, y_pred.dtype)
+    if y_true.shape.rank is not None and y_true.shape.rank >= 4:
+        batch = tf.shape(y_true)[0]
+        channels = y_true.shape[-1]
+        y_true_f = tf.reshape(y_true, [batch, -1, channels])
+        y_pred_f = tf.reshape(y_pred, [batch, -1, channels])
+        intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=1)
+        union = tf.reduce_sum(y_true_f, axis=1) + tf.reduce_sum(y_pred_f, axis=1) - intersection
+        iou_per_channel = (intersection + smooth) / (union + smooth)
+        return tf.reduce_mean(iou_per_channel, axis=-1)
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
