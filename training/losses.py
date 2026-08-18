@@ -89,6 +89,66 @@ def bce_dice_loss(dice_weight=0.5, smooth=1.0):
     return _combined
 
 
+def weighted_bce_dice_loss(class_weights, dice_weight=0.5, smooth=1.0):
+    """Class-weighted BCE + per-channel Dice for a multi-label, multi-channel
+    `(batch, H, W, C)` mask (Stage 04 Lesion Segmentation's own Experiment
+    2B -- see `lesion_segmentation_model.EXPERIMENT_2B_CLASS_WEIGHTS` for the
+    actual weight values used there; this function itself stays generic and
+    takes no lesion-specific defaults).
+
+    Unlike `bce_dice_loss()` (still the plain unweighted default used
+    everywhere else), both the BCE and the Dice component are computed
+    independently per channel and then combined via a *weighted* average --
+    `sum(class_weights[c] * per_channel_loss[c]) / sum(class_weights)` --
+    rather than a plain mean, so a channel with a higher weight contributes
+    more to the loss (and gradient) than an equally-sized lower-weighted
+    channel would. Dividing by `sum(class_weights)` keeps the result on the
+    same scale as an unweighted mean: uniform weights (e.g. `[1, 1, 1, 1]`)
+    reproduce `bce_dice_loss()`'s per-channel-averaged behavior exactly.
+
+    `class_weights` is a length-C sequence of positive floats, one per
+    output channel, in the model's own output channel order. Intended as
+    *moderate*, hand-chosen relative weights -- not raw inverse class
+    frequency, which for a rare class can be orders of magnitude larger than
+    is useful. `dice_weight`/`smooth` mirror `bce_dice_loss()`'s identically-
+    named parameters and are not touched by the weighting."""
+    weights = tf.constant(class_weights, dtype=tf.float32)
+    weight_sum = tf.reduce_sum(weights)
+
+    def _weighted_bce(y_true, y_pred):
+        y_pred = tf.convert_to_tensor(y_pred)
+        epsilon = tf.keras.backend.epsilon()
+        y_pred_c = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        y_true_c = tf.cast(y_true, y_pred_c.dtype)
+        elementwise = -(
+            y_true_c * tf.math.log(y_pred_c) + (1.0 - y_true_c) * tf.math.log(1.0 - y_pred_c)
+        )
+        spatial_axes = list(range(1, y_pred.shape.rank - 1))
+        per_channel = tf.reduce_mean(elementwise, axis=spatial_axes)  # (batch, channels)
+        return tf.reduce_sum(per_channel * weights, axis=-1) / weight_sum  # (batch,)
+
+    def _weighted_dice_loss(y_true, y_pred):
+        y_pred = tf.convert_to_tensor(y_pred)
+        y_true_c = tf.cast(y_true, y_pred.dtype)
+        batch = tf.shape(y_true_c)[0]
+        channels = y_pred.shape[-1]
+        y_true_f = tf.reshape(y_true_c, [batch, -1, channels])
+        y_pred_f = tf.reshape(y_pred, [batch, -1, channels])
+        intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=1)
+        union = tf.reduce_sum(y_true_f, axis=1) + tf.reduce_sum(y_pred_f, axis=1)
+        dice_per_channel = (2.0 * intersection + smooth) / (union + smooth)
+        dice_loss_per_channel = 1.0 - dice_per_channel  # (batch, channels)
+        return tf.reduce_sum(dice_loss_per_channel * weights, axis=-1) / weight_sum  # (batch,)
+
+    def _combined(y_true, y_pred):
+        return (
+            (1 - dice_weight) * _weighted_bce(y_true, y_pred)
+            + dice_weight * _weighted_dice_loss(y_true, y_pred)
+        )
+
+    return _combined
+
+
 def weighted_categorical_crossentropy(class_weights):
     """Categorical cross-entropy with explicit per-class weights, as a
     config-driven alternative to Keras' `class_weight=` fit() argument
@@ -111,6 +171,7 @@ _LOSS_REGISTRY = {
     "focal": focal_loss,
     "dice": dice_loss,
     "bce_dice": bce_dice_loss,
+    "weighted_bce_dice": weighted_bce_dice_loss,
     "categorical_crossentropy": lambda **kwargs: tf.keras.losses.CategoricalCrossentropy(**kwargs),
     "binary_crossentropy": lambda **kwargs: tf.keras.losses.BinaryCrossentropy(**kwargs),
 }

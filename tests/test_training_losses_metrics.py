@@ -20,7 +20,7 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
-from training.losses import bce_dice_loss, dice_loss
+from training.losses import bce_dice_loss, dice_loss, weighted_bce_dice_loss
 from training.metrics import dice_coefficient, iou_score
 
 
@@ -183,6 +183,170 @@ class BceDiceLossKerasCompatibilityTests(unittest.TestCase):
         history = model.fit(x, y, epochs=1, batch_size=2, verbose=0)
         self.assertIn("loss", history.history)
         self.assertTrue(np.isfinite(history.history["loss"][0]))
+
+
+def _four_channel_weighting_example():
+    """(1, 4, 4, 4) y_true/y_pred with four deliberately distinct per-channel
+    prediction qualities, soft (non-binary) probabilities throughout so both
+    the BCE and Dice components vary meaningfully per channel:
+
+      channel 0: y_true all-foreground, y_pred=0.9 everywhere  (best)
+      channel 1: y_true a 2x2 foreground block, y_pred=0.5 everywhere
+      channel 2: y_true all-background,        y_pred=0.1 everywhere
+      channel 3: y_true a single foreground pixel, y_pred=0.01 everywhere (worst)
+
+    Distinct per-channel quality means a channel-to-weight mapping bug
+    (e.g. weights applied to the wrong channel, or misaligned after a
+    reshape) is very likely to change which channel dominates the result.
+    """
+    y_true = np.zeros((1, 4, 4, 4), dtype=np.float32)
+    y_pred = np.zeros((1, 4, 4, 4), dtype=np.float32)
+
+    y_true[0, :, :, 0] = 1.0
+    y_pred[0, :, :, 0] = 0.9
+
+    y_true[0, 0:2, 0:2, 1] = 1.0
+    y_pred[0, :, :, 1] = 0.5
+
+    y_pred[0, :, :, 2] = 0.1  # y_true channel 2 stays all-background
+
+    y_true[0, 0, 0, 3] = 1.0
+    y_pred[0, :, :, 3] = 0.01
+
+    return y_true, y_pred
+
+
+def _independent_weighted_reference(y_true, y_pred, weights):
+    """Ground truth for `weighted_bce_dice_loss`, computed independently of
+    the implementation under test: per channel, a plain manual BCE mean
+    (its own formula, not `weighted_bce_dice_loss`'s) and the already-
+    verified `dice_coefficient` (from `DiceCoefficientChannelIndependenceTests`
+    above) sliced to that single channel, then combined via the spec's own
+    weighted-average formula: sum(w_i * loss_i) / sum(w_i)."""
+    weights = np.asarray(weights, dtype=np.float64)
+    num_channels = y_true.shape[-1]
+    epsilon = 1e-7
+
+    bce_per_channel = []
+    dice_loss_per_channel = []
+    for c in range(num_channels):
+        yt = y_true[..., c].astype(np.float64)
+        yp = np.clip(y_pred[..., c].astype(np.float64), epsilon, 1 - epsilon)
+        bce = -(yt * np.log(yp) + (1 - yt) * np.log(1 - yp))
+        bce_per_channel.append(bce.mean())
+
+        dice = float(dice_coefficient(y_true[..., c], y_pred[..., c]).numpy())
+        dice_loss_per_channel.append(1.0 - dice)
+
+    weighted_bce = float(np.sum(np.array(bce_per_channel) * weights) / weights.sum())
+    weighted_dice_loss = float(np.sum(np.array(dice_loss_per_channel) * weights) / weights.sum())
+    return 0.5 * weighted_bce + 0.5 * weighted_dice_loss
+
+
+class WeightedBceDiceLossTests(unittest.TestCase):
+    """training.losses.weighted_bce_dice_loss() -- Stage 04 Experiment 2B."""
+
+    def test_multichannel_input_returns_finite_value(self):
+        y_true, y_pred = _four_channel_weighting_example()
+        loss_fn = weighted_bce_dice_loss([2.0, 1.0, 1.1, 1.8])
+        value = loss_fn(y_true, y_pred).numpy()
+        self.assertEqual(value.shape, (1,))
+        self.assertTrue(np.all(np.isfinite(value)))
+
+    def test_matches_independent_reference_implementation(self):
+        """Correct channel-to-weight mapping: the implementation's output
+        must match a from-scratch, independently-written reference that
+        applies the same weights to the same channels via the spec's
+        weighted-average formula."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weights = [2.0, 1.0, 1.1, 1.8]
+        loss_fn = weighted_bce_dice_loss(weights)
+        actual = float(loss_fn(y_true, y_pred).numpy()[0])
+        expected = _independent_weighted_reference(y_true, y_pred, weights)
+        self.assertAlmostEqual(actual, expected, places=4)
+
+    def test_uniform_weights_reduce_to_plain_bce_dice_loss(self):
+        """Normalization sanity check: sum(w_i*loss_i)/sum(w_i) with all
+        weights equal must reproduce the plain, unweighted per-channel
+        average that bce_dice_loss() already computes (Experiment 2A)."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weighted = float(weighted_bce_dice_loss([1.0, 1.0, 1.0, 1.0])(y_true, y_pred).numpy()[0])
+        unweighted = float(bce_dice_loss()(y_true, y_pred).numpy()[0])
+        self.assertAlmostEqual(weighted, unweighted, places=5)
+
+    def test_uniformly_scaling_all_weights_leaves_loss_unchanged(self):
+        """Normalization of weights: multiplying every weight by the same
+        constant must not change the result (dividing by sum(weights)
+        cancels the scale factor out)."""
+        y_true, y_pred = _four_channel_weighting_example()
+        base_weights = [2.0, 1.0, 1.1, 1.8]
+        scaled_weights = [10.0 * w for w in base_weights]
+        base = float(weighted_bce_dice_loss(base_weights)(y_true, y_pred).numpy()[0])
+        scaled = float(weighted_bce_dice_loss(scaled_weights)(y_true, y_pred).numpy()[0])
+        self.assertAlmostEqual(base, scaled, places=5)
+
+    def test_changing_one_channels_weight_changes_the_loss(self):
+        y_true, y_pred = _four_channel_weighting_example()
+        original = float(weighted_bce_dice_loss([1.0, 1.0, 1.0, 1.0])(y_true, y_pred).numpy()[0])
+        channel_3_upweighted = float(
+            weighted_bce_dice_loss([1.0, 1.0, 1.0, 20.0])(y_true, y_pred).numpy()[0]
+        )
+        self.assertNotAlmostEqual(original, channel_3_upweighted, places=3)
+
+    def test_upweighting_the_worst_channel_increases_loss_more_than_the_best_channel(self):
+        """A second, direction-sensitive check on channel-to-weight mapping:
+        channel 3 (worst prediction quality) and channel 0 (best) must not
+        be interchangeable -- concentrating weight on the worst channel must
+        raise the total loss above concentrating the same weight on the
+        best channel."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weight_on_best = float(
+            weighted_bce_dice_loss([20.0, 1.0, 1.0, 1.0])(y_true, y_pred).numpy()[0]
+        )
+        weight_on_worst = float(
+            weighted_bce_dice_loss([1.0, 1.0, 1.0, 20.0])(y_true, y_pred).numpy()[0]
+        )
+        self.assertGreater(weight_on_worst, weight_on_best)
+
+    def test_keras_model_compiles_and_fits_one_step(self):
+        inputs = tf.keras.Input(shape=(8, 8, 4))
+        outputs = tf.keras.layers.Conv2D(4, 1, activation="sigmoid")(inputs)
+        model = tf.keras.Model(inputs, outputs)
+        model.compile(optimizer="adam", loss=weighted_bce_dice_loss([2.0, 1.0, 1.1, 1.8]),
+                      metrics=[dice_coefficient, iou_score])
+
+        rng = np.random.RandomState(1)
+        x = rng.rand(4, 8, 8, 4).astype("float32")
+        y = (rng.rand(4, 8, 8, 4) > 0.5).astype("float32")
+
+        history = model.fit(x, y, epochs=1, batch_size=2, verbose=0)
+        self.assertIn("loss", history.history)
+        self.assertTrue(np.isfinite(history.history["loss"][0]))
+
+    def test_existing_unweighted_losses_are_unaffected(self):
+        """dice_loss()/bce_dice_loss() must still behave exactly as
+        Experiment 2A left them -- adding weighted_bce_dice_loss must not
+        have perturbed either."""
+        y_true, y_pred = _two_channel_example()
+        expected_dice_mean = (1.0 + 1.0 / 3.0) / 2.0
+
+        loss_value = float(dice_loss()(y_true, y_pred).numpy()[0])
+        self.assertAlmostEqual(loss_value, 1.0 - expected_dice_mean, places=5)
+
+        combined = bce_dice_loss()(y_true, y_pred).numpy()
+        self.assertTrue(np.all(np.isfinite(combined)))
+
+    def test_existing_single_channel_dice_iou_are_unaffected(self):
+        """dice_coefficient()/iou_score() single-channel (rank < 4) behavior
+        must still be the fully-pooled scalar from before Experiment 2A --
+        unaffected by adding weighted_bce_dice_loss."""
+        y_true = np.zeros((1, 4, 4), dtype=np.float32)
+        y_pred = np.zeros((1, 4, 4), dtype=np.float32)
+        y_true[0, 0:2, 0:2] = 1.0
+        y_pred[0, 0:2, 0:2] = 1.0
+
+        self.assertAlmostEqual(float(dice_coefficient(y_true, y_pred).numpy()), 1.0, places=5)
+        self.assertAlmostEqual(float(iou_score(y_true, y_pred).numpy()), 1.0, places=5)
 
 
 if __name__ == "__main__":

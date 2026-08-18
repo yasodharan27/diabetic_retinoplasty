@@ -33,7 +33,15 @@ from keras import Input, Model, layers
 import config
 from lesion_segmentation_dataset import LESION_CLASSES
 from pipeline import SegmentationStage
-from training import Trainer, TrainingConfig, bce_dice_loss, build_metrics, dice_coefficient, iou_score
+from training import (
+    Trainer,
+    TrainingConfig,
+    bce_dice_loss,
+    build_metrics,
+    dice_coefficient,
+    iou_score,
+    weighted_bce_dice_loss,
+)
 from vessel_segmentation_inference import _load_rgb_array, predict_vessel_mask
 
 try:
@@ -45,6 +53,20 @@ DEFAULT_INPUT_SHAPE = (512, 512, 4)
 DEFAULT_MODEL_PATH = os.path.join(config.LESION_SEG_MODEL_DIR, "best_model.keras")
 DEFAULT_RUN_DIR = os.path.join(config.LESION_SEG_MODEL_DIR, "training_run")
 DEFAULT_THRESHOLD = 0.5
+
+# --- Experiment 2B: moderate class-balanced loss weights ---
+# Hand-chosen, MODERATE relative weights -- explicitly NOT raw inverse
+# class-pixel-frequency (measured on all 54 training images: Microaneurysm
+# 0.1069%, Haemorrhage 0.9857%, HardExudate 0.8066%, SoftExudate 0.1894% of
+# all pixels -- an inverse-frequency Microaneurysm weight would be ~9x
+# larger than Haemorrhage's alone, likely destabilizing training). These
+# values are an experiment parameter to test whether moderate weighting
+# helps the two classes Experiment 2A's unweighted per-channel Dice/BCE
+# still could not learn (Microaneurysm, SoftExudate) -- NOT a claim that
+# they are optimal, and NOT validated against the real 27-image test set
+# until that evaluation is actually run. Order matches LESION_CLASSES
+# exactly (Microaneurysm, Haemorrhage, HardExudate, SoftExudate).
+EXPERIMENT_2B_CLASS_WEIGHTS = (2.0, 1.0, 1.1, 1.8)
 
 
 # --- Attention U-Net architecture ---
@@ -85,7 +107,7 @@ def _decoder_block(x, skip, filters, name):
 
 
 def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_filters=32,
-                          learning_rate=1e-4):
+                          learning_rate=1e-4, class_weights=None):
     """
     Builds and compiles the Attention U-Net: 4 encoder levels + bottleneck
     + 4 decoder levels with attention-gated skip connections, a 1x1 sigmoid
@@ -94,12 +116,26 @@ def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_fi
     height/width must each be divisible by 16 (4 pooling levels) for the
     encoder/decoder's spatial dimensions to round-trip exactly.
 
-    Loss: `training.losses.bce_dice_loss()`. Metrics:
+    Loss: `training.losses.bce_dice_loss()` (unweighted, channel-independent
+    per-channel Dice + plain BCE -- Experiment 2A's default) when
+    `class_weights` is `None`. Passing a length-`num_classes` sequence (e.g.
+    `EXPERIMENT_2B_CLASS_WEIGHTS`, above) switches to
+    `training.losses.weighted_bce_dice_loss(class_weights)` instead
+    (Experiment 2B) -- both the BCE and Dice components are then combined
+    as a *weighted* per-channel average rather than a plain one. This is
+    the only place either loss is selected; no other stage's compilation is
+    affected by this parameter. Metrics:
     `training.metrics.build_metrics("segmentation")` (`dice_coefficient`,
     `iou_score`, computed over all `num_classes` channels combined -- see
     `per_class_segmentation_metrics` for the per-lesion-class breakdown
     used by `LesionSegmentationStage.evaluate()`).
     """
+    if class_weights is not None and len(class_weights) != num_classes:
+        raise ValueError(
+            f"class_weights must have length num_classes ({num_classes}); "
+            f"got {len(class_weights)}."
+        )
+
     height, width = input_shape[0], input_shape[1]
     if height % 16 != 0 or width % 16 != 0:
         raise ValueError(
@@ -135,9 +171,10 @@ def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_fi
                              name="lesion_seg_output")(d1)
 
     model = Model(inputs=inputs, outputs=outputs, name="lesion_segmentation_attention_unet")
+    loss = weighted_bce_dice_loss(class_weights) if class_weights is not None else bce_dice_loss()
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=bce_dice_loss(),
+        loss=loss,
         metrics=build_metrics("segmentation"),
     )
     return model
@@ -310,8 +347,17 @@ class LesionSegmentationStage(SegmentationStage):
     every method here is fully functional -- Lesion Segmentation trains
     within this project (SEGMENTATION_ARCHITECTURE.md Sec 5/7.0)."""
 
-    def __init__(self, input_shape=DEFAULT_INPUT_SHAPE):
+    def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, class_weights=None):
+        """`class_weights`, if given, is forwarded to `build_attention_unet`
+        the first time `train()` builds a model (i.e. whenever `self.model`
+        is still `None`) -- `None` (the default) preserves Experiment 2A's
+        plain unweighted `bce_dice_loss()`; a length-4 sequence (e.g.
+        `EXPERIMENT_2B_CLASS_WEIGHTS`) switches that model to
+        `weighted_bce_dice_loss` instead (Experiment 2B). Has no effect if
+        a model is assigned to `self.model` directly or loaded via
+        `load()` -- this only governs how `train()` builds a fresh one."""
         self.input_shape = input_shape
+        self.class_weights = class_weights
         self.model = None
 
     def train(self, train_data, val_data=None, **kwargs):
@@ -324,7 +370,7 @@ class LesionSegmentationStage(SegmentationStage):
         `trainer_config` (a `training.TrainingConfig`); otherwise builds one
         from `run_dir`/`epochs` kwargs (defaults: `DEFAULT_RUN_DIR`, 50)."""
         if self.model is None:
-            self.model = build_attention_unet(input_shape=self.input_shape)
+            self.model = build_attention_unet(input_shape=self.input_shape, class_weights=self.class_weights)
 
         trainer_config = kwargs.get("trainer_config") or TrainingConfig(
             run_dir=kwargs.get("run_dir", DEFAULT_RUN_DIR),

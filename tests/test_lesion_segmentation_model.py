@@ -92,6 +92,76 @@ class BuildAttentionUnetTests(unittest.TestCase):
         self.assertTrue(any("iou" in name for name in results))
 
 
+class BuildAttentionUnetClassWeightsTests(unittest.TestCase):
+    """Stage 04 Experiment 2B: `class_weights=None` (the default) must keep
+    building the plain, unweighted Experiment 2A model exactly as before;
+    passing a length-4 weight sequence must switch to
+    `training.weighted_bce_dice_loss` instead. No other stage's model-
+    building code is touched by this parameter."""
+
+    def test_default_class_weights_none_uses_unweighted_loss(self):
+        model = lsm.build_attention_unet(input_shape=(32, 32, 4), base_filters=4)
+        self.assertIsNotNone(model.loss)
+        x = np.random.rand(2, 32, 32, 4).astype("float32")
+        y = np.random.randint(0, 2, (2, 32, 32, 4)).astype("float32")
+        results = model.evaluate(x, y, verbose=0, return_dict=True)
+        self.assertIn("loss", results)
+        self.assertTrue(np.isfinite(results["loss"]))
+
+    def test_explicit_class_weights_builds_and_trains_one_step(self):
+        model = lsm.build_attention_unet(
+            input_shape=(32, 32, 4), base_filters=4,
+            class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+        )
+        x = np.random.rand(2, 32, 32, 4).astype("float32")
+        y = np.random.randint(0, 2, (2, 32, 32, 4)).astype("float32")
+        history = model.fit(x, y, epochs=1, batch_size=2, verbose=0)
+        self.assertIn("loss", history.history)
+        self.assertTrue(np.isfinite(history.history["loss"][0]))
+
+    def test_mismatched_class_weights_length_raises(self):
+        with self.assertRaises(ValueError):
+            lsm.build_attention_unet(input_shape=(32, 32, 4), base_filters=4,
+                                      class_weights=[1.0, 2.0])
+
+    def test_experiment_2b_class_weights_constant_matches_the_approved_values(self):
+        self.assertEqual(tuple(lsm.EXPERIMENT_2B_CLASS_WEIGHTS), (2.0, 1.0, 1.1, 1.8))
+        self.assertEqual(len(lsm.EXPERIMENT_2B_CLASS_WEIGHTS), len(lsm.LESION_CLASSES))
+
+
+class LesionSegmentationStageClassWeightsTests(unittest.TestCase):
+    """Stage 04 wiring for the Colab notebook: LesionSegmentationStage
+    (class_weights=...) must forward those weights to build_attention_unet()
+    the first time train() builds a model. class_weights=None (the default,
+    unchanged from before this wiring) must keep calling
+    build_attention_unet() exactly as Experiment 2A already did."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="lesion_seg_stage_weights_test_")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+
+    def test_default_class_weights_none_is_forwarded_as_none(self):
+        stage = lsm.LesionSegmentationStage(input_shape=(16, 16, 4))
+        train_ds = _tiny_dataset(num_samples=4, size=16, batch_size=2, seed=1)
+        with mock.patch("lesion_segmentation_model.build_attention_unet",
+                         wraps=lsm.build_attention_unet) as spy:
+            stage.train(train_ds, None, run_dir=os.path.join(self.tmp_dir, "run"), epochs=1)
+        spy.assert_called_once_with(input_shape=(16, 16, 4), class_weights=None)
+
+    def test_explicit_class_weights_are_forwarded_to_build_attention_unet(self):
+        stage = lsm.LesionSegmentationStage(
+            input_shape=(16, 16, 4), class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+        )
+        train_ds = _tiny_dataset(num_samples=4, size=16, batch_size=2, seed=1)
+        with mock.patch("lesion_segmentation_model.build_attention_unet",
+                         wraps=lsm.build_attention_unet) as spy:
+            stage.train(train_ds, None, run_dir=os.path.join(self.tmp_dir, "run"), epochs=1)
+        spy.assert_called_once_with(
+            input_shape=(16, 16, 4), class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+        )
+        self.assertIsNotNone(stage.model)
+
+
 class PerClassSegmentationMetricsTests(unittest.TestCase):
     def test_perfect_prediction_gives_dice_and_iou_near_one(self):
         y = np.zeros((1, 8, 8, 4), dtype=np.float32)
