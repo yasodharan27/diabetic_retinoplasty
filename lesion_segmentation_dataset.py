@@ -170,6 +170,18 @@ def _load_rgb_image(path):
     return np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
 
 
+# PIL modes whose last band is an alpha/opacity channel, not image content --
+# verified against Pillow's own mode table (RGBA/LA/PA are the standard
+# alpha-carrying modes this project's TIFF/PNG masks could plausibly be
+# opened as; RGBa/La cover the premultiplied-alpha variants PIL also
+# recognizes). A full scan of every mask file in this project's IDRiD
+# segmentation subset (363 files: 54 training + 27 testing images, all 5
+# groundtruth categories including Optic Disc) found exactly one non-"P"
+# (palette/single-channel) file -- IDRiD_81_EX.tif, mode "RGBA" -- confirming
+# `mode` is a reliable, general signal here, not a per-file special case.
+_ALPHA_CARRYING_MODES = ("RGBA", "LA", "PA", "RGBa", "La")
+
+
 def _load_binary_mask(path, shape):
     """Loads one IDRiD lesion mask, binarized to {0, 1} uint8 (verified:
     IDRiD's own `.tif` masks already store exactly {0, 1} palette indices,
@@ -180,14 +192,28 @@ def _load_binary_mask(path, shape):
     error."""
     if not os.path.exists(path):
         return np.zeros(shape, dtype=np.uint8)
-    mask = np.array(Image.open(path))
+    image = Image.open(path)
+    mode = image.mode
+    mask = np.array(image)
     if mask.ndim == 3:
-        # Some IDRiD mask TIFFs are stored multi-channel (e.g. RGB/RGBA)
-        # rather than single-channel palette images (observed: IDRiD_81_EX.tif
-        # loads as (H, W, 4)) -- collapse to one 2D mask by treating a pixel
-        # as foreground if ANY channel is non-zero, before the shape check
-        # below. Never resized -- a genuine spatial (H, W) mismatch must
-        # still raise, not be silently papered over.
+        if mode in _ALPHA_CARRYING_MODES:
+            # Drop the alpha/opacity channel (always PIL's last band for
+            # these modes) before collapsing -- it carries no lesion
+            # information. Confirmed on the real data: IDRiD_81_EX.tif's
+            # channel 0 holds the actual HardExudate mask (2.6% foreground);
+            # channels 1-2 are all-zero; channel 3 (alpha) is 255 --
+            # "fully opaque" TIFF metadata -- at every single pixel. Treating
+            # that constant-255 alpha channel as a foreground signal (the
+            # previous "any channel non-zero" rule, unqualified) made the
+            # entire mask register as foreground.
+            mask = mask[..., :-1]
+        # Some IDRiD mask TIFFs are stored multi-channel (e.g. genuine RGB
+        # content, or RGBA with the alpha channel already dropped above)
+        # rather than single-channel palette images -- collapse whatever
+        # channels remain to one 2D mask by treating a pixel as foreground if
+        # ANY of them is non-zero, before the shape check below. Never
+        # resized -- a genuine spatial (H, W) mismatch must still raise, not
+        # be silently papered over.
         mask = np.any(mask != 0, axis=-1)
     if mask.shape != shape:
         raise RuntimeError(

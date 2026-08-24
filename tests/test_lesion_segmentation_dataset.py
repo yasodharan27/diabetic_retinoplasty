@@ -217,23 +217,36 @@ class MissingSoftExudateMaskTests(unittest.TestCase):
 
 
 class MultiChannelMaskTests(unittest.TestCase):
-    """Regression test for the real IDRiD_81_EX.tif bug: some IDRiD mask
-    TIFFs are stored multi-channel (observed: (H, W, 4)) rather than the
-    usual single-channel palette image -- _load_binary_mask() must collapse
-    these to a 2D binary mask (foreground wherever ANY channel is nonzero)
-    before the shape-mismatch check, not crash or silently resize."""
+    """Regression tests for the real IDRiD_81_EX.tif bug and its fix.
+
+    The real file is RGBA: channel 0 holds the actual HardExudate mask
+    (sparse foreground), channels 1-2 are all-zero, and channel 3 (alpha) is
+    255 -- fully opaque -- at literally every pixel. The original
+    multi-channel-collapse fix (`np.any(mask != 0, axis=-1)`, unqualified)
+    treated that constant-255 alpha channel as foreground signal, making the
+    entire mask register as foreground. `_load_binary_mask()` must now
+    ignore the alpha/opacity channel (detected via PIL's own `mode`, e.g.
+    "RGBA"/"LA"/"PA") before collapsing whatever channels remain via "any
+    non-alpha channel nonzero" -- not crash, not silently resize, and not
+    treat alpha as lesion content."""
 
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="multichannel_mask_test_")
         self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
 
-    def test_multichannel_mask_collapses_to_2d_binary_mask(self):
+    def test_rgba_mask_with_constant_alpha_ignores_alpha_channel(self):
+        """The exact real-world IDRiD_81_EX.tif pattern: sparse real content
+        in channel 0, channels 1-2 all-zero, alpha (channel 3) opaque (255)
+        EVERYWHERE -- not just at one pixel, matching the actual file, not a
+        weaker synthetic stand-in. Before the fix this mask would have
+        collapsed to 100% foreground; after the fix it must match channel 0
+        exactly."""
         h, w = 10, 12
         mask_4ch = np.zeros((h, w, 4), dtype=np.uint8)
-        mask_4ch[2, 3, 0] = 255   # foreground via channel 0 only
-        mask_4ch[5, 5, 3] = 1     # foreground via channel 3 only (alpha)
-        # (7, 8) left all-zero across every channel -- must stay background
-        path = os.path.join(self.tmp_dir, "multichannel_mask.tif")
+        mask_4ch[2, 3, 0] = 255   # the only real lesion pixel, via channel 0
+        mask_4ch[6, 1, 0] = 255   # a second real lesion pixel, via channel 0
+        mask_4ch[..., 3] = 255    # alpha opaque everywhere, like the real file
+        path = os.path.join(self.tmp_dir, "rgba_constant_alpha_mask.tif")
         Image.fromarray(mask_4ch, mode="RGBA").save(path)
 
         result = lsd._load_binary_mask(path, (h, w))
@@ -241,18 +254,31 @@ class MultiChannelMaskTests(unittest.TestCase):
         self.assertEqual(result.shape, (h, w))
         self.assertEqual(result.dtype, np.uint8)
         self.assertTrue(np.isin(result, [0, 1]).all())
-        self.assertEqual(result[2, 3], 1, "foreground pixel via a single non-alpha channel")
-        self.assertEqual(result[5, 5], 1, "foreground pixel via a single (alpha) channel")
-        self.assertEqual(result[7, 8], 0, "pixel with every channel zero must stay background")
+        self.assertEqual(result.sum(), 2, "must match channel 0's 2 real foreground pixels exactly, "
+                                           "not the entire (h, w) image via the constant alpha channel")
+        self.assertEqual(result[2, 3], 1)
+        self.assertEqual(result[6, 1], 1)
+        self.assertEqual(result[0, 0], 0, "alpha=255 alone must NOT make this pixel foreground")
+        self.assertEqual(result[9, 11], 0, "alpha=255 alone must NOT make this pixel foreground")
 
-    def test_genuinely_wrong_spatial_shape_still_raises(self):
+    def test_genuine_multichannel_mask_without_alpha_still_collapses_via_any_nonzero(self):
+        """A genuinely multi-channel mask that carries NO alpha channel at
+        all (mode "RGB", 3 bands) -- the pre-existing "foreground if ANY
+        channel is nonzero" collapse must still apply to every channel here,
+        proving the alpha-specific carve-out doesn't disable multi-channel
+        handling in general. Real content deliberately placed in channel 1
+        (not channel 0) to prove this isn't hardcoded to one channel index."""
         h, w = 10, 12
-        mask_4ch = np.zeros((h, w, 4), dtype=np.uint8)
-        path = os.path.join(self.tmp_dir, "wrong_shape_mask.tif")
-        Image.fromarray(mask_4ch, mode="RGBA").save(path)
+        mask_3ch = np.zeros((h, w, 3), dtype=np.uint8)
+        mask_3ch[4, 7, 1] = 255   # foreground via channel 1 only, no alpha channel exists
+        path = os.path.join(self.tmp_dir, "rgb_no_alpha_mask.tif")
+        Image.fromarray(mask_3ch, mode="RGB").save(path)
 
-        with self.assertRaises(RuntimeError):
-            lsd._load_binary_mask(path, (h + 1, w))  # real (H, W) mismatch -- must still raise
+        result = lsd._load_binary_mask(path, (h, w))
+
+        self.assertEqual(result.shape, (h, w))
+        self.assertEqual(result.sum(), 1)
+        self.assertEqual(result[4, 7], 1, "foreground pixel via a single non-alpha channel (mode RGB, no alpha band)")
 
     def test_normal_2d_mask_behavior_is_unchanged(self):
         h, w = 10, 12
@@ -266,6 +292,15 @@ class MultiChannelMaskTests(unittest.TestCase):
         self.assertEqual(result.shape, (h, w))
         self.assertEqual(result[4, 6], 1)
         self.assertEqual(result.sum(), 1)
+
+    def test_genuinely_wrong_spatial_shape_still_raises(self):
+        h, w = 10, 12
+        mask_4ch = np.zeros((h, w, 4), dtype=np.uint8)
+        path = os.path.join(self.tmp_dir, "wrong_shape_mask.tif")
+        Image.fromarray(mask_4ch, mode="RGBA").save(path)
+
+        with self.assertRaises(RuntimeError):
+            lsd._load_binary_mask(path, (h + 1, w))  # real (H, W) mismatch -- must still raise
 
 
 class SampleShapeAndValueTests(unittest.TestCase):
