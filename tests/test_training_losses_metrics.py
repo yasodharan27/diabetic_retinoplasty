@@ -20,7 +20,12 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
-from training.losses import bce_dice_loss, dice_loss, weighted_bce_dice_loss
+from training.losses import (
+    bce_dice_loss,
+    dice_loss,
+    weighted_bce_dice_loss,
+    weighted_pooled_bce_dice_loss,
+)
 from training.metrics import dice_coefficient, iou_score
 
 
@@ -347,6 +352,169 @@ class WeightedBceDiceLossTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(dice_coefficient(y_true, y_pred).numpy()), 1.0, places=5)
         self.assertAlmostEqual(float(iou_score(y_true, y_pred).numpy()), 1.0, places=5)
+
+
+def _independent_weighted_pooled_reference(y_true, y_pred, weights, smooth=1.0):
+    """Ground truth for `weighted_pooled_bce_dice_loss`, written completely
+    independently of the implementation under test: per channel, the same
+    plain manual BCE this file's own `_independent_weighted_reference`
+    already uses (weighted-averaged across channels exactly as spec'd for
+    Experiment 2B, and reused unchanged for 2C's identical BCE mechanism);
+    but for Dice, each channel's raw (unweighted) intersection/union is
+    computed by hand, multiplied by that channel's weight, SUMMED across
+    channels (not averaged, and not divided by sum(weights)), and only then
+    turned into a single ratio -- exactly Experiment 2C's spec formula:
+    `(2*sum_c(w_c*I_c) + smooth) / (sum_c(w_c*U_c) + smooth)`."""
+    weights = np.asarray(weights, dtype=np.float64)
+    num_channels = y_true.shape[-1]
+    epsilon = 1e-7
+
+    bce_per_channel = []
+    weighted_intersection = 0.0
+    weighted_union = 0.0
+    for c in range(num_channels):
+        yt = y_true[..., c].astype(np.float64)
+        yp_raw = y_pred[..., c].astype(np.float64)
+        yp_clipped = np.clip(yp_raw, epsilon, 1 - epsilon)
+        bce = -(yt * np.log(yp_clipped) + (1 - yt) * np.log(1 - yp_clipped))
+        bce_per_channel.append(bce.mean())
+
+        intersection_c = float((yt * yp_raw).sum())
+        union_c = float(yt.sum() + yp_raw.sum())
+        weighted_intersection += weights[c] * intersection_c
+        weighted_union += weights[c] * union_c
+
+    weighted_bce = float(np.sum(np.array(bce_per_channel) * weights) / weights.sum())
+    pooled_dice = (2.0 * weighted_intersection + smooth) / (weighted_union + smooth)
+    pooled_dice_loss = 1.0 - pooled_dice
+    return 0.5 * weighted_bce + 0.5 * pooled_dice_loss
+
+
+class WeightedPooledBceDiceLossTests(unittest.TestCase):
+    """training.losses.weighted_pooled_bce_dice_loss() -- Stage 04
+    Experiment 2C. The sole difference from weighted_bce_dice_loss()
+    (Experiment 2B) is that the Dice term pools every channel's weighted
+    intersection/union into one ratio, instead of averaging four
+    independently-weighted per-channel ratios; the BCE term uses the
+    identical mechanism as 2B."""
+
+    def test_matches_independent_reference_implementation(self):
+        """Correct weighted-pooled Dice arithmetic AND correct channel-to-
+        weight mapping: the implementation must match a from-scratch
+        reference that applies the spec's own pooled formula."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weights = [2.0, 1.0, 1.1, 1.8]
+        actual = float(weighted_pooled_bce_dice_loss(weights)(y_true, y_pred).numpy()[0])
+        expected = _independent_weighted_pooled_reference(y_true, y_pred, weights)
+        self.assertAlmostEqual(actual, expected, places=4)
+
+    def test_not_equivalent_to_weighted_per_channel_dice_in_general(self):
+        """The two formulations must NOT coincide for data whose per-channel
+        Dice ratios differ (the whole point of Experiment 2C is that they
+        are different quantities)."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weights = [2.0, 1.0, 1.1, 1.8]
+        pooled = float(weighted_pooled_bce_dice_loss(weights)(y_true, y_pred).numpy()[0])
+        per_channel = float(weighted_bce_dice_loss(weights)(y_true, y_pred).numpy()[0])
+        self.assertNotAlmostEqual(pooled, per_channel, places=3)
+
+    def test_uniform_weights_reduce_to_original_pooled_dice_formula(self):
+        """[1, 1, 1, 1] must reproduce the ORIGINAL, fully-pooled Dice
+        formula Experiment 2 used before Experiment 2A's per-channel change
+        (every channel's pixels summed into one intersection/union before
+        one ratio) -- NOT the current dice_loss()/bce_dice_loss(), which
+        has been per-channel-averaged since Experiment 2A and is a
+        different quantity."""
+        y_true, y_pred = _four_channel_weighting_example()
+        smooth = 1.0
+
+        flat_true = y_true.reshape(1, -1).astype(np.float64)
+        flat_pred = y_pred.reshape(1, -1).astype(np.float64)
+        intersection = float((flat_true * flat_pred).sum())
+        union = float(flat_true.sum() + flat_pred.sum())
+        pooled_dice_loss_value = 1.0 - (2.0 * intersection + smooth) / (union + smooth)
+
+        epsilon = 1e-7
+        yt = y_true.astype(np.float64)
+        yp = np.clip(y_pred.astype(np.float64), epsilon, 1 - epsilon)
+        plain_bce = float((-(yt * np.log(yp) + (1 - yt) * np.log(1 - yp))).mean())
+
+        expected = 0.5 * plain_bce + 0.5 * pooled_dice_loss_value
+        actual = float(weighted_pooled_bce_dice_loss([1.0, 1.0, 1.0, 1.0])(y_true, y_pred).numpy()[0])
+        self.assertAlmostEqual(actual, expected, places=4)
+
+    def test_scaling_all_weights_changes_the_loss_per_documented_formula(self):
+        """Unlike weighted_bce_dice_loss() (where dividing by sum(weights)
+        cancels a uniform scale factor out), weighted_pooled_bce_dice_loss()
+        is deliberately NOT divided by sum(weights) -- `smooth` sits outside
+        the weighted sums, so scaling every weight by a constant does NOT
+        leave the Dice term unchanged. This is tested against the exact
+        independent reference formula, not merely asserted to differ."""
+        y_true, y_pred = _four_channel_weighting_example()
+        base_weights = [2.0, 1.0, 1.1, 1.8]
+        scaled_weights = [10.0 * w for w in base_weights]
+
+        base_actual = float(weighted_pooled_bce_dice_loss(base_weights)(y_true, y_pred).numpy()[0])
+        scaled_actual = float(weighted_pooled_bce_dice_loss(scaled_weights)(y_true, y_pred).numpy()[0])
+        base_expected = _independent_weighted_pooled_reference(y_true, y_pred, base_weights)
+        scaled_expected = _independent_weighted_pooled_reference(y_true, y_pred, scaled_weights)
+
+        self.assertAlmostEqual(base_actual, base_expected, places=4)
+        self.assertAlmostEqual(scaled_actual, scaled_expected, places=4)
+        self.assertNotAlmostEqual(base_actual, scaled_actual, places=3)
+
+    def test_upweighting_the_worst_channel_increases_loss_more_than_the_best_channel(self):
+        """Correct channel-to-weight mapping, direction-sensitive: channel 3
+        (worst prediction quality in _four_channel_weighting_example) and
+        channel 0 (best) must not be interchangeable."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weight_on_best = float(
+            weighted_pooled_bce_dice_loss([20.0, 1.0, 1.0, 1.0])(y_true, y_pred).numpy()[0]
+        )
+        weight_on_worst = float(
+            weighted_pooled_bce_dice_loss([1.0, 1.0, 1.0, 20.0])(y_true, y_pred).numpy()[0]
+        )
+        self.assertGreater(weight_on_worst, weight_on_best)
+
+    def test_multichannel_input_returns_finite_value(self):
+        y_true, y_pred = _four_channel_weighting_example()
+        value = weighted_pooled_bce_dice_loss([2.0, 1.0, 1.1, 1.8])(y_true, y_pred).numpy()
+        self.assertEqual(value.shape, (1,))
+        self.assertTrue(np.all(np.isfinite(value)))
+
+    def test_keras_model_compiles_and_fits_one_step(self):
+        inputs = tf.keras.Input(shape=(8, 8, 4))
+        outputs = tf.keras.layers.Conv2D(4, 1, activation="sigmoid")(inputs)
+        model = tf.keras.Model(inputs, outputs)
+        model.compile(optimizer="adam", loss=weighted_pooled_bce_dice_loss([2.0, 1.0, 1.1, 1.8]),
+                      metrics=[dice_coefficient, iou_score])
+
+        rng = np.random.RandomState(2)
+        x = rng.rand(4, 8, 8, 4).astype("float32")
+        y = (rng.rand(4, 8, 8, 4) > 0.5).astype("float32")
+
+        history = model.fit(x, y, epochs=1, batch_size=2, verbose=0)
+        self.assertIn("loss", history.history)
+        self.assertTrue(np.isfinite(history.history["loss"][0]))
+
+    def test_existing_losses_are_unaffected_by_the_shared_bce_refactor(self):
+        """Adding weighted_pooled_bce_dice_loss() required factoring the
+        weighted-BCE mechanism out into a shared helper -- dice_loss(),
+        bce_dice_loss(), and weighted_bce_dice_loss() must all still behave
+        exactly as Experiment 2A/2B left them."""
+        y_true, y_pred = _four_channel_weighting_example()
+        weights = [2.0, 1.0, 1.1, 1.8]
+
+        per_channel_actual = float(weighted_bce_dice_loss(weights)(y_true, y_pred).numpy()[0])
+        per_channel_expected = _independent_weighted_reference(y_true, y_pred, weights)
+        self.assertAlmostEqual(per_channel_actual, per_channel_expected, places=4)
+
+        two_true, two_pred = _two_channel_example()
+        expected_dice_mean = (1.0 + 1.0 / 3.0) / 2.0
+        self.assertAlmostEqual(
+            float(dice_loss()(two_true, two_pred).numpy()[0]), 1.0 - expected_dice_mean, places=5,
+        )
+        self.assertTrue(np.all(np.isfinite(bce_dice_loss()(two_true, two_pred).numpy())))
 
 
 if __name__ == "__main__":

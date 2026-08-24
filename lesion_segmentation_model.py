@@ -41,6 +41,7 @@ from training import (
     dice_coefficient,
     iou_score,
     weighted_bce_dice_loss,
+    weighted_pooled_bce_dice_loss,
 )
 from vessel_segmentation_inference import _load_rgb_array, predict_vessel_mask
 
@@ -66,6 +67,11 @@ DEFAULT_THRESHOLD = 0.5
 # they are optimal, and NOT validated against the real 27-image test set
 # until that evaluation is actually run. Order matches LESION_CLASSES
 # exactly (Microaneurysm, Haemorrhage, HardExudate, SoftExudate).
+#
+# Experiment 2C reuses these SAME weight values, unchanged -- see
+# `weighted_dice_mode="pooled"` below -- to isolate the pooled-vs-per-
+# channel Dice question from the separate question of what the weights
+# themselves should be.
 EXPERIMENT_2B_CLASS_WEIGHTS = (2.0, 1.0, 1.1, 1.8)
 
 
@@ -107,7 +113,7 @@ def _decoder_block(x, skip, filters, name):
 
 
 def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_filters=32,
-                          learning_rate=1e-4, class_weights=None):
+                          learning_rate=1e-4, class_weights=None, weighted_dice_mode="per_channel"):
     """
     Builds and compiles the Attention U-Net: 4 encoder levels + bottleneck
     + 4 decoder levels with attention-gated skip connections, a 1x1 sigmoid
@@ -118,18 +124,31 @@ def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_fi
 
     Loss: `training.losses.bce_dice_loss()` (unweighted, channel-independent
     per-channel Dice + plain BCE -- Experiment 2A's default) when
-    `class_weights` is `None`. Passing a length-`num_classes` sequence (e.g.
-    `EXPERIMENT_2B_CLASS_WEIGHTS`, above) switches to
-    `training.losses.weighted_bce_dice_loss(class_weights)` instead
-    (Experiment 2B) -- both the BCE and Dice components are then combined
-    as a *weighted* per-channel average rather than a plain one. This is
-    the only place either loss is selected; no other stage's compilation is
-    affected by this parameter. Metrics:
+    `class_weights` is `None`; `weighted_dice_mode` has no effect in that
+    case. Passing a length-`num_classes` sequence (e.g.
+    `EXPERIMENT_2B_CLASS_WEIGHTS`, above) switches to one of two weighted
+    losses depending on `weighted_dice_mode`:
+      - `"per_channel"` (default): `training.losses.weighted_bce_dice_loss
+        (class_weights)` (Experiment 2B) -- both the BCE and Dice
+        components are combined as a *weighted average of per-channel
+        ratios*.
+      - `"pooled"`: `training.losses.weighted_pooled_bce_dice_loss
+        (class_weights)` (Experiment 2C) -- BCE is combined the same way,
+        but the Dice component pools every channel's weighted intersection
+        and union into a single ratio instead of averaging per-channel
+        ratios (Experiment 2's original pooled-Dice formulation, now
+        class-weighted). The two are not equivalent in general.
+    This is the only place any of these losses is selected; no other
+    stage's compilation is affected by this parameter. Metrics:
     `training.metrics.build_metrics("segmentation")` (`dice_coefficient`,
     `iou_score`, computed over all `num_classes` channels combined -- see
     `per_class_segmentation_metrics` for the per-lesion-class breakdown
     used by `LesionSegmentationStage.evaluate()`).
     """
+    if weighted_dice_mode not in ("per_channel", "pooled"):
+        raise ValueError(
+            f"weighted_dice_mode must be 'per_channel' or 'pooled'; got {weighted_dice_mode!r}."
+        )
     if class_weights is not None and len(class_weights) != num_classes:
         raise ValueError(
             f"class_weights must have length num_classes ({num_classes}); "
@@ -171,7 +190,12 @@ def build_attention_unet(input_shape=DEFAULT_INPUT_SHAPE, num_classes=4, base_fi
                              name="lesion_seg_output")(d1)
 
     model = Model(inputs=inputs, outputs=outputs, name="lesion_segmentation_attention_unet")
-    loss = weighted_bce_dice_loss(class_weights) if class_weights is not None else bce_dice_loss()
+    if class_weights is None:
+        loss = bce_dice_loss()
+    elif weighted_dice_mode == "pooled":
+        loss = weighted_pooled_bce_dice_loss(class_weights)
+    else:
+        loss = weighted_bce_dice_loss(class_weights)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=loss,
@@ -347,17 +371,24 @@ class LesionSegmentationStage(SegmentationStage):
     every method here is fully functional -- Lesion Segmentation trains
     within this project (SEGMENTATION_ARCHITECTURE.md Sec 5/7.0)."""
 
-    def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, class_weights=None):
-        """`class_weights`, if given, is forwarded to `build_attention_unet`
-        the first time `train()` builds a model (i.e. whenever `self.model`
-        is still `None`) -- `None` (the default) preserves Experiment 2A's
-        plain unweighted `bce_dice_loss()`; a length-4 sequence (e.g.
-        `EXPERIMENT_2B_CLASS_WEIGHTS`) switches that model to
-        `weighted_bce_dice_loss` instead (Experiment 2B). Has no effect if
-        a model is assigned to `self.model` directly or loaded via
-        `load()` -- this only governs how `train()` builds a fresh one."""
+    def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, class_weights=None,
+                 weighted_dice_mode="per_channel"):
+        """`class_weights`/`weighted_dice_mode`, if given, are forwarded to
+        `build_attention_unet` the first time `train()` builds a model
+        (i.e. whenever `self.model` is still `None`) -- `class_weights=
+        None` (the default) preserves Experiment 2A's plain unweighted
+        `bce_dice_loss()`, and `weighted_dice_mode` then has no effect. A
+        length-4 `class_weights` sequence (e.g. `EXPERIMENT_2B_CLASS_
+        WEIGHTS`) switches that model to a weighted loss: `weighted_dice_
+        mode="per_channel"` (the default) selects `weighted_bce_dice_loss`
+        (Experiment 2B); `weighted_dice_mode="pooled"` selects
+        `weighted_pooled_bce_dice_loss` (Experiment 2C) instead. Has no
+        effect if a model is assigned to `self.model` directly or loaded
+        via `load()` -- this only governs how `train()` builds a fresh
+        one."""
         self.input_shape = input_shape
         self.class_weights = class_weights
+        self.weighted_dice_mode = weighted_dice_mode
         self.model = None
 
     def train(self, train_data, val_data=None, **kwargs):
@@ -370,7 +401,10 @@ class LesionSegmentationStage(SegmentationStage):
         `trainer_config` (a `training.TrainingConfig`); otherwise builds one
         from `run_dir`/`epochs` kwargs (defaults: `DEFAULT_RUN_DIR`, 50)."""
         if self.model is None:
-            self.model = build_attention_unet(input_shape=self.input_shape, class_weights=self.class_weights)
+            self.model = build_attention_unet(
+                input_shape=self.input_shape, class_weights=self.class_weights,
+                weighted_dice_mode=self.weighted_dice_mode,
+            )
 
         trainer_config = kwargs.get("trainer_config") or TrainingConfig(
             run_dir=kwargs.get("run_dir", DEFAULT_RUN_DIR),

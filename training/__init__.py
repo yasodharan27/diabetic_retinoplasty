@@ -17,6 +17,7 @@ from .losses import (
     dice_loss,
     bce_dice_loss,
     weighted_bce_dice_loss,
+    weighted_pooled_bce_dice_loss,
     weighted_categorical_crossentropy,
 )
 from .metrics import build_metrics, dice_coefficient, iou_score, QuadraticWeightedKappa
@@ -31,7 +32,7 @@ __all__ = [
     "Trainer", "TrainingConfig", "check_gpu", "enable_mixed_precision",
     "build_callbacks", "EpochStateLogger", "get_resume_epoch",
     "get_loss", "focal_loss", "dice_loss", "bce_dice_loss", "weighted_bce_dice_loss",
-    "weighted_categorical_crossentropy",
+    "weighted_pooled_bce_dice_loss", "weighted_categorical_crossentropy",
     "build_metrics", "dice_coefficient", "iou_score", "QuadraticWeightedKappa",
     "build_optimizer", "cosine_decay_schedule", "exponential_decay_schedule", "warmup_cosine_schedule",
 ]

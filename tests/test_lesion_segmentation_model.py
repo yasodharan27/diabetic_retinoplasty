@@ -26,6 +26,7 @@ import torch
 
 import lesion_segmentation_model as lsm
 from pipeline import SegmentationStage
+from training.losses import weighted_bce_dice_loss, weighted_pooled_bce_dice_loss
 from vessel_segmentation_model import build_vessel_segmentation_model, load_state_dict_from_checkpoint
 
 
@@ -129,6 +130,98 @@ class BuildAttentionUnetClassWeightsTests(unittest.TestCase):
         self.assertEqual(len(lsm.EXPERIMENT_2B_CLASS_WEIGHTS), len(lsm.LESION_CLASSES))
 
 
+def _distinctly_weighted_4channel_example(size=8):
+    """(1, size, size, 4) y_true/y_pred with deliberately distinct
+    per-channel prediction quality (mirrors
+    test_training_losses_metrics._four_channel_weighting_example), so that
+    weighted-pooled and weighted-per-channel Dice reliably diverge -- unlike
+    uniform random data, where the two formulations can coincidentally land
+    close together by chance."""
+    y_true = np.zeros((1, size, size, 4), dtype=np.float32)
+    y_pred = np.zeros((1, size, size, 4), dtype=np.float32)
+    y_true[0, :, :, 0] = 1.0
+    y_pred[0, :, :, 0] = 0.9
+    y_true[0, 0:2, 0:2, 1] = 1.0
+    y_pred[0, :, :, 1] = 0.5
+    y_pred[0, :, :, 2] = 0.1
+    y_true[0, 0, 0, 3] = 1.0
+    y_pred[0, :, :, 3] = 0.01
+    return y_true, y_pred
+
+
+class BuildAttentionUnetWeightedDiceModeTests(unittest.TestCase):
+    """Stage 04 Experiment 2C: `weighted_dice_mode="pooled"` (with
+    `class_weights` set) must switch the compiled loss to
+    `training.weighted_pooled_bce_dice_loss` instead of Experiment 2B's
+    `weighted_bce_dice_loss` -- the default `weighted_dice_mode=
+    "per_channel"` must keep building Experiment 2B's model exactly as
+    before this parameter was added."""
+
+    def test_default_weighted_dice_mode_is_per_channel(self):
+        model = lsm.build_attention_unet(
+            input_shape=(32, 32, 4), base_filters=4, class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+        )
+        y_true = np.random.RandomState(0).randint(0, 2, (2, 32, 32, 4)).astype("float32")
+        y_pred = np.random.RandomState(1).rand(2, 32, 32, 4).astype("float32")
+        actual = float(model.loss(y_true, y_pred).numpy()[0])
+        expected = float(
+            weighted_bce_dice_loss(lsm.EXPERIMENT_2B_CLASS_WEIGHTS)(y_true, y_pred).numpy()[0]
+        )
+        self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_pooled_mode_selects_weighted_pooled_loss(self):
+        model = lsm.build_attention_unet(
+            input_shape=(32, 32, 4), base_filters=4, class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+            weighted_dice_mode="pooled",
+        )
+        y_true, y_pred = _distinctly_weighted_4channel_example()
+
+        actual = float(model.loss(y_true, y_pred).numpy()[0])
+        expected_pooled = float(
+            weighted_pooled_bce_dice_loss(lsm.EXPERIMENT_2B_CLASS_WEIGHTS)(y_true, y_pred).numpy()[0]
+        )
+        expected_per_channel = float(
+            weighted_bce_dice_loss(lsm.EXPERIMENT_2B_CLASS_WEIGHTS)(y_true, y_pred).numpy()[0]
+        )
+        self.assertAlmostEqual(actual, expected_pooled, places=5)
+        self.assertNotAlmostEqual(actual, expected_per_channel, places=3)
+
+    def test_pooled_mode_trains_one_step(self):
+        model = lsm.build_attention_unet(
+            input_shape=(32, 32, 4), base_filters=4, class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+            weighted_dice_mode="pooled",
+        )
+        rng = np.random.RandomState(3)
+        x = rng.rand(2, 32, 32, 4).astype("float32")
+        y = (rng.rand(2, 32, 32, 4) > 0.5).astype("float32")
+        history = model.fit(x, y, epochs=1, batch_size=2, verbose=0)
+        self.assertIn("loss", history.history)
+        self.assertTrue(np.isfinite(history.history["loss"][0]))
+
+    def test_invalid_weighted_dice_mode_raises(self):
+        with self.assertRaises(ValueError):
+            lsm.build_attention_unet(
+                input_shape=(32, 32, 4), base_filters=4, class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+                weighted_dice_mode="not_a_real_mode",
+            )
+
+    def test_weighted_dice_mode_ignored_when_class_weights_is_none(self):
+        """weighted_dice_mode="pooled" with class_weights=None must still
+        build the plain unweighted Experiment 2A model -- weighted_dice_mode
+        only matters once class_weights is given."""
+        model_default = lsm.build_attention_unet(input_shape=(32, 32, 4), base_filters=4)
+        model_pooled_but_unweighted = lsm.build_attention_unet(
+            input_shape=(32, 32, 4), base_filters=4, weighted_dice_mode="pooled",
+        )
+        y_true = np.random.RandomState(0).randint(0, 2, (2, 32, 32, 4)).astype("float32")
+        y_pred = np.random.RandomState(1).rand(2, 32, 32, 4).astype("float32")
+        self.assertAlmostEqual(
+            float(model_default.loss(y_true, y_pred).numpy()[0]),
+            float(model_pooled_but_unweighted.loss(y_true, y_pred).numpy()[0]),
+            places=5,
+        )
+
+
 class LesionSegmentationStageClassWeightsTests(unittest.TestCase):
     """Stage 04 wiring for the Colab notebook: LesionSegmentationStage
     (class_weights=...) must forward those weights to build_attention_unet()
@@ -146,7 +239,9 @@ class LesionSegmentationStageClassWeightsTests(unittest.TestCase):
         with mock.patch("lesion_segmentation_model.build_attention_unet",
                          wraps=lsm.build_attention_unet) as spy:
             stage.train(train_ds, None, run_dir=os.path.join(self.tmp_dir, "run"), epochs=1)
-        spy.assert_called_once_with(input_shape=(16, 16, 4), class_weights=None)
+        spy.assert_called_once_with(
+            input_shape=(16, 16, 4), class_weights=None, weighted_dice_mode="per_channel",
+        )
 
     def test_explicit_class_weights_are_forwarded_to_build_attention_unet(self):
         stage = lsm.LesionSegmentationStage(
@@ -158,8 +253,39 @@ class LesionSegmentationStageClassWeightsTests(unittest.TestCase):
             stage.train(train_ds, None, run_dir=os.path.join(self.tmp_dir, "run"), epochs=1)
         spy.assert_called_once_with(
             input_shape=(16, 16, 4), class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+            weighted_dice_mode="per_channel",
         )
         self.assertIsNotNone(stage.model)
+
+    def test_experiment_2c_weighted_dice_mode_is_forwarded_to_build_attention_unet(self):
+        """Experiment 2C: LesionSegmentationStage(class_weights=...,
+        weighted_dice_mode="pooled") must explicitly select
+        training.weighted_pooled_bce_dice_loss, and the resulting model
+        must actually receive it -- not merely forward the string."""
+        stage = lsm.LesionSegmentationStage(
+            input_shape=(16, 16, 4), class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+            weighted_dice_mode="pooled",
+        )
+        train_ds = _tiny_dataset(num_samples=4, size=16, batch_size=2, seed=1)
+        with mock.patch("lesion_segmentation_model.build_attention_unet",
+                         wraps=lsm.build_attention_unet) as spy:
+            stage.train(train_ds, None, run_dir=os.path.join(self.tmp_dir, "run"), epochs=1)
+        spy.assert_called_once_with(
+            input_shape=(16, 16, 4), class_weights=lsm.EXPERIMENT_2B_CLASS_WEIGHTS,
+            weighted_dice_mode="pooled",
+        )
+        self.assertIsNotNone(stage.model)
+
+        y_true, y_pred = _distinctly_weighted_4channel_example(size=16)
+        actual = float(stage.model.loss(y_true, y_pred).numpy()[0])
+        expected_pooled = float(
+            weighted_pooled_bce_dice_loss(lsm.EXPERIMENT_2B_CLASS_WEIGHTS)(y_true, y_pred).numpy()[0]
+        )
+        expected_per_channel = float(
+            weighted_bce_dice_loss(lsm.EXPERIMENT_2B_CLASS_WEIGHTS)(y_true, y_pred).numpy()[0]
+        )
+        self.assertAlmostEqual(actual, expected_pooled, places=5)
+        self.assertNotAlmostEqual(actual, expected_per_channel, places=3)
 
 
 class PerClassSegmentationMetricsTests(unittest.TestCase):
