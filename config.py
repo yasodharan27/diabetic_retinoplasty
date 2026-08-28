@@ -121,6 +121,17 @@ class GlobalFeatureExtractionPaths:
 
 
 @dataclass(frozen=True)
+class FeatureFusionPaths:
+    """Adaptive Cross-Attention / Feature Fusion (Stage 07) model and
+    results paths. Mirrors `GlobalFeatureExtractionPaths` exactly -- Stage
+    07, like Stage 06, has no frozen upstream inference to cache; this
+    exists only for parity with the per-stage model_dir/results_dir
+    convention every other trainable stage in this project already uses."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -190,6 +201,11 @@ GLOBAL_FEATURE_EXTRACTION = GlobalFeatureExtractionPaths(
     results_dir=os.environ.get('GLOBAL_FEATURE_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'global_feature_extraction'),
 )
 
+FEATURE_FUSION = FeatureFusionPaths(
+    model_dir=os.environ.get('FEATURE_FUSION_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'feature_fusion'),
+    results_dir=os.environ.get('FEATURE_FUSION_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'feature_fusion'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -225,6 +241,9 @@ LOCAL_FEATURE_RESULTS_DIR = LOCAL_FEATURE_EXTRACTION.results_dir
 
 GLOBAL_FEATURE_MODEL_DIR = GLOBAL_FEATURE_EXTRACTION.model_dir
 GLOBAL_FEATURE_RESULTS_DIR = GLOBAL_FEATURE_EXTRACTION.results_dir
+
+FEATURE_FUSION_MODEL_DIR = FEATURE_FUSION.model_dir
+FEATURE_FUSION_RESULTS_DIR = FEATURE_FUSION.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---

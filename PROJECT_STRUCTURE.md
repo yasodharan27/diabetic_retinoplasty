@@ -193,12 +193,137 @@ for the visual end-to-end flow.
 - **Novelty status:** not a research contribution — Swin's core mechanism, the dual-patch-size branch concept, and the (4,8) pairing are all established/cited (see the Stage 06 design-resolution record). RACAF remains the project's sole research innovation.
 - **Status:** Implemented and unit-tested. **Not trained, not frozen.**
 
-### 7. Feature Fusion
-- **Purpose:** Combine local (Stage 5) and global (Stage 6) features (Adaptive Cross-Attention).
-- **Input:** Local + global feature vectors.
-- **Output:** Fused feature representation.
+### 7. Adaptive Cross-Attention (Feature Fusion)
+
+```
+    Stage 5                          Stage 6
+    Local                            Global
+    (B,32,32,256)                    (B,64,1152)   <- already flattened,
+        │                                │            Stage 6's real output
+        │ flatten -> (B,1024,256)        │ (no reshape needed)
+        │                                │
+        │ pre-LN, K/V proj. (256->256)   │ pre-LN, Q proj. (1152->256)
+        │                                │
+        │ + 2D pos. embed. (32+32)       │ + 2D pos. embed. (8+8)
+        ↓                                ↓
+      K,V: (B,1024,256)  <───────────  Q: (B,64,256)
+        │                                │
+        └──────────► Cross-Attention ◄───┘
+                    (8 heads, d_model=256)
+                     Q=Global, K,V=Local
+                            │
+                            ↓
+                     residual + FFN
+                    (256->1024->256)
+                            │
+                            ↓
+                      (B, 64, 256)
+                            │
+                            ↓
+                  Global Average Pooling
+                            │
+                            ↓
+                       E = (B, 256)
+                            │
+                            ↓
+                       RACAF  ⭐
+              (also independently receives raw G
+               directly from Stage 6, for GAP(G))
+```
+
+- **Purpose:** Let Stage 5's local, segmentation-aware information and Stage 6's global,
+  RGB-only context interact before RACAF, producing a single fused embedding for CORN.
+  **Implemented, unit-tested. Not trained, not frozen** (see `feature_fusion.py` and the Stage 07
+  design-resolution record for the full audit/literature comparison this specification is drawn
+  from).
+- **Inputs:** Local features $L$ (Stage 5) and Global features $G$ (Stage 6), both consumed
+  unmodified — Stage 7 does not alter either stage's internals.
+  - $L$: `(B, 32, 32, 256)` — Stage 5's real, spatial output; flattened to `(B, 1024, 256)` inside
+    Stage 7 — 1024 tokens, $C_{local}=256$.
+  - $G$: `(B, 64, 1152)` — Stage 6's real, **already-flattened** output (`create_dual_scale_swin_model()`
+    performs its own internal `Reshape` and hands off token sequences directly; there is no
+    separate spatial `(8,8,1152)` tensor to consume). 64 tokens, $C_{global}=1152$, still
+    conceptually an 8x8 row-major grid for positional-embedding purposes (Stage 6's own reshape
+    preserves that order). The same raw $G$ also continues directly to RACAF (see
+    `RACAF_ARCHITECTURE.md` §5/§6) — Stage 7 is not the only consumer of Stage 6's output.
+- **Attention direction:** one-way, **Global queries Local** (Perceiver-style asymmetric
+  cross-attention, Jaegle et al., ICML 2021) — $Q$ = Global's 64 tokens, $K,V$ = Local's 1024
+  tokens. Chosen over the reverse direction and over bidirectional attention because RACAF's
+  formulation only consumes one fused vector $E$ (`RACAF_ARCHITECTURE.md` §5); keeping the query
+  side small (64, not 1024) also keeps every post-attention operation (FFN, output projection)
+  an order of magnitude cheaper than the reverse direction, for identical attention-score cost.
+- **Projection / attention dimension:** $d_{model}=256$ — matches Local's native channel count
+  exactly (no unjustified up-projection of Local), and meaningfully compresses Global's raw,
+  unprojected 1152 channels (Stage 6 performs no post-concatenation projection of its own). 8
+  heads, 32 dims/head — reuses this project's own Stage 6 Branch A convention ("per-head
+  dimension is 32... following the original Swin Transformer paper's own design rule," §6 above).
+- **Positional encoding:** lightweight, factorized (row + column) learned 2D positional
+  embeddings, dim 256 for both branches (Local: 32+32 vectors; Global: 8+8 vectors) — added to
+  each branch's *projected*, `d_model`-wide tokens, immediately before the cross-attention call.
+  This is the only dimensionally consistent placement: Global's raw tokens are 1152-wide, and a
+  256-d positional vector cannot be added to them before their `1152->256` projection; Local's raw
+  tokens happen to already be 256-wide, but the embedding is applied post-projection for both
+  branches for consistency. Neither branch's own internal positional mechanism (Swin's relative
+  window bias; the CNN's implicit locality) is aware of the *other* branch's coordinate frame, so
+  this explicitly encodes the fixed 4:1 grid correspondence between Local's 32x32 grid and
+  Global's 8x8 grid. A project-specific engineering adaptation of established positional-embedding
+  practice (ViT/DETR-style absolute positional embeddings) — **not a novel mechanism.**
+- **Attention block:** pre-LayerNorm, single cross-attention layer (no self-attention sub-layer —
+  both branches are already self-mixed upstream), residual connection, FFN (`256 -> 1024 -> 256`,
+  GELU, dropout 0.1), second residual. Attention dropout 0.1. Standard Transformer practice
+  (Vaswani et al., NeurIPS 2017); no non-standard components.
+- **Output before pooling:** `(B, 64, 256)` — one enriched token per Global grid cell.
+- **Pooling:** global average pooling over the 64 output tokens, mirroring RACAF's own
+  `GAP(G)` construction so $E$ and RACAF's $\hat G$ remain a like-for-like comparison for its gate.
+- **Output:** $E$, shape **`(B, 256)`** — a single fused embedding per image, not a token
+  sequence. This shape is fixed by RACAF's requirement that $E$ and $\hat G = W_r\cdot GAP(G)+b_r$
+  share a shape for the blend `F = gate*E + (1-gate)*Ĝ` (`RACAF_ARCHITECTURE.md` §5); this
+  finalizes $d_{model}=256$, RACAF's one previously-open parameter (§6/§13).
+- **Computational rationale:** core cross-attention cost is ~33.6M MACs (`2 x 64 x 1024 x 256`),
+  ~18x cheaper than a hypothetical joint 1088-token self-attention (~606M MACs); the dominant
+  cost is the Local K/V projection (~134M MACs) because it touches all 1024 tokens, not the
+  attention operation itself. Total Stage 7 footprint, **measured**: 1,173,504 parameters (all
+  trainable), negligible next to Stage 6's Swin backbones (39.7M params) — slightly above the
+  original ~1.04M estimate because `keras.layers.MultiHeadAttention` applies its own internal
+  Q/K/V/output projections on top of this module's explicit pre-projection into `d_model`, which
+  is intentional (see Files below) rather than a discrepancy to resolve. No mixed precision,
+  gradient accumulation, or gradient checkpointing is required specifically for Stage 7 on a T4.
+- **"Adaptive" means:** attention weights are dynamically computed from image content via
+  learned Q/K/V projections and softmax — standard content-dependent attention, as opposed to a
+  static fusion rule (fixed concatenation, fixed-ratio sum). It does **not** mean reliability-,
+  uncertainty-, TTA-, or confidence-aware. Those belong exclusively to RACAF.
+- **RACAF boundary:** Stage 7 never reads Stage 4's output (TTA or otherwise), never computes
+  disagreement/reliability of any kind, never gates or weights $E$ by a confidence signal, and
+  never sees a ground-truth label. RACAF wraps Stage 7's output ($E$) and separately, independently
+  reads the same raw $G$ Stage 7 also received — RACAF's `GAP(G)` is not derived from anything
+  Stage 7 computes. See `RACAF_ARCHITECTURE.md` §3/§5 for exactly where RACAF begins.
+- **Training dataset:** APTOS 2019 — same split as Stages 5/6. No standalone Stage 7 training
+  objective; trained jointly with Stages 5, 6, 8, and RACAF
+  (`AdaptiveCrossAttentionStage.train()`/`.evaluate()` raise `NotImplementedError`, mirroring
+  `GlobalFeatureExtractionStage`'s identical convention).
+- **Files:** `feature_fusion.py` (`build_adaptive_cross_attention()`,
+  `Factorized2DPositionalEmbedding`, `AdaptiveCrossAttentionStage`). Implements
+  `pipeline.TrainableStage`/`pipeline.InferenceStage` directly, not `pipeline.FeatureExtractionStage`
+  — that class's own docstring fixes `predict`'s contract to a single spatial feature map from a
+  single input, never a globally pooled vector from two inputs, which is exactly Stage 7's shape.
+- **Serialization:** full `.keras` (`model.save()`/`tf.keras.models.load_model()`), not
+  weights-only. Every layer used (`MultiHeadAttention`, `Dense`, `LayerNormalization`, `Dropout`,
+  `Add`, `Reshape`, `GlobalAveragePooling1D`) is a built-in Keras layer with existing
+  `get_config()` support; the one custom layer this module introduces
+  (`Factorized2DPositionalEmbedding`) implements `get_config()` and is registered via
+  `@register_keras_serializable()`. Verified numerically: build -> save -> load -> identical
+  weights and identical predictions (`tests/test_feature_fusion.py`'s `SerializationTests`) — this
+  deliberately does not repeat Stage 06's weights-only fallback, since no pre-existing,
+  non-serializable classes are reused here.
+- **Novelty status:** not a research contribution — multi-head cross-attention, the
+  Perceiver-style asymmetric query/key-value direction, and absolute 2D positional embeddings are
+  all established/cited. RACAF remains the project's sole research innovation.
 - **Dependencies:** Stages 5, 6.
-- **Status:** Not implemented.
+- **Status:** **Implemented and unit-tested. Not trained, not frozen.** Verified end-to-end
+  against the real, already-implemented Stage 05 and Stage 06 models (not just representative
+  tensors), including a full save/load round-trip with identical outputs. See the Stage 07
+  design-resolution record for the full architecture comparison, literature survey, and
+  traceability table this specification is drawn from.
 
 ### 8. CORN Classification
 - **Purpose:** Final ordinal DR-severity classification (CORN ordinal regression head).

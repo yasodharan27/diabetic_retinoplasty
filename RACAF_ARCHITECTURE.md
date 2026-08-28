@@ -205,18 +205,20 @@ explicit, unresolved design parameter rather than an invented number:
 | $\kappa_c$, $B_c$, $w_c$ | $(4,)$ each | Derived — always exactly 4, fixed by `LESION_CLASSES` order |
 | $r$, gate | scalar | Derived |
 | Native-resolution lesion maps fed to Stage 05 | $(H_{img}, W_{img}, 4)$ | Fixed (`predict_lesion_mask`'s existing resize-back logic, unmodified by RACAF) |
-| $L$ (Local FE output) | $(H_{local}, W_{local}, C_{local})$ | **Design parameter — not yet fixed.** `SEGMENTATION_ARCHITECTURE.md` §4 explicitly defers this; no shape is invented here. |
+| $L$ (Local FE output) | $(32, 32, 256)$, flattened $(1024, 256)$ | **Fixed** by Stage 05's implementation (`local_feature_extraction_model.py`) — $N_{local}=1024$, $C_{local}=256$. Not a RACAF decision; recorded here because Stage 07's own cross-attention (below) consumes it as $K,V$. |
 | $G$ (Global FE output, pre-pool) | $(64, 1152)$ | **Fixed** by Stage 06's implementation (`swin_transformer.py`'s `create_dual_scale_swin_model()`) — un-pooled token sequence, $N=64$, $C_G=1152$. Not a RACAF decision; recorded here only because RACAF's own formula below depends on it. |
-| $\text{GAP}(G)$ | $(1152,)$ | Mean over $G$'s 64-token axis, computed by RACAF (not by Stage 06 — Stage 06 applies no pooling of its own). |
-| $E = \text{CrossAttn}(L,G)$ | $(d_{model},)$ | **Design parameter.** "Fixed by CORN's own formulation," not yet numerically fixed by any governing document. |
-| $\hat G$ | $(d_{model},)$ | Forced to match $E$ by construction |
-| $F$ | $(d_{model},)$ | Identical shape to $E$ — CORN's documented input contract is unaffected in shape, only in value |
+| $\text{GAP}(G)$ | $(1152,)$ | Mean over $G$'s 64-token axis, computed by RACAF directly from the same raw $G$ Stage 06 emits (not by Stage 06 — Stage 06 applies no pooling of its own, and RACAF does not derive this from anything Stage 07 computes). |
+| $E = \text{CrossAttn}(L,G)$ | $(d_{model},) = (256,)$ | **Fixed** by Stage 07's implementation (`feature_fusion.py`'s `build_adaptive_cross_attention()`, `PROJECT_STRUCTURE.md` §7): one-way cross-attention, $Q$=Global's 64 tokens, $K,V$=Local's 1024 tokens, $d_{model}=256$ (8 heads x 32 dims/head), global-average-pooled over the 64 output tokens. Batched: $(B, 256)$. |
+| $\hat G$ | $(d_{model},) = (256,)$ | Forced to match $E$ by construction — $W_r$ projects $\text{GAP}(G)$'s $(1152,)$ down to $(256,)$ |
+| $F$ | $(d_{model},) = (256,)$ | Identical shape to $E$ — CORN's documented input contract is unaffected in shape, only in value |
 | CORN output | $(4,)$ cumulative logits | Fixed (5 APTOS grades → 4 cumulative thresholds) |
 
-No shape in Stages 01–04, or in CORN's own head, is affected by RACAF. $C_G=1152$ is now fixed
-by Stage 06's implementation (above). The one value RACAF is still waiting on is $d_{model}$, an
-open question Stage 07's own eventual implementation must resolve independently of whether RACAF
-is ever built.
+No shape in Stages 01–04, or in CORN's own head, is affected by RACAF. $C_G=1152$ is fixed by
+Stage 06's implementation. **$d_{model}=256$ is now fixed by Stage 07's implementation** — the
+one value this document was previously waiting on (§13). Stage 07 produces $E$; RACAF consumes
+$E$ and, independently, the same raw $G$ tensor Stage 07 also received (never a value derived
+from Stage 07's internals) to compute $\hat G$. No RACAF equation, mechanism, or parameter above
+is changed by this — only the previously-open $d_{model}$ value is now recorded as resolved.
 
 ---
 
@@ -381,12 +383,15 @@ signal to build against in this project. This is a deliberate scope boundary, no
 RACAF must not be implemented until all of the following exist:
 
 - A finalized Local Feature Extraction (Stage 05) output contract — specifically, a fixed
-  $(H_{local}, W_{local}, C_{local})$ (or equivalent flattened) shape.
+  $(H_{local}, W_{local}, C_{local})$ (or equivalent flattened) shape. **Satisfied**: Stage 05 is
+  implemented (`local_feature_extraction_model.py`), $L=(32,32,256)$, flattened $(1024,256)$.
 - A finalized Global Feature Extraction (Stage 06) output contract — specifically, a fixed
   input resolution and channel count $C_G$. **Satisfied**: Stage 06 is implemented
   (`swin_transformer.py`), input resolution 256x256, $G=(64, 1152)$, $C_G=1152$.
 - A finalized Adaptive Cross-Attention (Stage 07) output contract — specifically, a fixed
-  $d_{model}$, since $\hat G$'s projection dimensionality is defined relative to it.
+  $d_{model}$, since $\hat G$'s projection dimensionality is defined relative to it. **Satisfied**:
+  Stage 07 is implemented and unit-tested (`feature_fusion.py`'s `build_adaptive_cross_attention()`),
+  $d_{model}=256$, $E=(B,256)$, verified against the real Stage 05/06 models end-to-end.
 - The frozen Experiment 2C checkpoint, unchanged from its currently committed state.
 - Confirmation that Stage 04's inference interface (`predict_lesion_mask` /
   `predict_lesion_mask_batch` in `lesion_segmentation_model.py`) can be called repeatedly, with a

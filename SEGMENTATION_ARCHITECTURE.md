@@ -1,6 +1,12 @@
 # Segmentation Stage — Architecture Design Document
 
-**Status:** Frozen architecture specification for pipeline stages 3 (Vessel Segmentation) and 4 (Lesion Segmentation), plus the interface/shape contract connecting them to stages 5–8 (Local Feature Extraction → Global Feature Extraction → Feature Fusion → Ordinal Classification). **Vessel Segmentation uses a pretrained, externally-sourced model (LWNet) for inference only — it is not trained within this project.** **Lesion Segmentation is trained within this project**, on IDRiD's segmentation subset. An earlier design trained Vessel Segmentation within this project on DRIVE + CHASE_DB1 instead; that design was itself adopted, then superseded again by the current pretrained-LWNet design, and is retained only in the Appendix (Design History) for context.
+**Status:** Frozen architecture specification for pipeline stages 3 (Vessel Segmentation) and 4 (Lesion Segmentation), plus the interface/shape contract connecting them to stages 5–8 (Local Feature Extraction → Global Feature Extraction → Feature Fusion → Ordinal Classification). **Vessel Segmentation uses a pretrained, externally-sourced model (LWNet) for inference only — it is not trained within this project.** **Lesion Segmentation is trained within this project**, on IDRiD's segmentation subset, and is now **finalized and frozen** as Experiment 2C — see §3.5. An earlier design trained Vessel Segmentation within this project on DRIVE + CHASE_DB1 instead; that design was itself adopted, then superseded again by the current pretrained-LWNet design, and is retained only in the Appendix (Design History) for context.
+
+This document does not describe or redesign RACAF (Reliability-Aware Cross-Attention Fusion),
+the one approved downstream research innovation inserted after Feature Fusion and before Ordinal
+Classification — that is `RACAF_ARCHITECTURE.md`'s sole authority. This document's role in
+RACAF's design is limited to §3.5 below: recording that Stage 4's checkpoint is frozen and that
+its evaluation results are not RACAF inputs.
 
 **Sources consulted:** `PROJECT_CODE.md`, `IMPLEMENTATION_PLAN.md`, the `datasets/` directory tree, the existing `pipeline/`, `training/`, `evaluation/`, `config.py` code, and the papers in `research_papers/`.
 
@@ -129,6 +135,35 @@ Matches Vessel Segmentation's output resolution (§2.2), so the two masks stack 
 
 IDRiD's segmentation subset also ships an Optic Disc mask. It is **not** included in Lesion Segmentation's output: `PROJECT_CODE.md`'s Models table names four lesion categories for this stage, and `dr_gan++.pdf` itself treats Optic Disc as a separate model output from the lesion masks, not a joint one. The OD mask remains available on disk if a future pipeline stage needs it.
 
+### 3.5 Finalization Status (Experiment 2C) and Its Relationship to RACAF
+
+Lesion Segmentation is **finalized** as **Experiment 2C — Weighted-Pooled Dice**
+(`0.5·weighted_BCE + 0.5·weighted_pooled_Dice`, class weights MA=2.0/HE=1.0/EX=1.1/SE=1.8; see
+`training/losses.py`'s `weighted_pooled_bce_dice_loss`). Its checkpoint is **frozen for every
+downstream stage**, including Local Feature Extraction (§4 below), Global Feature Extraction, and
+RACAF — no further training, loss changes, or architecture changes to this stage are planned; no
+Experiment 2D exists.
+
+Its measured performance on the official 27-image IDRiD test set:
+
+| Class | Dice | IoU |
+|---|---|---|
+| Hard Exudate (EX) | 0.3574 | 0.2176 |
+| Haemorrhage (HE) | 0.1273 | 0.0680 |
+| Soft Exudate (SE) | 0.0244 | 0.0123 |
+| Microaneurysm (MA) | 0.0165 | 0.0083 |
+| Mean | 0.1314 | 0.0766 |
+
+**These are evaluation results only.** They motivate why RACAF exists (`RACAF_ARCHITECTURE.md`
+§1) but are never consumed as an input by RACAF or by any other trainable downstream component —
+using a held-out test statistic as a model input was considered and explicitly rejected during
+RACAF's design (`RACAF_ARCHITECTURE.md` §9). RACAF instead consumes only this stage's per-image
+**inference-time probability maps** (`predict_lesion_mask`'s `probability_maps` output, run
+multiple times under deterministic test-time augmentation) — never a ground-truth segmentation
+mask, and never a value derived from IDRiD's held-out test split, at inference time or during
+RACAF's own training. RACAF does not modify anything described in this section or in §1–§3
+above; it is documented entirely in `RACAF_ARCHITECTURE.md`.
+
 ---
 
 ## 4. Data Flow: Image → CORN Classifier
@@ -152,9 +187,9 @@ Lesion Segmentation  ── Attention U-Net (trained within this project, on
     (3 RGB + 1 vessel + 4 lesion)
     ▼
 Local Feature Extraction  ── Adaptive Multi-Kernel CNN
-    │  shape: (H_local, W_local, C_local) -- Local Feature Extraction's own
-    │  design document, not yet written, fixes this shape and its internal
-    │  fusion architecture; out of scope here.
+    │  shape: (32, 32, 256) -- fixed by Stage 05's own implementation
+    │  (local_feature_extraction_model.py); flattened (1024, 256) when
+    │  consumed as Stage 07's K,V.
     ▼
 Global Feature Extraction  ── Dual-Scale Swin Transformer
     (consumes the preprocessed RGB image directly; parallel to, not sequential
@@ -166,10 +201,15 @@ Global Feature Extraction  ── Dual-Scale Swin Transformer
     for the full specification; not repeated here.)
     │  shape: (64, 1152) -- fixed by Stage 06's own implementation, see above.
     ▼
-Adaptive Cross-Attention  (Feature Fusion)
-    │  shape: reduces to a flat feature vector for the CORN head (fixed by
-    │  CORN's own formulation). Exact dimensionality and fusion mechanism
-    │  belong to Feature Fusion's own future design document.
+Adaptive Cross-Attention  (Feature Fusion, Stage 07)
+    (one-way cross-attention, Global queries Local: Q = Global's 64 tokens,
+    K,V = Local's 1024 tokens, d_model=256, 8 heads. Implemented and
+    unit-tested (feature_fusion.py), not trained, not frozen -- see
+    PROJECT_STRUCTURE.md §7 and the Stage 07 design-resolution record for
+    the full specification.)
+    │  shape: (B, 256) -- a single fused embedding E, global-average-pooled
+    │  from the cross-attention's (B, 64, 256) token output. This fixes
+    │  d_model=256, the one value RACAF_ARCHITECTURE.md was waiting on.
     ▼
 CORN Classifier
     │  shape: (num_classes - 1) cumulative logits = 4 logits for the 5
@@ -177,7 +217,7 @@ CORN Classifier
     │  rank-consistent ordinal formulation.
 ```
 
-Only `Image → Vessel Segmentation → Lesion Segmentation` and the hand-off into Local Feature Extraction are formally specified by this document. The Local/Global/Fusion/CORN shapes are shown for traceability but belong to those stages' own future design documents.
+Only `Image → Vessel Segmentation → Lesion Segmentation` and the hand-off into Local Feature Extraction are formally specified by this document. The Local/Global/Fusion/CORN shapes are shown for traceability but are authoritatively specified in those stages' own documents (`PROJECT_STRUCTURE.md` §5/§6/§7; CORN's own document does not yet exist). RACAF (Reliability-Aware Cross-Attention Fusion) is also part of this downstream chain — inserted after Feature Fusion and before CORN — and is fully specified in `RACAF_ARCHITECTURE.md`, not here.
 
 ---
 

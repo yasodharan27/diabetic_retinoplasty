@@ -72,19 +72,21 @@ Standard (non-plus-plus) Grad-CAM: builds a sub-model exposing the `swin_refine`
 
 ## 2. Target Architecture (frozen, per `PROJECT_CODE.md` / `SEGMENTATION_ARCHITECTURE.md`)
 
-11-stage pipeline:
+12-stage pipeline (11 base stages plus RACAF, the one approved downstream research innovation —
+see `PROJECT_CODE.md`'s "Approved Research Innovation" section and `RACAF_ARCHITECTURE.md`):
 
 1. Image Quality Assessment — EfficientNetB0
 2. Image Preprocessing — Gamma Correction, CLAHE (RGB in, RGB out; no green-channel extraction, Ben Graham, median denoise, histogram equalization, resizing, or augmentation)
 3. Vessel Segmentation — Pretrained LWNet, **inference only, not trained within this project**
-4. Lesion Segmentation — Attention U-Net, trained on IDRiD
+4. Lesion Segmentation — Attention U-Net, trained on IDRiD — **finalized, Experiment 2C (Weighted-Pooled Dice), frozen**
 5. Local Feature Extraction — Adaptive Multi-Kernel CNN
 6. Global Feature Extraction — Dual-Scale Swin Transformer
-7. Feature Fusion — Adaptive Cross-Attention
-8. Ordinal Classification — CORN
-9. Uncertainty Estimation — Monte Carlo Dropout
-10. Explainability — Grad-CAM++, SHAP, Attention Rollout
-11. Evaluation
+7. Feature Fusion — Adaptive Cross-Attention — **implemented, not trained** (Global queries Local, $d_{model}=256$, output $E=(B,256)$), see `feature_fusion.py` and `PROJECT_STRUCTURE.md` §7
+8. Reliability-Aware Cross-Attention Fusion (RACAF) — the one approved research innovation; wraps Stage 7's output, does not redefine it; not yet implemented, see `RACAF_ARCHITECTURE.md`
+9. Ordinal Classification — CORN
+10. Uncertainty Estimation — Monte Carlo Dropout
+11. Explainability — Grad-CAM++, SHAP, Attention Rollout
+12. Evaluation
 
 Approved datasets: **EyeQ** (image quality, Stage 01 only), **APTOS 2019** (classification), and **IDRiD** (lesion segmentation and grading). EyePACS itself is not part of the implemented training or inference pipeline and is not required to reproduce it. Vessel Segmentation (Stage 03) uses a vendored pretrained checkpoint (LWNet) and needs no dataset of its own — DRIVE and CHASE_DB1, approved under an earlier superseded design, are no longer project datasets (see `SEGMENTATION_ARCHITECTURE.md` Appendix A.1). No other datasets permitted without explicit request.
 
@@ -97,16 +99,17 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **APTOS 2019** (clas
 | 1 | Image Quality Assessment | EfficientNetB0 (quality classifier) | Implemented, trained, verified — see `PROJECT_STRUCTURE.md`'s Stage 1 results. | **Completed** |
 | 2 | Image Preprocessing | Gamma Correction, CLAHE only (RGB in/out, deterministic, generated once) | `image_preprocessing.py` implements exactly this. No green-channel extraction, Ben Graham, median denoise, or resize — all explicitly excluded from Stage 02 per the frozen architecture. | **Frozen / implementation-ready** |
 | 3 | Vessel Segmentation | Pretrained LWNet, inference only | No code exists yet. Design finalized: Stage 03 integrates the externally-sourced, MIT-licensed `lwnet` checkpoint for inference only, not trained within this project (see `SEGMENTATION_ARCHITECTURE.md` §1.2/§2, and its design-history appendix for why an intermediate design trained a Baseline U-Net on DRIVE + CHASE_DB1 instead, and why that was reversed). | **Missing — design finalized, ready to implement** |
-| 4 | Lesion Segmentation | Attention U-Net | No code exists. Design finalized in `SEGMENTATION_ARCHITECTURE.md` §3 — input is the processed RGB image concatenated with Stage 3's vessel probability map (4 channels total). | **Missing — design finalized** |
+| 4 | Lesion Segmentation | Attention U-Net | Implemented and trained in Colab. Final experiment **2C (Weighted-Pooled Dice)**: Mean Dice 0.1314 / Mean IoU 0.0766 on the official 27-image IDRiD test set (per-class: MA 0.0165/0.0083, HE 0.1273/0.0680, EX 0.3574/0.2176, SE 0.0244/0.0123). See `SEGMENTATION_ARCHITECTURE.md` §3 and `RACAF_ARCHITECTURE.md` §1. No Experiment 2D is planned — Stage 4 is closed. | **Completed — FROZEN.** No further training, loss changes, or architecture changes to this stage. |
 | 5 | Local Feature Extraction | Adaptive Multi-Kernel CNN | No dedicated "local" feature extractor exists. Input contract finalized: RGB image + vessel map + 4 lesion maps, concatenated into an 8-channel tensor (`SEGMENTATION_ARCHITECTURE.md` §4). | **Missing** |
-| 6 | Global Feature Extraction | Dual-Scale Swin Transformer | A complete, hand-written single-scale Swin Transformer exists (`swin_transformer.py`), and `create_swin_tiny_model()` runs it standalone. The *hybrid* model only bolts on a single `SwinTransformerBlock` for feature refinement after a CNN backbone — no dual-scale windowing exists. Reusable foundation, wrong topology. Consumes the processed RGB image directly; any resizing it needs is internal to this stage (Stage 02 stays model-agnostic and unresized). | **Partially implemented** |
-| 7 | Feature Fusion | Adaptive Cross-Attention | The current "fusion" is a linear sequence (CNN → one Swin block → GlobalAveragePooling2D → Dense), not an attention-based fusion of two independent feature streams. | **Missing** |
-| 8 | Ordinal Classification | CORN | All classifiers use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK metric in the baseline scripts (QWK is, however, already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py`). | **Missing** |
-| 9 | Uncertainty Estimation | Monte Carlo Dropout | Fully implemented in `bayesian_inference.py`: MC sampling, mean/std, predictive entropy, uncertainty visualizations. Reliability diagram uses simulated labels (documented limitation, not a bug). Will need re-pointing at whatever model results from steps 5–8. | **Implemented** (needs integration once the classifier changes) |
-| 10 | Explainability | Grad-CAM++, SHAP, Attention Rollout | Only vanilla Grad-CAM exists (`explainable_ai.py`), hard-coded to the `swin_refine` layer name from the current hybrid model. Grad-CAM++, SHAP, and Attention Rollout are all absent. | **Partially implemented** |
-| 11 | Evaluation | — | Confusion matrix, classification report, accuracy/AUC exist per-script but are duplicated across files rather than a single evaluation module, and none compute ordinal-appropriate metrics (QWK) or real (non-simulated) calibration against the target architecture's models. | **Partially implemented** |
+| 6 | Global Feature Extraction | Dual-Scale Swin Transformer | Implemented: `swin_transformer.py`'s `create_dual_scale_swin_model()` — two parallel Swin branches (patch 4/8, `depths=[2,2,6,2]`/`[2,2,6]`) reusing the existing `PatchEmbed`/`BasicLayer`/`PatchMerging` classes, fused by concatenation only, output `(B,64,1152)`. `create_swin_tiny_model()`/`create_hybrid_model()` untouched. Not trained (no standalone objective — see `PROJECT_STRUCTURE.md` §6). | **Implemented, not trained** |
+| 7 | Feature Fusion | Adaptive Cross-Attention | **Implemented, not trained.** `feature_fusion.py`'s `build_adaptive_cross_attention()` — one-way cross-attention, Global queries Local (`Q`=Global's 64 tokens, `K,V`=Local's 1024 tokens), `d_model=256`, 8 heads, pre-LN block + FFN (`256->1024->256`, GELU, dropout 0.1), factorized 2D positional embeddings, global-average-pooled to `E=(B,256)`. Verified against the real, already-implemented Stage 05/06 models (not just representative tensors) — see `PROJECT_STRUCTURE.md` §7 for the full specification. `feature_fusion.py` fully replaces the old baseline "fusion" (CNN → one Swin block → GlobalAveragePooling2D → Dense) reference — that baseline is not this design and was never a real implementation of this stage. | **Implemented, not trained** |
+| 8 | Reliability-Aware Cross-Attention Fusion (RACAF) | RACAF — TTA-based reliability gate wrapping Stage 7's output | The single approved research innovation. Fully specified in `RACAF_ARCHITECTURE.md`; no code exists. All of §13's output-contract prerequisites are now satisfied, including Stage 07's `d_model=256` and Stage 07's own real implementation now existing (`feature_fusion.py`) — RACAF can be implemented as its own next, separate step. | **Missing — all prerequisites satisfied, ready to implement as its own next step** |
+| 9 | Ordinal Classification | CORN | All classifiers use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK metric in the baseline scripts (QWK is, however, already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py`). | **Missing** |
+| 10 | Uncertainty Estimation | Monte Carlo Dropout | Fully implemented in `bayesian_inference.py`: MC sampling, mean/std, predictive entropy, uncertainty visualizations. Reliability diagram uses simulated labels (documented limitation, not a bug). Will need re-pointing at whatever model results from steps 5–9. | **Implemented** (needs integration once the classifier changes) |
+| 11 | Explainability | Grad-CAM++, SHAP, Attention Rollout | Only vanilla Grad-CAM exists (`explainable_ai.py`), hard-coded to the `swin_refine` layer name from the current hybrid model. Grad-CAM++, SHAP, and Attention Rollout are all absent. | **Partially implemented** |
+| 12 | Evaluation | — | Confusion matrix, classification report, accuracy/AUC exist per-script but are duplicated across files rather than a single evaluation module, and none compute ordinal-appropriate metrics (QWK) or real (non-simulated) calibration against the target architecture's models. | **Partially implemented** |
 
-**Non-target component present in the repo:** `dr_gan.py` (conditional GAN for synthetic minority-class oversampling) is real and working but is not part of the 11-stage target pipeline. Per the "reuse existing components" rule, it should be kept and can still feed the ordinal classifier's training data, but it is not one of the roadmap's numbered modules.
+**Non-target component present in the repo:** `dr_gan.py` (conditional GAN for synthetic minority-class oversampling) is real and working but is not part of the 12-stage target pipeline. Per the "reuse existing components" rule, it should be kept and can still feed the ordinal classifier's training data, but it is not one of the roadmap's numbered modules.
 
 **Dataset gap — resolved differently for each stage.** Lesion Segmentation (Stage 4) requires pixel-level mask ground truth and is trained within this project on IDRiD's segmentation subset. Vessel Segmentation (Stage 3) also needs pixel-level vessel ground truth, but rather than sourcing a dataset and training within this project, it integrates a pretrained external checkpoint (LWNet, trained by its own authors on DRIVE) for inference only — so Stage 3 needs no project dataset of its own. An intermediate design added DRIVE and CHASE_DB1 as project datasets to train a "Baseline U-Net" within this project instead; that design was itself superseded by the current pretrained-LWNet design — see `SEGMENTATION_ARCHITECTURE.md`'s design-history appendix for the full chronology.
 
@@ -137,6 +140,11 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 - **Expected output:** the vendored LWNet checkpoint (`models/vessel_segmentation/best_model.pth` + `config.cfg`) producing single-channel vessel probability maps, `(H, W, 1)`, values in `[0, 1]`, at Stage 02's native resolution — see `SEGMENTATION_ARCHITECTURE.md` §2/§6.
 
 ### Step 4 — Lesion Segmentation (Attention U-Net)
+- **Status: Completed — FROZEN.** Final experiment **2C (Weighted-Pooled Dice)**: Mean Dice
+  0.1314 / Mean IoU 0.0766 on the official 27-image IDRiD test set. No Experiment 2D and no
+  further architecture, loss, or training changes to this stage — see `RACAF_ARCHITECTURE.md`
+  §1 for the full per-class results, recorded there as evaluation history only. Stage 4 is
+  frozen for every downstream stage, including RACAF (Step 7.5 below).
 - **Why:** Same rationale as Step 3, for lesion (exudate/hemorrhage/microaneurysm) maps.
 - **Depends on:** Step 3's vendored checkpoint, since Lesion Segmentation's training input requires a vessel-mask channel generated by running the pretrained LWNet model over every IDRiD/segmentation image first — a checkpoint-availability dependency, not a training-order one (Step 3 never trains).
 - **New files:** `lesion_segmentation_dataset.py`, `lesion_segmentation_model.py` (Attention U-Net + train/infer functions).
@@ -152,13 +160,73 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 - **Expected output:** a callable Keras layer/sub-model producing a local feature tensor, unit-tested in isolation (shape/sanity checks) before wiring into fusion.
 
 ### Step 6 — Global Feature Extraction (Dual-Scale Swin Transformer)
-- **Why:** The existing `swin_transformer.py` already provides every low-level building block needed for this — the gap is topology (single-scale block used for refinement) vs. target (a genuine dual-scale backbone).
-- **Input:** the processed RGB image directly (parallel branch, not sequential with Local Feature Extraction). Any resizing this stage needs is internal to it — Stage 02 does not resize, and no fixed resolution is documented here; the final input resolution is configurable and will be selected during implementation based on memory and model performance.
-- **Files to modify:** `swin_transformer.py` — extend with a new `create_dual_scale_swin_model()` builder, without deleting or altering `create_swin_tiny_model()` or `create_hybrid_model()`, which the current baseline still depends on.
+- **Status: Implemented, unit-tested. Not trained, not frozen.** Two parallel Swin branches
+  (Branch A: patch 4, full 4-stage `depths=[2,2,6,2]`; Branch B: patch 8, 3-stage `depths=[2,2,6]`)
+  built from `PatchEmbed`/`BasicLayer`/`PatchMerging`, fused by channel-wise concatenation only —
+  no projection, no cross-attention, no pooling, no classification head. Output `(B,64,1152)`. See
+  `PROJECT_STRUCTURE.md` §6 for the full specification and the Stage 06 design-resolution record
+  for the complete literature/engineering traceability.
+- **Why:** The existing `swin_transformer.py` already provided every low-level building block needed for this — the gap was topology (single-scale block used for refinement) vs. target (a genuine dual-scale backbone).
+- **Input:** the processed RGB image directly (parallel branch, not sequential with Local Feature Extraction, and with no dependency on Stage 3/4/5). Resized to 256x256 inside Stage 06's own pipeline — Stage 02 itself is not resized.
+- **Files modified:** `swin_transformer.py` — extended with `create_dual_scale_swin_model()` and `GlobalFeatureExtractionStage`; the function bodies of `create_swin_tiny_model()`/`create_hybrid_model()` are unchanged (verified via `git diff` hunk boundaries — no edit touches either function). Three pre-existing defects in the shared `SwinTransformerBlock`/`PatchMerging` classes (a dtype mismatch, a `tf.Variable`-inside-graph-tracing error, and a symbolic-tensor-as-bool assertion — all unrelated to Stage 06's architecture, all required for any `shift_size>0` Swin block to build under the currently-installed Keras version) were fixed as the minimal changes needed for Stage 06 to build at all — independently re-verified (not just re-asserted) against the pre-session code, with the fixes confirmed to produce numerically identical values to what the original code would have computed had it not crashed. A fourth, unrelated pre-existing defect (`SwinTransformer.__init__`'s `self.layers = []` shadowing Keras 3's reserved `Model.layers`) was deliberately left unfixed — `git grep` confirms `create_swin_tiny_model()`/`SwinTransformer` have no active caller anywhere in this project, so fixing it was judged unnecessary scope expansion; pinned by a regression test rather than left undocumented. See `PROJECT_STRUCTURE.md` §6 for the full account.
+- **New files:** `global_feature_extraction_dataset.py` (reuses `local_feature_extraction_dataset.py`'s Stage-02-application helpers, not duplicated).
+- **Checkpoint format:** weights-only (`.weights.h5`), matching the shared `training/callbacks.py`/`training/trainer.py` framework's own default (`save_weights_only=True`) — Stage 4 is the one that opts into full `.keras`, not the project baseline. See `PROJECT_STRUCTURE.md` §6.
 
 ### Step 7 — Feature Fusion (Adaptive Cross-Attention)
+- **Status: Implemented, unit-tested. Not trained. Not frozen.** One-way cross-attention, Global
+  queries Local (`Q`=Global's 64 tokens, `K,V`=Local's 1024 tokens), `d_model=256` (8 heads x 32
+  dims/head), pre-LN block with residual + FFN (`256->1024->256`, GELU, dropout 0.1), factorized
+  2D positional embeddings on both branches, global-average-pooled to a single fused embedding
+  `E=(B,256)`. See `PROJECT_STRUCTURE.md` §7 for the complete specification, literature basis
+  (Perceiver, Jaegle et al. ICML 2021; CrossViT, Chen et al. ICCV 2021), and traceability table.
 - **Why:** Combines the Local (Step 5) and Global (Step 6) feature streams.
-- **New files:** `feature_fusion.py` (cross-attention module).
+- **Why this direction:** RACAF's formulation (`RACAF_ARCHITECTURE.md` §5) consumes exactly one
+  fused vector `E`; keeping the query side small (Global's 64 tokens, not Local's 1024) keeps
+  every post-attention operation an order of magnitude cheaper than the reverse direction, for
+  identical attention-score cost. Bidirectional attention was considered and rejected — it would
+  produce a second stream RACAF's approved formula has no place to consume.
+- **"Adaptive" clarified:** content-dependent attention weighting via learned Q/K/V projections
+  and softmax — explicitly **not** reliability-, uncertainty-, TTA-, or confidence-aware. Those
+  remain exclusive to RACAF (Step 7.5); Step 7 never reads Stage 4's output — verified structurally
+  by regression tests, not just asserted (`tests/test_feature_fusion.py`'s `RACAFBoundaryTests`).
+- **Global's real input shape:** Stage 06's real, implemented output is already flattened
+  `(64, 1152)`, not the conceptually-described spatial `(8,8,1152)` — `create_dual_scale_swin_model()`
+  performs that flatten internally. `feature_fusion.py`'s Global input matches Stage 06's real,
+  verified output shape directly; Local's input remains spatial `(32,32,256)`, matching Stage 05's
+  real output, and is flattened inside this module. Verified end-to-end against the real Stage
+  05/06 models, not just representative tensors.
+- **Serialization:** full `.keras` (`model.save()`/`load_model()`), not weights-only — every layer
+  used (`MultiHeadAttention`, `Dense`, `LayerNormalization`, `Dropout`, `Add`,
+  `GlobalAveragePooling1D`) is a built-in Keras layer with existing `get_config()` support; the one
+  custom layer this module introduces (`Factorized2DPositionalEmbedding`) implements `get_config()`
+  and is registered via `@register_keras_serializable()`. This deliberately does not repeat Stage
+  06's weights-only fallback — no pre-existing, non-serializable classes are reused here.
+- **New files:** `feature_fusion.py` (`build_adaptive_cross_attention()`,
+  `Factorized2DPositionalEmbedding`, `AdaptiveCrossAttentionStage`).
+- **Checkpoint format:** full `.keras`, per the serialization note above. See `PROJECT_STRUCTURE.md`
+  §7.
+
+### Step 7.5 — RACAF (Reliability-Aware Cross-Attention Fusion)
+- **Why:** The single approved downstream research innovation (`PROJECT_CODE.md`'s "Approved
+  Research Innovation" section). Wraps Step 7's output with a per-image reliability gate derived
+  from Stage 4's frozen, test-time-augmented output — never from Stage 4's recorded test-set
+  Dice/IoU, and never requiring Stage 4 to be retrained or architecturally modified.
+- **Depends on:** Steps 5, 6, and 7's output contracts (`L`'s shape, `G`'s shape, and Cross-
+  Attention's own output dimensionality) all being finalized first — RACAF's Global-readout
+  projection is defined relative to those shapes and cannot be built before they exist. **All
+  three are now satisfied**: `L=(B,1024,256)`, `G=(B,64,1152)`, `E=(B,256)` (`d_model=256`), and
+  Step 7 now has real, tested code (`feature_fusion.py`) producing `E` — RACAF can be implemented
+  as its own next, separate step.
+- **Full specification:** `RACAF_ARCHITECTURE.md` — the authoritative design document. Not
+  implemented as part of this roadmap step; this entry only records where it sits in the
+  sequence. Do NOT implement Steps 5–7 in a way that assumes RACAF's requirements without
+  consulting that document first.
+- **New files:** none yet — no code exists for RACAF as of this plan's current revision.
+
+*(Note: this roadmap's Step numbers below no longer align 1:1 with the Target Architecture's
+Stage numbers in §2, since RACAF was inserted as "Step 7.5" rather than triggering a renumbering
+of every already-referenced roadmap step — Step 8 below corresponds to Stage 9 in §2, Step 9 to
+Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 
 ### Step 8 — Ordinal Classification (CORN)
 - **Why:** Replaces the current nominal softmax heads with a rank-consistent ordinal head appropriate for DR severity grading.
@@ -187,4 +255,21 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 
 ## 6. Next Step
 
-Stage 1 and Stage 2 are complete. Per the "one module at a time, wait for approval" rule, the next implementation target is **Stage 3 (Vessel Segmentation)** — integrating the pretrained LWNet checkpoint for inference, not training a new model — with explicit approval requested before writing code.
+Stages 1–4 are complete. Stage 4 (Lesion Segmentation) is finalized as Experiment 2C and is now
+**frozen** — no further training, loss, or architecture changes to it, and no Experiment 2D is
+planned. Stage 5 (Local Feature Extraction), Stage 6 (Global Feature Extraction), and Stage 7
+(Feature Fusion / Adaptive Cross-Attention) are all now **implemented and unit-tested, but not
+trained and not frozen** — none has a standalone training objective; all three await the joint
+Stage 05–08 + RACAF training script. Stage 7's implementation (`feature_fusion.py`) follows exactly
+the approved design (`PROJECT_STRUCTURE.md` §7): one-way cross-attention, Global queries Local,
+`d_model=256`, output `E=(B,256)`, verified against the real Stage 05/06 models end-to-end. Per the
+"one module at a time, wait for approval" rule, the next implementation target is **RACAF**, with
+explicit approval requested before writing code.
+
+**RACAF (Step 7.5 above) is queued after Stage 7 and can now be implemented** — all of §13's
+prerequisites are satisfied: `L=(B,1024,256)`, `G=(B,64,1152)`, `d_model=256`, and Stage 7's own
+real code now exists to wrap. See `RACAF_ARCHITECTURE.md` §13 for the exact list of prerequisites.
+RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
+Research Innovation" section); no second, competing innovation should be introduced without a
+deliberate revision of that decision — Stage 7's cross-attention mechanism itself is
+established/literature-derived engineering, not a research contribution.
