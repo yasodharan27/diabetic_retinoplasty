@@ -33,17 +33,14 @@ transform belongs to CORN's own module, not implemented here).
 
 APTOS2019's `raw/test.csv` is never read by this module -- it ships with
 no `diagnosis` column (a held-out Kaggle-competition split), so it cannot
-support supervised training or evaluation in this project. Only
-`train.csv`'s 3662 labeled images are split (deterministically,
-`train_test_split`) into train/val here, mirroring the exact mechanism
-`lesion_segmentation_dataset.split_train_val_ids` /
-`image_quality_dataset.load_eyeq_datasets` already use. This is a
-reasonable interim split for exercising this module -- it is NOT yet the
-authoritative Stage 08 joint-training split (no target-architecture APTOS
-dataset loader existed anywhere in this project before this module), so
-Stage 05 must adopt whatever split Stage 08's own loader eventually fixes
-once written, since Stages 05-08 + RACAF are documented to train in one
-shared graph (`RACAF_ARCHITECTURE.md` Sec 7).
+support supervised training or evaluation in this project. `train.csv`'s
+3662 labeled images are split into train/val via `split_train_val_ids`,
+which now delegates to `downstream_split.get_authoritative_split` -- the
+ONE authoritative, stratified, cross-environment split shared by every
+downstream trainable stage (Stage 05, Stage 06, and eventually Stage 07 /
+RACAF / CORN's joint training), not a per-stage interim choice. See
+`downstream_split.py`'s module docstring for the full rationale; this
+module is a consumer of that split, not its owner.
 
 IDRiD is never read by this module in any capacity -- Stage 05 does not
 train on it (only 81 total images, no DR-grade labels at all); its only
@@ -67,10 +64,11 @@ import os
 import cv2
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
+from PIL import Image
 from skimage.transform import resize as sk_resize
 
 import config
+import downstream_split
 from image_preprocessing import preprocess_array
 from lesion_segmentation_dataset import LESION_CLASSES
 from lesion_segmentation_model import (
@@ -93,6 +91,13 @@ NUM_CHANNELS = 8  # 3 RGB + 1 vessel probability + 4 lesion probabilities
 APTOS_RAW_DIR = config.dataset_raw_dir("APTOS2019")
 DEFAULT_TRAIN_CSV = os.path.join(APTOS_RAW_DIR, "train.csv")
 DEFAULT_TRAIN_IMAGE_DIR = os.path.join(APTOS_RAW_DIR, "train_images")
+
+# datasets/APTOS2019/processed -- reuses config.py's existing generic helper.
+# Empty in this project's local copy as of this module's original
+# implementation (see module docstring), but a real Colab/Drive environment
+# may already contain Stage 02's batch-processed output here; see
+# _resolve_processed_rgb.
+DEFAULT_PROCESSED_DIR = config.dataset_processed_dir("APTOS2019")
 
 # Cached Stage 03/04 outputs -- derived, regenerable artifacts, not raw
 # dataset content, so they live under this stage's own results directory
@@ -134,15 +139,18 @@ def _list_labeled_images(csv_path=DEFAULT_TRAIN_CSV):
 
 
 def split_train_val_ids(csv_path=DEFAULT_TRAIN_CSV, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED):
-    """Deterministic train/val split of APTOS2019's labeled `train.csv`
-    (same `train_test_split` mechanism `lesion_segmentation_dataset.
-    split_train_val_ids` / `image_quality_dataset.load_eyeq_datasets`
-    already use, with a fixed `seed` so the split is reproducible run to
-    run). See this module's docstring for why this is an interim split,
-    not yet the authoritative Stage 08 joint-training split."""
-    entries = _list_labeled_images(csv_path)
-    train_entries, val_entries = train_test_split(entries, test_size=val_split, random_state=seed)
-    return sorted(train_entries), sorted(val_entries)
+    """Thin delegation to `downstream_split.get_authoritative_split` -- kept
+    here, under this same name and signature, so every existing caller
+    (`global_feature_extraction_dataset.py`'s re-export, this module's own
+    `load_local_feature_extraction_datasets`, and any test) keeps working
+    unchanged. This is no longer where the split is actually computed or
+    owned -- see `downstream_split.py`'s module docstring for why that
+    module, not this one, is now the single source of truth (Stage 05 was
+    the first stage to need this split, not its conceptual owner). For the
+    default `csv_path`/`val_split`/`seed`, this now returns the committed,
+    stratified, cross-environment authoritative manifest rather than a
+    freshly (and non-stratified) computed interim split."""
+    return downstream_split.get_authoritative_split(csv_path, val_split=val_split, seed=seed)
 
 
 # --- Per-sample loading ---
@@ -184,6 +192,29 @@ def _stage02_processed_rgb(raw_bgr_image):
 
 def _cache_path(cache_dir, id_code, kind):
     return os.path.join(cache_dir, f"APTOS_{id_code}_{kind}.npy")
+
+
+def _resolve_processed_rgb(raw_bgr_image, processed_dir, id_code):
+    """Reuses an already-generated Stage 02 processed output for `id_code`
+    if `processed_dir` (default `DEFAULT_PROCESSED_DIR`) already contains
+    one -- the same "read the existing file, never regenerate it"
+    convention `lesion_segmentation_dataset.py` already relies on for IDRiD
+    (PROJECT_CODE.md's Stage 02 Preprocessing Policy: "No downstream stage
+    should regenerate deterministic preprocessing outputs"). Falls back to
+    live in-memory Stage 02 application (`_stage02_processed_rgb`) only
+    when no precomputed file exists for this `id_code` -- true for every
+    environment as of this module's original implementation
+    (`datasets/APTOS2019/processed/` ships empty locally), but not
+    necessarily true in every environment this code runs in (e.g. a Google
+    Drive copy where Stage 02's batch preprocessing has already run) -- see
+    this module's docstring. Matches the raw image's own filename exactly
+    (`preprocess_folder()` preserves filenames, per `image_preprocessing.py`),
+    read the same way `lesion_segmentation_dataset._load_rgb_image` already
+    reads IDRiD's processed files."""
+    processed_path = os.path.join(processed_dir, f"{id_code}.png")
+    if os.path.exists(processed_path):
+        return np.array(Image.open(processed_path).convert("RGB"), dtype=np.uint8)
+    return _stage02_processed_rgb(raw_bgr_image)
 
 
 def _get_or_compute_vessel_map(rgb_image, cache_path, vessel_model):
@@ -302,15 +333,21 @@ def build_local_feature_input(image, vessel_probability_map=None, lesion_probabi
     return _resize_input(input_array, image_size)
 
 
-def _build_sample(id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size):
+def _build_sample(id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size,
+                   processed_dir=DEFAULT_PROCESSED_DIR):
     """Builds one `(input, label)` pair for one APTOS training-set image:
-    Stage 02 preprocessing applied live, Stage 03/04 outputs resolved via
-    the disk cache (computed once per id_code, reused on every subsequent
-    call/epoch), concatenated and resized via `build_local_feature_input`.
-    `input` is `(*image_size, 8)` float32; `label` is the plain `int`
-    APTOS DR grade (0-4)."""
+    Stage 02 output resolved via `_resolve_processed_rgb` (an existing
+    `processed_dir` file if present, live application otherwise), Stage
+    03/04 outputs resolved via the disk cache (computed once per id_code,
+    reused on every subsequent call/epoch), concatenated and resized via
+    `build_local_feature_input`. `input` is `(*image_size, 8)` float32;
+    `label` is the plain `int` APTOS DR grade (0-4). `processed_dir`
+    defaults to `DEFAULT_PROCESSED_DIR` so every existing positional caller
+    (this module's own `load_local_feature_extraction_datasets`, and
+    `colab/notebooks/stage05_local_feature_extraction.ipynb`'s direct call)
+    keeps working unchanged."""
     raw_bgr = _load_raw_bgr(image_dir, id_code)
-    rgb = _stage02_processed_rgb(raw_bgr)
+    rgb = _resolve_processed_rgb(raw_bgr, processed_dir, id_code)
 
     vessel_cache = _cache_path(cache_dir, id_code, "vessel")
     vessel_map = _get_or_compute_vessel_map(rgb, vessel_cache, vessel_model)
@@ -377,13 +414,16 @@ def _resolve_lesion_model(lesion_model, lesion_model_path):
 
 
 def _make_dataset(entries, image_dir, cache_dir, vessel_model, lesion_model,
-                   image_size, batch_size, shuffle, augment, seed):
+                   image_size, batch_size, shuffle, augment, seed, processed_dir=DEFAULT_PROCESSED_DIR):
     entries = list(entries)
 
     def gen():
         rng = np.random.default_rng(seed) if augment else None
         for id_code, diagnosis in entries:
-            x, y = _build_sample(id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size)
+            x, y = _build_sample(
+                id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size,
+                processed_dir=processed_dir,
+            )
             if augment:
                 x = _augment(x, rng)
             yield x, y
@@ -413,17 +453,21 @@ def load_local_feature_extraction_datasets(
     batch_size=DEFAULT_BATCH_SIZE,
     seed=DEFAULT_SEED,
     augment_train=True,
+    processed_dir=DEFAULT_PROCESSED_DIR,
 ):
     """
     Train/val `tf.data.Dataset` pipelines built from APTOS2019's labeled
-    `train.csv` (3662 images), split deterministically per
-    `split_train_val_ids`. See this module's docstring for why `test.csv`
-    is never used, and why this split is an interim choice, not yet the
-    authoritative Stage 08 joint-training split.
+    `train.csv` (3662 images), split per `split_train_val_ids` -- for the
+    default `csv_path`/`val_split`/`seed`, this is now the authoritative,
+    stratified, cross-environment split (`downstream_split.py`), not an
+    interim per-stage one. See this module's docstring for why `test.csv`
+    is never used.
 
     Pass already-loaded `vessel_model`/`lesion_model` to reuse them across
     many calls/datasets; otherwise each is loaded once (not per-sample, not
-    per-epoch) from `vessel_model_path`/`lesion_model_path`.
+    per-epoch) from `vessel_model_path`/`lesion_model_path`. `processed_dir`
+    is checked for an existing Stage 02 output per image before falling
+    back to live preprocessing (`_resolve_processed_rgb`).
 
     Returns `(train_ds, val_ds)`, each yielding batches of `((batch, H, W,
     8) float32 input, (batch,) int32 label)`.
@@ -435,10 +479,10 @@ def load_local_feature_extraction_datasets(
 
     train_ds = _make_dataset(
         train_entries, image_dir, cache_dir, resolved_vessel_model, resolved_lesion_model,
-        image_size, batch_size, shuffle=True, augment=augment_train, seed=seed,
+        image_size, batch_size, shuffle=True, augment=augment_train, seed=seed, processed_dir=processed_dir,
     )
     val_ds = _make_dataset(
         val_entries, image_dir, cache_dir, resolved_vessel_model, resolved_lesion_model,
-        image_size, batch_size, shuffle=False, augment=False, seed=seed,
+        image_size, batch_size, shuffle=False, augment=False, seed=seed, processed_dir=processed_dir,
     )
     return train_ds, val_ds

@@ -35,6 +35,27 @@ same `best_model.keras` -- `experiments/<module>/` is spelled out in the
 verified layout; `exported_models/<module>/` mirrors that same convention
 for consistency, since the diagram only shows the shared root but every
 trainable module needs its own final-model slot.
+
+--- APTOS2019 / IDRiD raw+processed sub-resolution: epistemic status ---
+
+The layout above (`datasets/APTOS2019/`, `datasets/IDRiD/`) is the directly
+verified one -- it does not by itself say whether Drive's copies mirror
+this project's local `raw/`/`processed/` convention, or (for IDRiD) the
+three-subset `grading/`/`localization/`/`segmentation/` split confirmed in
+this repository's own local `datasets/IDRiD/` directory. `aptos2019_raw_dir`
+/ `aptos2019_processed_dir` and the `idrid_*_raw_dir` / `idrid_*_processed_dir`
+fields below extend the layout by convention -- the same raw/processed
+scaffolding `config.py`'s own module comment says "every dataset under
+datasets/ follows" locally, and the same three subset names
+`lesion_segmentation_dataset.py` (frozen, Stage 04) already depends on via
+`config.dataset_raw_dir("IDRiD/segmentation")`. This is a reasonable,
+non-fabricated inference, NOT a directly verified fact about Drive's actual
+current contents -- this module cannot check Drive from outside Colab, and
+no one has confirmed these specific subpaths against the live Drive folder
+as of this addition. `verify_dataset.verify_idrid_dataset_dir()` checks
+this explicitly (and fails clearly, rather than silently) the first time a
+real Colab session mounts Drive; until that has run at least once, treat
+these specific fields as unverified-from-code.
 """
 
 import os
@@ -58,8 +79,24 @@ class DrivePaths:
     eyeq_dataset_dir: str
     eyeq_raw_dir: str
     eyeq_processed_dir: str
+
     aptos2019_dataset_dir: str
+    aptos2019_raw_dir: str
+    aptos2019_processed_dir: str
+
+    # IDRiD is not flat -- three named subsets, each with its own raw/processed
+    # pair (grading/localization/segmentation; Stage 04 uses only "segmentation"
+    # today, via config.dataset_raw_dir("IDRiD/segmentation")). idrid_dataset_dir
+    # is the bare root; the six *_raw_dir/*_processed_dir fields below are the
+    # per-subset paths every dataset loader actually needs. See this module's
+    # docstring for what is/isn't directly verified about Drive here.
     idrid_dataset_dir: str
+    idrid_grading_raw_dir: str
+    idrid_grading_processed_dir: str
+    idrid_localization_raw_dir: str
+    idrid_localization_processed_dir: str
+    idrid_segmentation_raw_dir: str
+    idrid_segmentation_processed_dir: str
 
     # experiments/<module>/ -- one isolated, timestamped folder per training run
     experiments_root: str
@@ -98,6 +135,11 @@ def build_drive_paths(drive_mount_point="/content/drive"):
     exported_models_root = posixpath.join(project_root, "exported_models")
 
     eyeq_dataset_dir = posixpath.join(datasets_root, "EyeQ")
+    aptos2019_dataset_dir = posixpath.join(datasets_root, "APTOS2019")
+    idrid_dataset_dir = posixpath.join(datasets_root, "IDRiD")
+    idrid_grading_dir = posixpath.join(idrid_dataset_dir, "grading")
+    idrid_localization_dir = posixpath.join(idrid_dataset_dir, "localization")
+    idrid_segmentation_dir = posixpath.join(idrid_dataset_dir, "segmentation")
 
     return DrivePaths(
         drive_mount_point=drive_mount_point,
@@ -106,8 +148,16 @@ def build_drive_paths(drive_mount_point="/content/drive"):
         eyeq_dataset_dir=eyeq_dataset_dir,
         eyeq_raw_dir=posixpath.join(eyeq_dataset_dir, "raw"),
         eyeq_processed_dir=posixpath.join(eyeq_dataset_dir, "processed"),
-        aptos2019_dataset_dir=posixpath.join(datasets_root, "APTOS2019"),
-        idrid_dataset_dir=posixpath.join(datasets_root, "IDRiD"),
+        aptos2019_dataset_dir=aptos2019_dataset_dir,
+        aptos2019_raw_dir=posixpath.join(aptos2019_dataset_dir, "raw"),
+        aptos2019_processed_dir=posixpath.join(aptos2019_dataset_dir, "processed"),
+        idrid_dataset_dir=idrid_dataset_dir,
+        idrid_grading_raw_dir=posixpath.join(idrid_grading_dir, "raw"),
+        idrid_grading_processed_dir=posixpath.join(idrid_grading_dir, "processed"),
+        idrid_localization_raw_dir=posixpath.join(idrid_localization_dir, "raw"),
+        idrid_localization_processed_dir=posixpath.join(idrid_localization_dir, "processed"),
+        idrid_segmentation_raw_dir=posixpath.join(idrid_segmentation_dir, "raw"),
+        idrid_segmentation_processed_dir=posixpath.join(idrid_segmentation_dir, "processed"),
         experiments_root=experiments_root,
         experiment_dirs={m: posixpath.join(experiments_root, m) for m in PIPELINE_MODULES},
         tensorboard_root=posixpath.join(project_root, "tensorboard"),

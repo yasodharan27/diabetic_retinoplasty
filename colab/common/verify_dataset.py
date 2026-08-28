@@ -221,3 +221,49 @@ def verify_image_folder(path, min_images=1, sample_size=SAMPLE_SIZE):
         corruption_sampled=len(sample),
         corruption_failures=len(failures),
     )
+
+
+IDRID_SUBSETS = ("grading", "localization", "segmentation")
+
+
+def verify_idrid_dataset_dir(idrid_root):
+    """Explicit, fail-clearly check that `idrid_root` (e.g.
+    `colab_config.IDRID_DATASET_DIR`) actually contains the three named
+    IDRiD subsets this project's code depends on -- `grading/raw`,
+    `localization/raw`, `segmentation/raw` -- rather than letting a missing
+    or differently-shaped Drive folder silently resolve to a wrong or
+    nonexistent path deep inside some dataset loader (`drive_paths.py`'s
+    module docstring documents this as an inferred-by-convention, not yet
+    directly Drive-verified, layout). Checks existence only -- `raw/` and
+    `processed/` subfolders, no file-count or content check (that's
+    `verify_image_folder`'s job, run separately against whichever specific
+    subfolder a caller cares about).
+
+    Raises `RuntimeError` naming every missing subset explicitly (not just
+    the first one found) if `idrid_root` itself, or any of its three
+    `<subset>/raw` folders, does not exist. Returns `idrid_root` unchanged
+    on success."""
+    if not os.path.isdir(idrid_root):
+        raise RuntimeError(
+            f"IDRiD dataset verification failed: {idrid_root} is not a directory. "
+            "Verify Drive is mounted and datasets/IDRiD/ exists at this path before proceeding."
+        )
+
+    missing = []
+    for subset in IDRID_SUBSETS:
+        raw_dir = os.path.join(idrid_root, subset, "raw")
+        if not os.path.isdir(raw_dir):
+            missing.append(raw_dir)
+
+    if missing:
+        raise RuntimeError(
+            "IDRiD dataset verification failed: expected subset(s) not found under "
+            f"{idrid_root}: {missing}. This project assumes IDRiD is organized as "
+            "IDRiD/{grading,localization,segmentation}/{raw,processed} (verified locally; "
+            "see drive_paths.py's module docstring) -- if Drive's actual layout differs, "
+            "colab_config.py's IDRID_*_RAW_DIR/IDRID_*_PROCESSED_DIR constants must be "
+            "corrected to match it, not assumed."
+        )
+
+    print(f"[{idrid_root}] all {len(IDRID_SUBSETS)} expected IDRiD subsets present: {IDRID_SUBSETS}")
+    return idrid_root

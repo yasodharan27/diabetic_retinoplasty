@@ -288,6 +288,16 @@ def dataset_processed_dir(dataset_name):
     )
 
 
+# --- Authoritative downstream classification split (downstream_split.py) ---
+# The committed (id_code, diagnosis, split) manifest lives outside datasets/
+# and results/ (both entirely gitignored) so it is an actual, checked-in,
+# cross-environment source of truth -- not a regenerable output and not
+# dataset content. See downstream_split.py's module docstring.
+DOWNSTREAM_SPLIT_DIR = os.environ.get('DOWNSTREAM_SPLIT_DIR') or os.path.join(
+    _REPO_ROOT, 'dataset_splits'
+)
+
+
 # --- Preprocessing configuration (Step 2: Gamma Correction + CLAHE) ---
 
 def _env_float(name, default):

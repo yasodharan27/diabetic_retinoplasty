@@ -26,10 +26,13 @@ Label: the `diagnosis` column of `train.csv`, 0-4, returned as a plain
 int32 scalar -- not one-hot, not CORN's cumulative-target encoding.
 
 Split: reuses `local_feature_extraction_dataset.split_train_val_ids`
-unmodified, so Stage 05 and Stage 06 see the identical train/val partition
-of APTOS 2019 -- required once they are trained jointly (a future,
-not-yet-implemented step), since a mismatched split between the two
-parallel branches would make "the same training example" ambiguous.
+unmodified, which itself now delegates to `downstream_split.
+get_authoritative_split` -- the ONE authoritative, stratified split shared
+by every downstream stage, not a Stage-05-owned one. So Stage 05 and Stage
+06 see the identical train/val partition of APTOS 2019 -- required once
+they are trained jointly (a future, not-yet-implemented step), since a
+mismatched split between the two parallel branches would make "the same
+training example" ambiguous.
 
 Augmentation: reuses `local_feature_extraction_dataset._augment_spatial`
 and `_augment_intensity_rgb` unmodified. Both are channel-count-agnostic
@@ -82,14 +85,23 @@ def build_global_feature_input(image, image_size=DEFAULT_IMAGE_SIZE):
     return lfed._resize_input(input_array, image_size)
 
 
-def _build_sample(id_code, diagnosis, image_dir, image_size):
+DEFAULT_PROCESSED_DIR = lfed.DEFAULT_PROCESSED_DIR
+
+
+def _build_sample(id_code, diagnosis, image_dir, image_size, processed_dir=DEFAULT_PROCESSED_DIR):
     """Builds one `(input, label)` pair for one APTOS training-set image:
-    Stage 02 preprocessing applied live (via
-    `local_feature_extraction_dataset`'s existing helpers, unmodified),
-    resized. `input` is `(*image_size, 3)` float32; `label` is the plain
-    `int` APTOS DR grade (0-4)."""
+    Stage 02 output resolved via `local_feature_extraction_dataset`'s
+    existing `_resolve_processed_rgb` helper (unmodified, reused not
+    duplicated -- an existing `processed_dir` file if present, live
+    application otherwise), resized. `input` is `(*image_size, 3)` float32;
+    `label` is the plain `int` APTOS DR grade (0-4). `processed_dir`
+    defaults to the same `DEFAULT_PROCESSED_DIR` Stage 05 uses, so every
+    existing positional caller (this module's own
+    `load_global_feature_extraction_datasets`, and
+    `colab/notebooks/stage06_global_feature_extraction.ipynb`'s direct
+    call) keeps working unchanged."""
     raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
-    rgb = lfed._stage02_processed_rgb(raw_bgr)
+    rgb = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
     input_array = build_global_feature_input(rgb, image_size=image_size)
     return input_array, diagnosis
 
@@ -103,13 +115,14 @@ def _augment(input_array, rng):
     return input_array
 
 
-def _make_dataset(entries, image_dir, image_size, batch_size, shuffle, augment, seed):
+def _make_dataset(entries, image_dir, image_size, batch_size, shuffle, augment, seed,
+                   processed_dir=DEFAULT_PROCESSED_DIR):
     entries = list(entries)
 
     def gen():
         rng = np.random.default_rng(seed) if augment else None
         for id_code, diagnosis in entries:
-            x, y = _build_sample(id_code, diagnosis, image_dir, image_size)
+            x, y = _build_sample(id_code, diagnosis, image_dir, image_size, processed_dir=processed_dir)
             if augment:
                 x = _augment(x, rng)
             yield x, y
@@ -132,12 +145,14 @@ def load_global_feature_extraction_datasets(
     batch_size=DEFAULT_BATCH_SIZE,
     seed=DEFAULT_SEED,
     augment_train=True,
+    processed_dir=DEFAULT_PROCESSED_DIR,
 ):
     """
     Train/val `tf.data.Dataset` pipelines built from APTOS2019's labeled
-    `train.csv`, split deterministically per `split_train_val_ids` (the
-    same split Stage 05's own loader produces, given the same `val_split`/
-    `seed`).
+    `train.csv`, split per `split_train_val_ids` (the same authoritative
+    split Stage 05's own loader produces, given the same `val_split`/
+    `seed`). `processed_dir` is checked for an existing Stage 02 output per
+    image before falling back to live preprocessing.
 
     Returns `(train_ds, val_ds)`, each yielding batches of `((batch, H, W,
     3) float32 input, (batch,) int32 label)`.
@@ -146,8 +161,10 @@ def load_global_feature_extraction_datasets(
 
     train_ds = _make_dataset(
         train_entries, image_dir, image_size, batch_size, shuffle=True, augment=augment_train, seed=seed,
+        processed_dir=processed_dir,
     )
     val_ds = _make_dataset(
         val_entries, image_dir, image_size, batch_size, shuffle=False, augment=False, seed=seed,
+        processed_dir=processed_dir,
     )
     return train_ds, val_ds

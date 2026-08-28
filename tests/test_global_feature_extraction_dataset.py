@@ -141,7 +141,11 @@ class AugmentationReuseTests(unittest.TestCase):
 
 class TfDataPipelineTests(unittest.TestCase):
     def setUp(self):
-        self.tree = _SyntheticAPTOSTree([(f"img_{i:02d}", i % 5) for i in range(6)])
+        # 3 samples per class (15 total): split_train_val_ids now stratifies
+        # by diagnosis (downstream_split.compute_split), which requires at
+        # least 2 members per class -- 6 samples (1-2 per class) was enough
+        # for the old, non-stratified split but is not enough here.
+        self.tree = _SyntheticAPTOSTree([(f"img_{i:02d}", i % 5) for i in range(15)])
         self.addCleanup(self.tree.cleanup)
 
     def test_train_val_datasets_yield_correctly_shaped_batches(self):

@@ -35,8 +35,22 @@ LOGS_ROOT = DRIVE.logs_root
 # --- Dataset roots -- available to every stage, not just IQA ---
 EYEQ_RAW_DIR = DRIVE.eyeq_raw_dir
 EYEQ_PROCESSED_DIR = DRIVE.eyeq_processed_dir
+
 APTOS2019_DATASET_DIR = DRIVE.aptos2019_dataset_dir
+APTOS2019_RAW_DIR = DRIVE.aptos2019_raw_dir
+APTOS2019_PROCESSED_DIR = DRIVE.aptos2019_processed_dir
+
+# IDRiD is not flat -- see drive_paths.py's docstring for the epistemic
+# status of these per-subset paths (verified locally, inferred-by-convention
+# on Drive until a real Colab session confirms it via
+# verify_dataset.verify_idrid_dataset_dir()).
 IDRID_DATASET_DIR = DRIVE.idrid_dataset_dir
+IDRID_GRADING_RAW_DIR = DRIVE.idrid_grading_raw_dir
+IDRID_GRADING_PROCESSED_DIR = DRIVE.idrid_grading_processed_dir
+IDRID_LOCALIZATION_RAW_DIR = DRIVE.idrid_localization_raw_dir
+IDRID_LOCALIZATION_PROCESSED_DIR = DRIVE.idrid_localization_processed_dir
+IDRID_SEGMENTATION_RAW_DIR = DRIVE.idrid_segmentation_raw_dir
+IDRID_SEGMENTATION_PROCESSED_DIR = DRIVE.idrid_segmentation_processed_dir
 
 # --- Per-module experiment / export directories ---
 # `drive_paths.PIPELINE_MODULES` (currently IQA, VesselSegmentation,

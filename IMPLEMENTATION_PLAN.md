@@ -172,6 +172,37 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 - **New files:** `global_feature_extraction_dataset.py` (reuses `local_feature_extraction_dataset.py`'s Stage-02-application helpers, not duplicated).
 - **Checkpoint format:** weights-only (`.weights.h5`), matching the shared `training/callbacks.py`/`training/trainer.py` framework's own default (`save_weights_only=True`) — Stage 4 is the one that opts into full `.keras`, not the project baseline. See `PROJECT_STRUCTURE.md` §6.
 
+### Step 5/6 infrastructure update — authoritative split + Drive path resolution
+
+Both stages' dataset loaders previously computed the same interim, non-stratified train/val split
+independently (Stage 5 owned it, Stage 6 re-exported it) and had no way to resolve APTOS2019/IDRiD
+paths from Google Drive in a real Colab session (`colab/common/setup.py`'s
+`configure_environment_variables()` wired only `EYEQ_RAW_DIR`). Fixed as infrastructure, not an
+architecture change (`local_feature_extraction_model.py`/`swin_transformer.py`'s model code and
+tensor contracts are unchanged):
+- **New file:** `downstream_split.py` — the ONE authoritative, stratified (by `diagnosis`), seeded
+  (80/20, seed 42 — the prior interim ratio/seed, now promoted and stratified) train/val split,
+  persisted to the committed manifest `dataset_splits/aptos2019_train_val_split.csv`.
+  `local_feature_extraction_dataset.split_train_val_ids()` now delegates to it; `global_feature_extraction_dataset.py`'s
+  re-export is unchanged and picks this up transparently. See `PROJECT_STRUCTURE.md`'s
+  "Authoritative Downstream Classification Split" section.
+- **`colab/common/drive_paths.py`/`colab_config.py`/`setup.py`:** extended to resolve and wire
+  APTOS2019 raw/processed and IDRiD's three subsets (`grading`/`localization`/`segmentation`,
+  each with its own raw/processed) individually — previously unresolvable from Drive in a fresh
+  Colab session. `colab/common/verify_dataset.py` gained `verify_idrid_dataset_dir()`, an explicit,
+  fail-clearly existence check (not a silent assumption) for this layout.
+- **`local_feature_extraction_dataset.py`/`global_feature_extraction_dataset.py`:** new
+  `_resolve_processed_rgb()` helper (Stage 05, reused by Stage 06) checks for an existing Stage 02
+  processed-output file per image before falling back to live in-memory preprocessing — so a Drive
+  environment with APTOS2019's Stage 02 output already batch-generated is used as-is, never
+  silently regenerated. Both `_build_sample` functions gained an optional, defaulted `processed_dir`
+  parameter; all existing callers (including the Stage 05/06 Colab notebooks' direct calls) are
+  unaffected.
+- **IDRiD's Disease Grading test split** (103 official-labeled images, verified this session to
+  have no image overlap with Stage 4's own training images) remains an **optional external
+  evaluation candidate for CORN only — PENDING USER APPROVAL**, not adopted into training, model
+  selection, or documented as final anywhere in this repository.
+
 ### Step 7 — Feature Fusion (Adaptive Cross-Attention)
 - **Status: Implemented, unit-tested. Not trained. Not frozen.** One-way cross-attention, Global
   queries Local (`Q`=Global's 64 tokens, `K,V`=Local's 1024 tokens), `d_model=256` (8 heads x 32
@@ -269,9 +300,14 @@ not trained and not frozen** — none has a standalone training objective; all f
 Stage 05–08 + RACAF training script. RACAF's implementation (`racaf.py`) follows exactly the
 approved, audited design (`RACAF_ARCHITECTURE.md`): frozen-Stage-04 TTA disagreement, population
 variance, burden-weighted scalar reliability `r`, and a 295,170-parameter gate + Global-readout
-fusion model, verified against the real Stage 05/06/07 models end-to-end. Per the "one module at a
-time, wait for approval" rule, the next implementation target is **CORN (Stage 08, Ordinal
-Classification)**, with explicit approval requested before writing code.
+fusion model, verified against the real Stage 05/06/07 models end-to-end. The downstream dataset
+infrastructure CORN's own training will need — one authoritative, stratified APTOS2019 train/val
+split (`downstream_split.py`) shared by Stages 05/06 today and by Stage 07/RACAF/CORN's eventual
+joint training, plus Drive path resolution for APTOS2019/IDRiD (previously wired only for EyeQ) —
+is now in place (see "Step 5/6 infrastructure update" above); no training was run, no checkpoint
+was produced. Per the "one module at a time, wait for approval" rule, the next implementation
+target is **CORN (Stage 08, Ordinal Classification)**, with explicit approval requested before
+writing code.
 
 RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
 Research Innovation" section); no second, competing innovation should be introduced without a
