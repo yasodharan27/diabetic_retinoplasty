@@ -2,10 +2,11 @@
 
 **Status:** Authoritative specification for the single approved downstream research innovation
 referenced by `PROJECT_CODE.md`'s Approved Research Innovation section and
-`IMPLEMENTATION_PLAN.md`'s roadmap. **Not yet implemented.** RACAF has no code, no dataset
-loader, no training run, and no checkpoint — this document exists so that its design is fixed
-and unambiguous *before* implementation begins, exactly as `SEGMENTATION_ARCHITECTURE.md`
-already did for Stages 3–4 before their code was written.
+`IMPLEMENTATION_PLAN.md`'s roadmap. **Implemented and unit-tested** (`racaf.py`,
+`tests/test_racaf.py`), exactly as specified below — no equation, parameter, or tensor contract
+in this document was changed to accommodate the implementation. **Not yet trained; Stage 04
+remains frozen and unmodified.** This document remains the authoritative design record, the same
+role `SEGMENTATION_ARCHITECTURE.md` plays for Stages 3–4.
 
 RACAF depends on Stage 05 (Local Feature Extraction), Stage 06 (Global Feature Extraction), and
 Stage 07 (Adaptive Cross-Attention) already having finalized output contracts — it has no
@@ -124,20 +125,45 @@ resolution — no interpolation, no resampling artifact is introduced by the aug
 Each output is transformed back into canonical (original) orientation before anything else is
 computed, so all four predictions are pixel-aligned.
 
+**Implementation boundary (where the 512×512×4 tensor comes from):** the RGB+vessel input is
+resized to Stage 04's native `(512, 512, 4)` shape **once**, before branching into the four views
+— not once per view. The four transforms are then applied directly to that already-512×512
+tensor (and their outputs inverse-transformed at that same resolution), which is what makes them
+exact permutations with zero interpolation. This means RACAF's TTA loop must call the **frozen
+Stage 04 model directly** (or a thin RACAF-specific inference helper built around it) on each of
+the four transformed `(512,512,4)` tensors — **not** the public `predict_lesion_mask()` /
+`predict_lesion_mask_batch()` convenience wrapper (`lesion_segmentation_model.py`) inside this
+loop. That wrapper performs its own *additional* resize of the model's output back to the
+original image's resolution, for Stage 05's unrelated native-resolution needs (see the
+"Native-resolution lesion maps fed to Stage 05" row in Sec 6) — a second resampling step that has
+nothing to do with the TTA augmentation itself and would sit in the same code path if the wrapper
+were reused naively for all four views. `predict_lesion_mask()` itself is not modified by this
+document and keeps serving Stage 05 exactly as before, via a single, separate (identity-only)
+call; RACAF's four-view reliability computation is a parallel, independent use of the same frozen
+model at its native resolution only.
+
 For each lesion class $c \in \{MA, HE, EX, SE\}$:
 
 - **Mean prediction:** $\bar p_c$ — the average of the four aligned probability maps.
 - **Per-pixel disagreement:** $D_c(x,y) = \text{Var}_k\big[\tilde p_c^{(k)}(x,y)\big]$ across the
-  four aligned views.
+  four aligned views. $\text{Var}_k$ is the **population variance** over the $k=1..4$ samples
+  (divide by $N=4$, i.e. `ddof=0` — `np.var(..., ddof=0)`'s default, or equivalently
+  `tf.math.reduce_variance(...)`, which is always population variance by definition). This is not
+  a free implementation choice: it is the convention $\Delta_{\max}=0.25$ below is derived from,
+  and using sample variance (`ddof=1`) instead would let $\Delta_c$ exceed $0.25$, pushing
+  $\kappa_c$ outside its intended $[0,1]$ range.
 - **Foreground restriction:** disagreement is pooled only over the region the *averaged*
   prediction itself claims is foreground — $U_c = \{(x,y): \bar p_c(x,y) > 0.5\}$, reusing this
   project's existing `DEFAULT_THRESHOLD` convention, not a newly invented number. This avoids the
   signal being diluted by the overwhelming majority of confidently-background pixels that a
   whole-image average would otherwise be dominated by.
-- **Mathematical normalization:** disagreement is rescaled against the maximum variance
-  mathematically possible for a quantity bounded in $[0,1]$ across four samples — $0.25$, achieved
-  at a perfect split between $0$ and $1$. This is a fixed constant derived from the definition of
-  variance, not fit to any dataset, split, or model.
+- **Mathematical normalization:** disagreement is rescaled against the maximum **population**
+  variance mathematically possible for a quantity bounded in $[0,1]$ across four samples — $0.25$,
+  achieved at a perfect split between $0$ and $1$ (two samples at each extreme; also derivable
+  directly from Popoviciu's inequality on variances, $\text{Var}\le(b-a)^2/4$ for a bounded
+  quantity). This is a fixed constant derived from the definition of population variance, not fit
+  to any dataset, split, or model — and only correct for population variance; see the
+  disagreement bullet above.
 
 The result is one **per-class reliability vector**, computed fresh for every image, using nothing
 but Stage 04's own frozen forward pass on that image, repeated four times with a different
@@ -150,6 +176,8 @@ deterministic input transform each time.
 **Per-pixel disagreement and foreground restriction:**
 
 $$D_c(x,y) = \text{Var}_k\big[\tilde p_c^{(k)}(x,y)\big], \qquad U_c = \{(x,y): \bar p_c(x,y) > 0.5\}$$
+
+($\text{Var}_k$: population variance, $N=4$, `ddof=0` — see Sec 4.)
 
 $$\Delta_c = \begin{cases} \dfrac{1}{|U_c|}\displaystyle\sum_{(x,y)\in U_c} D_c(x,y) & |U_c| > 0 \\[6pt] 0 & |U_c| = 0 \end{cases}$$
 
@@ -230,13 +258,31 @@ is changed by this — only the previously-open $d_{model}$ value is now recorde
   (specifically: no dropout is added) to support RACAF. Its outputs are wrapped in a
   stop-gradient before any reliability quantity is computed from them, so gradient from the
   downstream classification loss cannot reach Stage 04's parameters through this path even
-  though the entropy/variance functions involved are technically differentiable.
+  though the entropy/variance functions involved are technically differentiable. **Defense in
+  depth:** the loaded Stage 04 model itself must also be set `trainable = False` at the Keras
+  level, in addition to (not instead of) the `stop_gradient` above — `load_lesion_model()`
+  (`lesion_segmentation_model.py`) recompiles the model with a live optimizer on load, so it is
+  not `trainable=False` by default, and `model.trainable=False` plus `stop_gradient` together
+  guarantee Stage 04's parameters neither appear in any joint optimizer's variable list nor
+  receive a gradient through this path, matching the same frozen-upstream-input precaution
+  `local_feature_extraction_model.py`'s `_StopGradientBoundary` layer already establishes for an
+  analogous case in this project.
 - **RACAF's downstream parameters ($w_g, b_g, W_r, b_r$) are trained jointly with Stages 05–08**,
   under the same optimizer already planned for that joint run, as ordinary additional trainable
   variables. The reliability *estimation* itself (the four TTA passes, $D_c$, $U_c$, $\Delta_c$,
   $\kappa_c$, $B_c$, $w_c$, $r$) is fully deterministic and non-trainable — it produces a fixed
   input to the gate, computed once per image and cacheable exactly like this project's existing
   vessel-map disk-caching pattern (`_get_or_compute_vessel_map` in `lesion_segmentation_dataset.py`).
+  **This requires a NEW, RACAF-specific cache**, not a reuse of the existing single-prediction
+  cache (`_get_or_compute_lesion_maps` in `local_feature_extraction_dataset.py`) as if it already
+  covered TTA — that existing cache stores only the one, identity-transform prediction Stage 05
+  already consumes, unrelated to and unaffected by RACAF. The new cache should store the *small*
+  derived quantities — $\kappa=(4,)$ and/or the scalar $r$ — keyed per image, not the four raw
+  $(512,512,4)$ probability maps (orders of magnitude larger and unnecessary, since $\kappa$/$r$
+  are the only quantities the gate ever consumes). Because Stage 04 is frozen, reliability for a
+  given image is deterministic and never changes across epochs, so it is computed once per image
+  and reused identically across training, validation, and testing — never recomputed from a
+  ground-truth label, Dice/IoU value, or any other test-set statistic (see §9).
 - **No test-set information is introduced anywhere in this training procedure** — see §9 for the
   full audit.
 - **No auxiliary loss is required or used.** $w_g,b_g,W_r,b_r$ train purely through the existing
@@ -393,10 +439,15 @@ RACAF must not be implemented until all of the following exist:
   Stage 07 is implemented and unit-tested (`feature_fusion.py`'s `build_adaptive_cross_attention()`),
   $d_{model}=256$, $E=(B,256)$, verified against the real Stage 05/06 models end-to-end.
 - The frozen Experiment 2C checkpoint, unchanged from its currently committed state.
-- Confirmation that Stage 04's inference interface (`predict_lesion_mask` /
-  `predict_lesion_mask_batch` in `lesion_segmentation_model.py`) can be called repeatedly, with a
-  transformed input, without requiring any change to the loaded model itself — already true today,
-  since these are plain inference calls against a loaded `tf.keras.Model`.
+- Confirmation that Stage 04's underlying model (loadable via `load_lesion_model()` in
+  `lesion_segmentation_model.py`) can be called repeatedly with a transformed `(512,512,4)` input,
+  without requiring any change to the loaded model itself — already true today, since these are
+  plain inference calls against a loaded `tf.keras.Model`. RACAF's four-view TTA loop calls this
+  underlying model directly at its native resolution (Sec 4's Implementation boundary), not the
+  higher-level `predict_lesion_mask()`/`predict_lesion_mask_batch()` wrapper, which remains
+  unmodified and continues to serve only Stage 05's separate, single-prediction, native-resolution
+  need.
 
-Until these exist, this document is a specification only. No RACAF code, dataset loader,
-training script, or checkpoint exists in this repository as of this document's authoring.
+**Satisfied.** RACAF is implemented (`racaf.py`) and unit-tested (`tests/test_racaf.py`, 73
+tests), matching this specification exactly. No training script or checkpoint exists yet — the
+joint Stages 05–08 training run referenced in §7 has not been built.

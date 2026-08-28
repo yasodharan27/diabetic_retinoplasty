@@ -132,6 +132,19 @@ class FeatureFusionPaths:
 
 
 @dataclass(frozen=True)
+class RACAFPaths:
+    """Reliability-Aware Cross-Attention Fusion (RACAF) model and results
+    paths. Mirrors `FeatureFusionPaths` exactly. `results_dir` additionally
+    hosts RACAF's own per-image reliability cache (kappa/r, derived from
+    frozen Stage 04 TTA predictions) -- a derived, regenerable artifact,
+    not raw dataset content -- mirroring `local_feature_extraction_dataset.py`'s
+    identical `DEFAULT_CACHE_DIR = os.path.join(config.LOCAL_FEATURE_RESULTS_DIR, ...)`
+    convention for the Stage 03/04 cache it already maintains."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -206,6 +219,11 @@ FEATURE_FUSION = FeatureFusionPaths(
     results_dir=os.environ.get('FEATURE_FUSION_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'feature_fusion'),
 )
 
+RACAF = RACAFPaths(
+    model_dir=os.environ.get('RACAF_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'racaf'),
+    results_dir=os.environ.get('RACAF_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'racaf'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -244,6 +262,9 @@ GLOBAL_FEATURE_RESULTS_DIR = GLOBAL_FEATURE_EXTRACTION.results_dir
 
 FEATURE_FUSION_MODEL_DIR = FEATURE_FUSION.model_dir
 FEATURE_FUSION_RESULTS_DIR = FEATURE_FUSION.results_dir
+
+RACAF_MODEL_DIR = RACAF.model_dir
+RACAF_RESULTS_DIR = RACAF.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---

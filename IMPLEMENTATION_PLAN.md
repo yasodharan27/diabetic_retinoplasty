@@ -82,7 +82,7 @@ see `PROJECT_CODE.md`'s "Approved Research Innovation" section and `RACAF_ARCHIT
 5. Local Feature Extraction — Adaptive Multi-Kernel CNN
 6. Global Feature Extraction — Dual-Scale Swin Transformer
 7. Feature Fusion — Adaptive Cross-Attention — **implemented, not trained** (Global queries Local, $d_{model}=256$, output $E=(B,256)$), see `feature_fusion.py` and `PROJECT_STRUCTURE.md` §7
-8. Reliability-Aware Cross-Attention Fusion (RACAF) — the one approved research innovation; wraps Stage 7's output, does not redefine it; not yet implemented, see `RACAF_ARCHITECTURE.md`
+8. Reliability-Aware Cross-Attention Fusion (RACAF) — the one approved research innovation; wraps Stage 7's output, does not redefine it; **implemented, not trained** (`racaf.py`), see `RACAF_ARCHITECTURE.md`
 9. Ordinal Classification — CORN
 10. Uncertainty Estimation — Monte Carlo Dropout
 11. Explainability — Grad-CAM++, SHAP, Attention Rollout
@@ -103,7 +103,7 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **APTOS 2019** (clas
 | 5 | Local Feature Extraction | Adaptive Multi-Kernel CNN | No dedicated "local" feature extractor exists. Input contract finalized: RGB image + vessel map + 4 lesion maps, concatenated into an 8-channel tensor (`SEGMENTATION_ARCHITECTURE.md` §4). | **Missing** |
 | 6 | Global Feature Extraction | Dual-Scale Swin Transformer | Implemented: `swin_transformer.py`'s `create_dual_scale_swin_model()` — two parallel Swin branches (patch 4/8, `depths=[2,2,6,2]`/`[2,2,6]`) reusing the existing `PatchEmbed`/`BasicLayer`/`PatchMerging` classes, fused by concatenation only, output `(B,64,1152)`. `create_swin_tiny_model()`/`create_hybrid_model()` untouched. Not trained (no standalone objective — see `PROJECT_STRUCTURE.md` §6). | **Implemented, not trained** |
 | 7 | Feature Fusion | Adaptive Cross-Attention | **Implemented, not trained.** `feature_fusion.py`'s `build_adaptive_cross_attention()` — one-way cross-attention, Global queries Local (`Q`=Global's 64 tokens, `K,V`=Local's 1024 tokens), `d_model=256`, 8 heads, pre-LN block + FFN (`256->1024->256`, GELU, dropout 0.1), factorized 2D positional embeddings, global-average-pooled to `E=(B,256)`. Verified against the real, already-implemented Stage 05/06 models (not just representative tensors) — see `PROJECT_STRUCTURE.md` §7 for the full specification. `feature_fusion.py` fully replaces the old baseline "fusion" (CNN → one Swin block → GlobalAveragePooling2D → Dense) reference — that baseline is not this design and was never a real implementation of this stage. | **Implemented, not trained** |
-| 8 | Reliability-Aware Cross-Attention Fusion (RACAF) | RACAF — TTA-based reliability gate wrapping Stage 7's output | The single approved research innovation. Fully specified in `RACAF_ARCHITECTURE.md`; no code exists. All of §13's output-contract prerequisites are now satisfied, including Stage 07's `d_model=256` and Stage 07's own real implementation now existing (`feature_fusion.py`) — RACAF can be implemented as its own next, separate step. | **Missing — all prerequisites satisfied, ready to implement as its own next step** |
+| 8 | Reliability-Aware Cross-Attention Fusion (RACAF) | RACAF — TTA-based reliability gate wrapping Stage 7's output | **Implemented, not trained.** `racaf.py`: `tta_views()` (frozen Stage 04, 4 deterministic transforms, called directly, never via `predict_lesion_mask()`), `compute_reliability()` (population-variance disagreement, per-class `kappa`, burden-weighted scalar `r` — fully deterministic, no labels), `get_or_compute_reliability()` (new disk cache, stores only `kappa`/`r`), `build_racaf_fusion()` (the only trainable piece: `gate=σ(w_g·r+b_g)`, `Ĝ=W_r·GAP(G)+b_r`, `F=gate·E+(1-gate)·Ĝ`, exactly 295,170 trainable params, measured). Verified against the real Stage 05/06/07 models end-to-end. | **Implemented, not trained** |
 | 9 | Ordinal Classification | CORN | All classifiers use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK metric in the baseline scripts (QWK is, however, already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py`). | **Missing** |
 | 10 | Uncertainty Estimation | Monte Carlo Dropout | Fully implemented in `bayesian_inference.py`: MC sampling, mean/std, predictive entropy, uncertainty visualizations. Reliability diagram uses simulated labels (documented limitation, not a bug). Will need re-pointing at whatever model results from steps 5–9. | **Implemented** (needs integration once the classifier changes) |
 | 11 | Explainability | Grad-CAM++, SHAP, Attention Rollout | Only vanilla Grad-CAM exists (`explainable_ai.py`), hard-coded to the `swin_refine` layer name from the current hybrid model. Grad-CAM++, SHAP, and Attention Rollout are all absent. | **Partially implemented** |
@@ -207,6 +207,14 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
   §7.
 
 ### Step 7.5 — RACAF (Reliability-Aware Cross-Attention Fusion)
+- **Status: Implemented, unit-tested (73 tests). Not trained. Not frozen.** `racaf.py` implements
+  exactly `RACAF_ARCHITECTURE.md`'s Sec 4/5/6/7 formulation, in four independently testable
+  pieces: frozen-Stage-04 TTA (`tta_views`), deterministic reliability computation
+  (`compute_reliability` — population variance, per-class `kappa`, burden-weighted scalar `r`, no
+  labels), a new per-image disk cache (`get_or_compute_reliability`, stores only `kappa`/`r`), and
+  the trainable fusion model (`build_racaf_fusion` — gate + Global readout only, 295,170 trainable
+  parameters, measured exactly). `RACAFStage` follows `AdaptiveCrossAttentionStage`'s identical
+  `TrainableStage`/`InferenceStage` pattern.
 - **Why:** The single approved downstream research innovation (`PROJECT_CODE.md`'s "Approved
   Research Innovation" section). Wraps Step 7's output with a per-image reliability gate derived
   from Stage 4's frozen, test-time-augmented output — never from Stage 4's recorded test-set
@@ -214,14 +222,12 @@ Ordered to match the target pipeline's numbering, since each stage after preproc
 - **Depends on:** Steps 5, 6, and 7's output contracts (`L`'s shape, `G`'s shape, and Cross-
   Attention's own output dimensionality) all being finalized first — RACAF's Global-readout
   projection is defined relative to those shapes and cannot be built before they exist. **All
-  three are now satisfied**: `L=(B,1024,256)`, `G=(B,64,1152)`, `E=(B,256)` (`d_model=256`), and
-  Step 7 now has real, tested code (`feature_fusion.py`) producing `E` — RACAF can be implemented
-  as its own next, separate step.
-- **Full specification:** `RACAF_ARCHITECTURE.md` — the authoritative design document. Not
-  implemented as part of this roadmap step; this entry only records where it sits in the
-  sequence. Do NOT implement Steps 5–7 in a way that assumes RACAF's requirements without
-  consulting that document first.
-- **New files:** none yet — no code exists for RACAF as of this plan's current revision.
+  three were satisfied** (`L=(B,1024,256)`, `G=(B,64,1152)`, `E=(B,256)`), which is what made this
+  implementation possible; verified against the real Stage 05/06/07 models end-to-end.
+- **Full specification:** `RACAF_ARCHITECTURE.md` — the authoritative design document, followed
+  exactly; no equation, parameter, or tensor contract was changed during implementation.
+- **New files:** `racaf.py` (`tta_views`, `compute_reliability`, `get_or_compute_reliability`,
+  `build_racaf_fusion`, `RACAFStage`).
 
 *(Note: this roadmap's Step numbers below no longer align 1:1 with the Target Architecture's
 Stage numbers in §2, since RACAF was inserted as "Step 7.5" rather than triggering a renumbering
@@ -257,19 +263,19 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 
 Stages 1–4 are complete. Stage 4 (Lesion Segmentation) is finalized as Experiment 2C and is now
 **frozen** — no further training, loss, or architecture changes to it, and no Experiment 2D is
-planned. Stage 5 (Local Feature Extraction), Stage 6 (Global Feature Extraction), and Stage 7
-(Feature Fusion / Adaptive Cross-Attention) are all now **implemented and unit-tested, but not
-trained and not frozen** — none has a standalone training objective; all three await the joint
-Stage 05–08 + RACAF training script. Stage 7's implementation (`feature_fusion.py`) follows exactly
-the approved design (`PROJECT_STRUCTURE.md` §7): one-way cross-attention, Global queries Local,
-`d_model=256`, output `E=(B,256)`, verified against the real Stage 05/06 models end-to-end. Per the
-"one module at a time, wait for approval" rule, the next implementation target is **RACAF**, with
-explicit approval requested before writing code.
+planned. Stage 5 (Local Feature Extraction), Stage 6 (Global Feature Extraction), Stage 7 (Feature
+Fusion / Adaptive Cross-Attention), and **RACAF** are all now **implemented and unit-tested, but
+not trained and not frozen** — none has a standalone training objective; all four await the joint
+Stage 05–08 + RACAF training script. RACAF's implementation (`racaf.py`) follows exactly the
+approved, audited design (`RACAF_ARCHITECTURE.md`): frozen-Stage-04 TTA disagreement, population
+variance, burden-weighted scalar reliability `r`, and a 295,170-parameter gate + Global-readout
+fusion model, verified against the real Stage 05/06/07 models end-to-end. Per the "one module at a
+time, wait for approval" rule, the next implementation target is **CORN (Stage 08, Ordinal
+Classification)**, with explicit approval requested before writing code.
 
-**RACAF (Step 7.5 above) is queued after Stage 7 and can now be implemented** — all of §13's
-prerequisites are satisfied: `L=(B,1024,256)`, `G=(B,64,1152)`, `d_model=256`, and Stage 7's own
-real code now exists to wrap. See `RACAF_ARCHITECTURE.md` §13 for the exact list of prerequisites.
 RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
 Research Innovation" section); no second, competing innovation should be introduced without a
-deliberate revision of that decision — Stage 7's cross-attention mechanism itself is
-established/literature-derived engineering, not a research contribution.
+deliberate revision of that decision — Stage 7's cross-attention mechanism, and every individual
+technique RACAF itself uses (TTA, predictive variance, sigmoid gating, linear projection), remain
+established/literature-derived engineering, not research contributions in their own right; only
+RACAF's specific integration of them is.

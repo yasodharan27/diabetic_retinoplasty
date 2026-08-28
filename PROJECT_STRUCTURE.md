@@ -325,12 +325,49 @@ for the visual end-to-end flow.
   design-resolution record for the full architecture comparison, literature survey, and
   traceability table this specification is drawn from.
 
+### RACAF (Reliability-Aware Cross-Attention Fusion)
+- **Purpose:** The project's ONE approved research innovation (`PROJECT_CODE.md`'s "Approved
+  Research Innovation" section). Wraps Stage 7's output `E` with a per-image reliability signal
+  derived entirely from Stage 4's own frozen, test-time-augmented predictive disagreement — never
+  from Stage 4's recorded test-set Dice/IoU, a ground-truth mask, or any other label. Not one of
+  the 11 base target-architecture stages (`PROJECT_CODE.md`); sits between Stage 7 and Stage 8.
+- **Full specification:** `RACAF_ARCHITECTURE.md` — the authoritative design document.
+  Implementation follows it exactly; no equation, parameter, or tensor contract was changed.
+- **Implementation:** `racaf.py`, in four independently testable pieces:
+  - `tta_views()` -- runs frozen Stage 04 directly (never `predict_lesion_mask()`) on 4
+    deterministic transforms (identity/h-flip/v-flip/180°) of its native `(512,512,4)` input,
+    inverse-transforming each output back to alignment.
+  - `compute_reliability()` -- fully deterministic, non-trainable: population-variance
+    disagreement (`ddof=0`, required for `Delta_max=0.25`), foreground-restricted pooling,
+    per-class `kappa=(4,)` in `[0,1]`, burden-weighted scalar `r` in `[0,1]`.
+  - `get_or_compute_reliability()` -- a new per-image disk cache (distinct from Stage 5's
+    existing single-prediction cache), storing only `kappa`/`r`, never the four raw probability
+    maps.
+  - `build_racaf_fusion()` -- the only trainable piece: `gate=sigmoid(w_g*r+b_g)`,
+    `G_hat=W_r*GAP(G)+b_r`, `F=gate*E+(1-gate)*G_hat`. **295,170 trainable parameters** (measured
+    exactly), all elsewhere (Stage 4/5/6/7) frozen/upstream and excluded from this count.
+  - `RACAFStage` -- `pipeline.TrainableStage`/`InferenceStage`, mirroring
+    `AdaptiveCrossAttentionStage`'s pattern; `train()`/`evaluate()` raise `NotImplementedError`.
+- **Frozen-Stage-4 boundary:** `load_frozen_stage4_model()` sets `trainable=False` explicitly, in
+  addition to (not instead of) the `tf.stop_gradient` already applied to every TTA prediction --
+  verified: no gradient reaches Stage 4's parameters through either path.
+- **Output:** `F`, shape `(B, 256)` -- a feature vector, replacing `E` as CORN's input, identical
+  shape, only the value changes. Never logits, never probabilities, never a DR class.
+- **Novelty status:** the individual techniques (TTA, predictive variance, sigmoid gating, linear
+  projection) are all established/cited, not invented here -- RACAF's contribution is their
+  specific integration for this exact frozen-Stage-4 constraint (see `RACAF_ARCHITECTURE.md` §1).
+- **Training dataset:** APTOS 2019, same split as Stages 5/6/7. No standalone training objective.
+- **Dependencies:** Stage 4 (frozen, inference-only), Stage 6 (raw `G`), Stage 7 (`E`).
+- **Status:** **Implemented and unit-tested (73 tests). Not trained, not frozen.** Verified
+  end-to-end against the real, already-implemented Stage 05/06/07 models, including a full
+  save/load round-trip with identical outputs.
+
 ### 8. CORN Classification
 - **Purpose:** Final ordinal DR-severity classification (CORN ordinal regression head).
-- **Input:** Fused features (Stage 7).
+- **Input:** RACAF's fused output `F` (not Stage 7's raw `E` directly -- RACAF wraps it first).
 - **Output:** DR severity grade (0-4, ordinal) + class probabilities.
 - **Training dataset:** APTOS 2019.
-- **Dependencies:** Stage 7.
+- **Dependencies:** Stage 7, RACAF.
 - **Status:** Not implemented.
 
 > **Note on Stages 5-8:** `PROJECT_CODE.md`'s Models table and the verified Google Drive layout
