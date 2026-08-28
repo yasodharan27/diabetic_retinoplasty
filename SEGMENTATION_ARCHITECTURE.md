@@ -158,11 +158,13 @@ Local Feature Extraction  ── Adaptive Multi-Kernel CNN
     ▼
 Global Feature Extraction  ── Dual-Scale Swin Transformer
     (consumes the preprocessed RGB image directly; parallel to, not sequential
-    with, Local Feature Extraction. Any resizing this stage needs is internal
-    to it -- Stage 02 does not resize, and no fixed resolution is documented
-    here; the final input resolution is configurable and will be selected
-    during implementation based on memory and model performance.)
-    │  shape: not fixed by this document -- see above.
+    with, Local Feature Extraction. Resized to 256x256 inside Stage 06's own
+    pipeline -- Stage 02 itself does not resize. Two parallel Swin branches,
+    patch_size 4 and 8, fused by channel-wise concatenation only -- no
+    projection, no cross-attention, no pooling. See swin_transformer.py's
+    create_dual_scale_swin_model() and the Stage 06 design-resolution record
+    for the full specification; not repeated here.)
+    │  shape: (64, 1152) -- fixed by Stage 06's own implementation, see above.
     ▼
 Adaptive Cross-Attention  (Feature Fusion)
     │  shape: reduces to a flat feature vector for the CORN head (fixed by

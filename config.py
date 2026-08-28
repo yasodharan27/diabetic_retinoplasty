@@ -93,6 +93,34 @@ class LesionSegmentationPaths:
 
 
 @dataclass(frozen=True)
+class LocalFeatureExtractionPaths:
+    """Local Feature Extraction (Stage 05) model and results paths.
+
+    Mirrors `LesionSegmentationPaths` exactly: `model_dir` will hold this
+    project's own trained `.keras` output once Stage 05 is trained (not a
+    vendored checkpoint), and `results_dir` additionally holds the cached
+    Stage 03/04 inference outputs Stage 05's dataset loader computes over
+    APTOS 2019 (see `local_feature_extraction_dataset.py`) -- a derived,
+    regenerable artifact, not raw dataset content, so it lives here rather
+    than under `datasets/`."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
+class GlobalFeatureExtractionPaths:
+    """Global Feature Extraction (Stage 06) model and results paths.
+
+    Mirrors `LocalFeatureExtractionPaths` exactly. Unlike Stage 05, Stage
+    06 has no frozen upstream (Stage 03/04) inference to cache -- its
+    `results_dir` exists only for parity with the per-stage
+    model_dir/results_dir convention every other trainable stage in this
+    project already uses."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -152,6 +180,16 @@ LESION_SEGMENTATION = LesionSegmentationPaths(
     results_dir=os.environ.get('LESION_SEG_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'lesion_segmentation'),
 )
 
+LOCAL_FEATURE_EXTRACTION = LocalFeatureExtractionPaths(
+    model_dir=os.environ.get('LOCAL_FEATURE_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'local_feature_extraction'),
+    results_dir=os.environ.get('LOCAL_FEATURE_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'local_feature_extraction'),
+)
+
+GLOBAL_FEATURE_EXTRACTION = GlobalFeatureExtractionPaths(
+    model_dir=os.environ.get('GLOBAL_FEATURE_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'global_feature_extraction'),
+    results_dir=os.environ.get('GLOBAL_FEATURE_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'global_feature_extraction'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -181,6 +219,12 @@ VESSEL_SEG_RESULTS_DIR = VESSEL_SEGMENTATION.results_dir
 
 LESION_SEG_MODEL_DIR = LESION_SEGMENTATION.model_dir
 LESION_SEG_RESULTS_DIR = LESION_SEGMENTATION.results_dir
+
+LOCAL_FEATURE_MODEL_DIR = LOCAL_FEATURE_EXTRACTION.model_dir
+LOCAL_FEATURE_RESULTS_DIR = LOCAL_FEATURE_EXTRACTION.results_dir
+
+GLOBAL_FEATURE_MODEL_DIR = GLOBAL_FEATURE_EXTRACTION.model_dir
+GLOBAL_FEATURE_RESULTS_DIR = GLOBAL_FEATURE_EXTRACTION.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---

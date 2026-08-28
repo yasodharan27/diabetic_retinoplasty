@@ -18,6 +18,7 @@ Classification).
 """
 
 from .classification import ClassificationStage
+from .feature_extraction import FeatureExtractionStage
 from .inference import InferenceStage
 from .segmentation import SegmentationStage
 from .trainable import TrainableStage
@@ -27,4 +28,5 @@ __all__ = [
     "InferenceStage",
     "SegmentationStage",
     "ClassificationStage",
+    "FeatureExtractionStage",
 ]
