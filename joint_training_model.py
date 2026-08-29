@@ -21,6 +21,8 @@ parameters are not `tf.Variable`s in this graph at all, so no optimizer, gradien
 Only Stage 05, Stage 06, Stage 07, RACAF's two learned pieces (`w_g,b_g,W_r,b_r`), and CORN are
 trainable in the returned model -- exactly the boundary `JOINT_TRAINING_ARCHITECTURE.md` §4/§19
 fixes. The training loss is `corn.corn_loss` alone (`compile_joint_model`) -- no auxiliary loss.
+`compile_joint_model` also attaches `corn.CORNQuadraticWeightedKappa` as a reported METRIC (not
+a loss) so `monitor="val_QWK", mode="max"` checkpoint selection (§23) has a real value to read.
 
 Checkpoint format: weights-only (`save_joint_model_weights`/`load_joint_model_weights`), per
 `JOINT_TRAINING_ARCHITECTURE.md` §25 -- Stage 06's underlying Swin layer classes have no
@@ -91,12 +93,19 @@ def joint_corn_loss(y_true, y_pred):
 def compile_joint_model(model, optimizer=None):
     """Compiles `model` (from `build_joint_model()`) with exactly `corn.corn_loss` as the
     training objective -- the ONLY supervised loss for this joint training run
-    (`JOINT_TRAINING_ARCHITECTURE.md` §21). `optimizer` defaults to a plain `Adam()` if not
-    supplied; this function makes no other training-loop decision (batch size, callbacks,
-    schedule) -- those belong to the notebook / `training.Trainer`, not this module."""
+    (`JOINT_TRAINING_ARCHITECTURE.md` §21) -- plus `corn.CORNQuadraticWeightedKappa` as a
+    reported METRIC, never a second loss, so Keras's own `logs` dict actually contains
+    `"QWK"`/`"val_QWK"` for `JOINT_TRAINING_ARCHITECTURE.md` §23's `monitor="val_QWK",
+    mode="max"` checkpoint-selection policy to observe during `model.fit()` -- previously this
+    function compiled with no metric at all, so that monitor string had nothing to read and
+    `ModelCheckpoint`/`EarlyStopping`/`ReduceLROnPlateau` would have silently skipped every
+    epoch (see `tests/test_joint_training.py`'s `CORNQWKJointIntegrationTests`). `optimizer`
+    defaults to a plain `Adam()` if not supplied; this function makes no other training-loop
+    decision (batch size, callbacks, schedule) -- those belong to the notebook /
+    `training.Trainer`, not this module."""
     if optimizer is None:
         optimizer = tf.keras.optimizers.Adam()
-    model.compile(optimizer=optimizer, loss=joint_corn_loss)
+    model.compile(optimizer=optimizer, loss=joint_corn_loss, metrics=[corn.CORNQuadraticWeightedKappa()])
     return model
 
 

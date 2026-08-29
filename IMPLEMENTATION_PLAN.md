@@ -288,9 +288,23 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (38 tests, `tests/test_joint_training.py`). NOT trained — no
-  `model.fit()` call, no epoch, no checkpoint exists anywhere in this repository or on Drive.**
+- **Status: Implemented, unit-tested (43 tests, `tests/test_joint_training.py`, plus 11 more in
+  `tests/test_corn.py` for the CORN-aware QWK metric below). NOT trained — no `model.fit()` call
+  on real data, no epoch, no checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
+- **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that
+  `compile_joint_model()` originally compiled with no metric at all, so `monitor="val_QWK"`
+  (below) had no `"val_QWK"` key in Keras's `logs` dict to read — checkpoint
+  selection/early-stopping/LR-reduction would each have silently no-op'd on the first real run.
+  Fixed with a Keras `Metric` (`corn.py`) that decodes CORN's raw logits via EXACTLY
+  `decode_logits`'s own sigmoid → cumulative-product → threshold-count rule (not an argmax — the
+  project's existing generic `training.metrics.QuadraticWeightedKappa` cannot be attached to
+  CORN's output directly, since argmaxing 4 conditional-task logits both computes the wrong grade
+  and can never reach class index 4) and delegates confusion-matrix/kappa computation to
+  `QuadraticWeightedKappa` unmodified. `compile_joint_model()` now compiles with
+  `metrics=[corn.CORNQuadraticWeightedKappa()]` (named `"QWK"`) alongside the unchanged
+  `loss=joint_corn_loss` — QWK is a metric only, never a second loss. See
+  `JOINT_TRAINING_ARCHITECTURE.md` §23.
 - **New files:**
   - `joint_training_dataset.py` — the joint data/cache pipeline. Builds `stage5_input`
     `(512,512,8)`, `stage6_input` `(256,256,3)`, `reliability` (scalar `r`), and `grade` per

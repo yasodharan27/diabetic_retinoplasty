@@ -236,6 +236,143 @@ class DecodeLogitsTests(unittest.TestCase):
             )
 
 
+class CORNQuadraticWeightedKappaTests(unittest.TestCase):
+    """Covers `corn.CORNQuadraticWeightedKappa` -- the CORN-aware Keras QWK metric used for
+    joint-training checkpoint selection (`JOINT_TRAINING_ARCHITECTURE.md` Sec 23). Confusion-
+    matrix accumulation and kappa computation are inherited, unmodified, from
+    `training.metrics.QuadraticWeightedKappa` -- these tests focus on the new logits->grade
+    decode and on the metric's end-to-end numerical correctness against an independent
+    reference, not on re-verifying kappa math already covered elsewhere."""
+
+    @staticmethod
+    def _logits_for_grade(grades, magnitude=15.0):
+        """Builds `(len(grades), 4)` logits that the sigmoid->cumprod->threshold rule decodes
+        EXACTLY to `grades` -- large-magnitude logits push p_cond to ~0/~1 so the cumulative
+        product is unambiguous."""
+        grades = np.asarray(grades)
+        thresholds = np.arange(4)[None, :]
+        return np.where(thresholds < grades[:, None], magnitude, -magnitude).astype("float32")
+
+    @staticmethod
+    def _reference_qwk(y_true, y_pred):
+        from sklearn.metrics import cohen_kappa_score
+        return cohen_kappa_score(y_true, y_pred, weights="quadratic")
+
+    def test_metric_initialization(self):
+        metric = corn.CORNQuadraticWeightedKappa()
+        self.assertEqual(metric.name, "QWK")
+        self.assertEqual(metric.num_classes, 5)
+        self.assertEqual(metric.confusion.shape, (5, 5))
+        np.testing.assert_array_equal(metric.confusion.numpy(), np.zeros((5, 5)))
+
+    def test_decode_matches_decode_logits_all_high(self):
+        logits = tf.constant([[10.0, 10.0, 10.0, 10.0]])
+        expected_grade = corn.decode_logits(logits.numpy())["predicted_grade"][0]
+        self.assertEqual(expected_grade, 4)
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant([4]), logits)
+        self.assertEqual(metric.confusion.numpy()[4, 4], 1.0)
+
+    def test_decode_matches_decode_logits_all_low(self):
+        logits = tf.constant([[-10.0, -10.0, -10.0, -10.0]])
+        expected_grade = corn.decode_logits(logits.numpy())["predicted_grade"][0]
+        self.assertEqual(expected_grade, 0)
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant([0]), logits)
+        self.assertEqual(metric.confusion.numpy()[0, 0], 1.0)
+
+    def test_decode_matches_decode_logits_on_random_batch(self):
+        """The metric's internal decode must match `decode_logits` exactly, sample by sample,
+        for a batch spanning intermediate values -- proves no second, incompatible decoding rule
+        was introduced. Feeding each sample's OWN `decode_logits`-derived grade as `y_true`
+        forces a purely-diagonal confusion matrix if and only if the metric decoded identically."""
+        rng = np.random.RandomState(0)
+        logits_np = rng.uniform(-15, 15, size=(50, 4)).astype("float32")
+        expected_grades = corn.decode_logits(logits_np)["predicted_grade"]
+
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant(expected_grades, dtype=tf.int32), tf.constant(logits_np))
+        confusion = metric.confusion.numpy()
+        off_diagonal = confusion.sum() - np.trace(confusion)
+        self.assertEqual(off_diagonal, 0.0)
+
+    def test_grade_4_is_reachable(self):
+        """The exact bug this metric fixes: naively argmaxing 4 threshold logits can never
+        produce class index 4. Proves grade 4 IS reachable through the correct decode."""
+        logits = tf.constant([[5.0, 5.0, 5.0, 5.0], [5.0, 5.0, 5.0, 5.0]])
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant([4, 4]), logits)
+        self.assertEqual(metric.confusion.numpy()[4, 4], 2.0)
+
+    def test_reset_state(self):
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant([4]), tf.constant([[10.0, 10.0, 10.0, 10.0]]))
+        self.assertGreater(float(tf.reduce_sum(metric.confusion)), 0.0)
+        metric.reset_state()
+        np.testing.assert_array_equal(metric.confusion.numpy(), np.zeros((5, 5)))
+        self.assertEqual(float(metric.result()), 0.0)
+
+    def test_metric_shape_and_dtype(self):
+        metric = corn.CORNQuadraticWeightedKappa()
+        self.assertEqual(metric.confusion.shape, (5, 5))
+        result = metric.result()
+        self.assertEqual(result.shape, ())
+        self.assertEqual(result.dtype, tf.float32)
+
+    def test_perfect_predictions_give_kappa_of_one(self):
+        grades = [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+        logits_np = self._logits_for_grade(grades)
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant(grades), tf.constant(logits_np))
+        self.assertAlmostEqual(float(metric.result()), 1.0, places=5)
+
+    def test_completely_different_predictions_matches_reference(self):
+        """A systematic full reversal (0<->4, 1<->3, ...) -- the sign/magnitude is verified
+        against the independent reference, not assumed."""
+        y_true = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        reversed_grades = 4 - y_true
+        logits_np = self._logits_for_grade(reversed_grades)
+        y_pred = corn.decode_logits(logits_np)["predicted_grade"]
+        np.testing.assert_array_equal(y_pred, reversed_grades)
+
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant(y_true, dtype=tf.int32), tf.constant(logits_np))
+        expected = self._reference_qwk(y_true, y_pred)
+        self.assertAlmostEqual(float(metric.result()), expected, places=5)
+        self.assertLess(float(metric.result()), 0.0, "a systematic full reversal must score below chance")
+
+    def test_matches_independent_reference_on_mixed_grades(self):
+        """Cross-checks the full metric (decode + kappa) against sklearn's
+        cohen_kappa_score(weights='quadratic') computed independently on the SAME decoded
+        grades."""
+        rng = np.random.RandomState(1)
+        y_true = rng.randint(0, 5, size=30)
+        logits_np = rng.uniform(-15, 15, size=(30, 4)).astype("float32")
+        y_pred = corn.decode_logits(logits_np)["predicted_grade"]
+
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant(y_true, dtype=tf.int32), tf.constant(logits_np))
+        expected = self._reference_qwk(y_true, y_pred)
+        self.assertAlmostEqual(float(metric.result()), expected, places=5)
+
+    def test_batch_accumulation_uses_the_combined_confusion_matrix_not_an_average(self):
+        """Two separate update_state calls must accumulate into ONE confusion matrix -- result()
+        computed from the combined counts, never an average of two independently-computed
+        per-batch kappas (exactly what a naive stateless metric would get wrong)."""
+        rng = np.random.RandomState(2)
+        y_true_all = rng.randint(0, 5, size=40)
+        logits_all = rng.uniform(-15, 15, size=(40, 4)).astype("float32")
+
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant(y_true_all[:20], dtype=tf.int32), tf.constant(logits_all[:20]))
+        metric.update_state(tf.constant(y_true_all[20:], dtype=tf.int32), tf.constant(logits_all[20:]))
+        accumulated_result = float(metric.result())
+
+        y_pred_all = corn.decode_logits(logits_all)["predicted_grade"]
+        expected = self._reference_qwk(y_true_all, y_pred_all)
+        self.assertAlmostEqual(accumulated_result, expected, places=5)
+
+
 class ModelBatchIndependenceTests(unittest.TestCase):
     def test_model_forward_pass_is_batch_independent(self):
         model = corn.build_corn_model()

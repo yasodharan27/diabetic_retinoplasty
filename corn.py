@@ -33,7 +33,17 @@ Kept in independently testable pieces, mirroring `racaf.py`'s modularity
 3. `decode_logits` -- deterministic, non-trainable inference: sigmoid ->
    cumulative product -> thresholded predicted grade -> per-class
    probability reconstruction. Pure NumPy.
-4. `CORNStage` -- `pipeline.classification.ClassificationStage`
+4. `CORNQuadraticWeightedKappa` -- a Keras `Metric`, NOT a loss, for joint
+   training's `monitor="val_QWK", mode="max"` checkpoint selection
+   (`JOINT_TRAINING_ARCHITECTURE.md` Sec 23). Decodes raw CORN logits with
+   EXACTLY `decode_logits`'s own sigmoid -> cumulative-product ->
+   threshold-count rule (re-expressed in TensorFlow ops so it runs inside
+   `model.fit()`'s graph-mode execution), then delegates confusion-matrix
+   accumulation and kappa computation to
+   `training.metrics.QuadraticWeightedKappa`, unmodified -- see this
+   class's own docstring for why the generic metric cannot be attached to
+   CORN's output directly.
+5. `CORNStage` -- `pipeline.classification.ClassificationStage`
    implementation (this project's existing classification-stage contract,
    already binding on Stage 01/Stage 08 per that ABC's own docstring), not
    a new interface.
@@ -54,6 +64,7 @@ from keras import Input, Model, layers
 
 import config
 from pipeline.classification import ClassificationStage
+from training.metrics import QuadraticWeightedKappa
 
 # --- Fixed by the approved CORN design (CORN_ARCHITECTURE.md) ---
 
@@ -185,7 +196,53 @@ def decode_logits(logits):
 
 
 # =====================================================================
-# 4. pipeline.ClassificationStage implementation.
+# 4. CORN-aware Quadratic Weighted Kappa -- a Keras METRIC (never a loss),
+#    for joint training's val_QWK checkpoint selection.
+# =====================================================================
+
+class CORNQuadraticWeightedKappa(QuadraticWeightedKappa):
+    """Quadratic Weighted Kappa for CORN's raw ordinal logits -- for use as a
+    `model.compile(metrics=[...])` entry during joint training, so Keras's own `logs` dict
+    actually contains `"QWK"`/`"val_QWK"` for `JOINT_TRAINING_ARCHITECTURE.md` Sec 23's
+    `monitor="val_QWK", mode="max"` checkpoint-selection policy to observe. This is a METRIC
+    only -- `corn_loss` remains the sole training objective (see this module's docstring); no
+    auxiliary loss is introduced by adding this metric.
+
+    `training.metrics.QuadraticWeightedKappa.update_state()` cannot be applied to CORN's raw
+    `(B, num_thresholds)` logits directly: it argmaxes `y_pred` over its last axis, which would
+    treat CORN's `num_thresholds=4` conditional-task logits as 4 mutually exclusive classes --
+    wrong both mathematically (an ordinal grade needs the sigmoid -> cumulative-product ->
+    threshold-count decode below, not an argmax) and structurally (argmax over 4 values can
+    never produce class index 4, silently making the highest DR grade unreachable).
+
+    This subclass overrides ONLY the decode step. Confusion-matrix accumulation, `result()`'s
+    kappa computation, and `reset_state()` are all inherited from `QuadraticWeightedKappa`
+    UNCHANGED -- the kappa mathematics itself is not duplicated here. The decode is EXACTLY
+    `decode_logits`'s own inference rule (item 3 above), re-expressed in pure TensorFlow ops
+    since `decode_logits` itself is NumPy-only (used for eager, single-prediction inference) and
+    this class must run inside `model.fit()`'s graph-mode execution:
+
+        p_cond = sigmoid(logits)
+        p_cum  = cumprod(p_cond, axis=-1)
+        grade  = sum(p_cum > 0.5, axis=-1)   -- in [0, NUM_GRADES-1]
+
+    `tests/test_corn.py`'s `CORNQuadraticWeightedKappaTests` proves this decode is numerically
+    identical to `decode_logits` on the same logits, and that the resulting kappa matches an
+    independent reference implementation."""
+
+    def __init__(self, num_classes=NUM_GRADES, name="QWK", **kwargs):
+        super().__init__(num_classes=num_classes, name=name, **kwargs)
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        logits = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+        p_cond = tf.sigmoid(logits)
+        p_cum = tf.math.cumprod(p_cond, axis=-1)
+        predicted_grade = tf.reduce_sum(tf.cast(p_cum > 0.5, tf.int32), axis=-1)
+        super().update_state(y_true, predicted_grade, sample_weight=sample_weight)
+
+
+# =====================================================================
+# 5. pipeline.ClassificationStage implementation.
 # =====================================================================
 
 class CORNStage(ClassificationStage):

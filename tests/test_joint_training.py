@@ -518,6 +518,135 @@ class JointModelTests(unittest.TestCase):
 
 
 # =====================================================================
+# val_QWK checkpoint-selection fix -- compile_joint_model() wiring, Keras log naming, and
+# callback compatibility. Tiny synthetic tensors only; no real APTOS data, no real training
+# epoch, no persistent checkpoint.
+# =====================================================================
+
+class CORNQWKJointIntegrationTests(unittest.TestCase):
+    def test_compile_joint_model_adds_exactly_one_qwk_metric(self):
+        """`model.metrics` is not yet populated with individual metric names until Keras has
+        built the compiled-metrics wrapper (which happens on the first fit/evaluate/predict
+        call) -- so this uses `model.evaluate(..., return_dict=True)` (a forward pass only, no
+        gradient step, no weight update -- not training) to force that build and read the
+        resulting metric names directly, proving exactly one metric, "QWK", was added alongside
+        the loss, with no other metric silently included."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        s5 = np.random.RandomState(9).rand(2, 512, 512, 8).astype("float32")
+        s6 = np.random.RandomState(10).rand(2, 256, 256, 3).astype("float32")
+        r = np.random.RandomState(11).rand(2, 1).astype("float32")
+        grades = np.array([1, 3], dtype="int32")
+
+        results = model.evaluate([s5, s6, r], grades, batch_size=2, verbose=0, return_dict=True)
+        self.assertIn("QWK", results)
+        self.assertEqual(set(results.keys()), {"loss", "QWK"})
+
+    def test_compile_joint_model_still_uses_only_corn_loss(self):
+        """No additional loss was introduced alongside the new metric."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+        self.assertIs(model.loss, jtm.joint_corn_loss)
+
+    def test_keras_logs_contain_qwk_and_val_qwk(self):
+        """A tiny (batch=2), ONE-step synthetic train+val fit -- proves Keras's own logs dict
+        actually contains 'QWK'/'val_QWK' by name, not merely that the metric object exists.
+        NOT real training: one epoch, one step, synthetic tensors, model discarded afterward."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        s5 = np.random.RandomState(0).rand(2, 512, 512, 8).astype("float32")
+        s6 = np.random.RandomState(1).rand(2, 256, 256, 3).astype("float32")
+        r = np.random.RandomState(2).rand(2, 1).astype("float32")
+        grades = np.array([1, 3], dtype="int32")
+
+        history = model.fit(
+            [s5, s6, r], grades, validation_data=([s5, s6, r], grades),
+            epochs=1, batch_size=2, verbose=0,
+        )
+        self.assertIn("loss", history.history)
+        self.assertIn("QWK", history.history)
+        self.assertIn("val_loss", history.history)
+        self.assertIn("val_QWK", history.history)
+        val_qwk = float(history.history["val_QWK"][0])
+        self.assertFalse(np.isnan(val_qwk))
+
+    def test_model_checkpoint_can_monitor_val_qwk(self):
+        """A real `tf.keras.callbacks.ModelCheckpoint(monitor="val_QWK", mode="max")` attached
+        to a one-step `model.fit()` call must find the value (no 'not available' skip) and save
+        a checkpoint -- proof the callback layer, not just the raw logs dict, sees it. Checkpoint
+        is written to a temp directory and removed immediately after; not a real training run."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        tmp_dir = tempfile.mkdtemp(prefix="qwk_checkpoint_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        checkpoint_path = os.path.join(tmp_dir, "best.weights.h5")
+
+        s5 = np.random.RandomState(3).rand(2, 512, 512, 8).astype("float32")
+        s6 = np.random.RandomState(4).rand(2, 256, 256, 3).astype("float32")
+        r = np.random.RandomState(5).rand(2, 1).astype("float32")
+        grades = np.array([0, 4], dtype="int32")
+
+        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            checkpoint_path, monitor="val_QWK", mode="max",
+            save_best_only=True, save_weights_only=True, verbose=0,
+        )
+        model.fit(
+            [s5, s6, r], grades, validation_data=([s5, s6, r], grades),
+            epochs=1, batch_size=2, verbose=0, callbacks=[checkpoint_cb],
+        )
+        self.assertNotEqual(checkpoint_cb.best, float("-inf"), "ModelCheckpoint never saw val_QWK")
+        self.assertTrue(os.path.exists(checkpoint_path))
+
+    def test_model_checkpoint_mode_max_only_saves_on_improvement(self):
+        """Deterministic proof of the maximize-direction policy, independent of real training
+        dynamics: manufactured val_QWK values fed directly to a ModelCheckpoint's own
+        `on_epoch_end` -- a higher value must be treated as an improvement, a lower one must
+        not."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        tmp_dir = tempfile.mkdtemp(prefix="qwk_checkpoint_direction_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        checkpoint_path = os.path.join(tmp_dir, "best.weights.h5")
+
+        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            checkpoint_path, monitor="val_QWK", mode="max",
+            save_best_only=True, save_weights_only=True, verbose=0,
+        )
+        checkpoint_cb.set_model(model)
+
+        checkpoint_cb.on_epoch_end(0, logs={"val_QWK": 0.2})
+        self.assertEqual(checkpoint_cb.best, 0.2)
+        checkpoint_cb.on_epoch_end(1, logs={"val_QWK": 0.6})
+        self.assertEqual(checkpoint_cb.best, 0.6)  # improved -- new best
+        checkpoint_cb.on_epoch_end(2, logs={"val_QWK": 0.1})
+        self.assertEqual(checkpoint_cb.best, 0.6)  # NOT an improvement -- best unchanged
+
+    def test_saving_and_loading_weights_still_works_with_metric_compiled(self):
+        """The new metric must not interfere with the established weights-only checkpoint
+        strategy (JOINT_TRAINING_ARCHITECTURE.md Sec 25)."""
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        tmp_dir = tempfile.mkdtemp(prefix="qwk_weights_roundtrip_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        path = os.path.join(tmp_dir, "joint.weights.h5")
+
+        s5 = np.random.RandomState(6).rand(1, 512, 512, 8).astype("float32")
+        s6 = np.random.RandomState(7).rand(1, 256, 256, 3).astype("float32")
+        r = np.random.RandomState(8).rand(1, 1).astype("float32")
+        before = model.predict([s5, s6, r], verbose=0)
+
+        jtm.save_joint_model_weights(model, path)
+        reloaded = jtm.load_joint_model_weights(path)
+        after = reloaded.predict([s5, s6, r], verbose=0)
+        np.testing.assert_allclose(before, after, atol=1e-5)
+
+
+# =====================================================================
 # Drive path / checkpoint-selection infrastructure (no real Drive needed).
 # =====================================================================
 

@@ -433,9 +433,13 @@ for the visual end-to-end flow.
 > The full joint-training design -- dataset flow, caching, gradient boundary, loss, checkpoint
 > format, and the Drive/notebook infrastructure it depends on -- is resolved in
 > `JOINT_TRAINING_ARCHITECTURE.md`, and the joint model builder/dataset loader (`joint_training_model.py`,
-> `joint_training_dataset.py`, 38 tests) are now implemented -- but no training has been run and no
+> `joint_training_dataset.py`, 43 tests) are now implemented -- but no training has been run and no
 > checkpoint exists (`colab/notebooks/stage08_corn_classifier.ipynb`'s training cells are gated
-> behind `RUN_TRAINING = False`).
+> behind `RUN_TRAINING = False`). Checkpoint selection (`monitor="val_QWK", mode="max"`) is backed
+> by `corn.CORNQuadraticWeightedKappa` -- a CORN-aware Keras metric (11 more tests in
+> `tests/test_corn.py`) that decodes CORN's logits via `decode_logits`'s own rule rather than
+> the generic, argmax-based `training.metrics.QuadraticWeightedKappa`, which cannot be applied to
+> CORN's conditional-task logits directly.
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

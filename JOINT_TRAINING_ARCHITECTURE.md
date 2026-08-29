@@ -383,6 +383,27 @@ QWK (`evaluation/metrics.py`, already implemented).
 ordinal-appropriate metric and is already implemented and reusable. Training loss is unaffected —
 `corn_loss` remains the sole training objective; QWK is used only for best-checkpoint selection.
 
+**Implementation note (post-implementation audit fix):** `compile_joint_model()` originally
+compiled with no metric at all, so Keras's own `logs` dict during `model.fit()` would never have
+contained a `"val_QWK"` key for this monitor string to read — `ModelCheckpoint`/`EarlyStopping`/
+`ReduceLROnPlateau` would each have silently skipped every epoch (Keras logs a "metric not
+available" warning and no-ops), defeating this section's policy on the first real run. The
+project's existing generic `training.metrics.QuadraticWeightedKappa` cannot be attached to
+CORN's output directly either — it argmaxes `y_pred`, which would treat CORN's 4 conditional
+threshold logits as 4 mutually exclusive classes (wrong, and structurally unable to ever produce
+grade 4). Fixed by `corn.CORNQuadraticWeightedKappa` (`corn.py`) — a thin subclass that decodes
+CORN's logits with EXACTLY `decode_logits`'s own sigmoid → cumulative-product → threshold-count
+rule (in TensorFlow ops, so it runs inside `model.fit()`'s graph-mode execution) and delegates
+confusion-matrix accumulation and kappa computation to `QuadraticWeightedKappa`, unmodified.
+`compile_joint_model()` now passes `metrics=[corn.CORNQuadraticWeightedKappa()]` (named `"QWK"`,
+so Keras logs `"QWK"`/`"val_QWK"`) alongside the unchanged `loss=joint_corn_loss` — QWK is a
+METRIC only, never a second loss. Verified: `tests/test_corn.py`'s
+`CORNQuadraticWeightedKappaTests` (decode equivalence with `decode_logits`, numerical agreement
+with an independent `sklearn.metrics.cohen_kappa_score` reference, batch accumulation) and
+`tests/test_joint_training.py`'s `CORNQWKJointIntegrationTests` (Keras logs actually contain
+`"QWK"`/`"val_QWK"`, `ModelCheckpoint(monitor="val_QWK", mode="max")` finds the value and only
+saves on improvement, weights-only save/load still round-trips with the metric compiled).
+
 ---
 
 ## 24. T4 strategy — locked (Step 9)
