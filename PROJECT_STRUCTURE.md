@@ -385,17 +385,52 @@ for the visual end-to-end flow.
   save/load round-trip with identical outputs.
 
 ### 8. CORN Classification
-- **Purpose:** Final ordinal DR-severity classification (CORN ordinal regression head).
-- **Input:** RACAF's fused output `F` (not Stage 7's raw `E` directly -- RACAF wraps it first).
-- **Output:** DR severity grade (0-4, ordinal) + class probabilities.
-- **Training dataset:** APTOS 2019.
-- **Dependencies:** Stage 7, RACAF.
-- **Status:** Not implemented.
+- **Purpose:** Final ordinal DR-severity classification. Established ordinal-regression
+  methodology (Shi, Cao & Raschka, 2021, arXiv:2111.08851) applied to this project's 5-grade task
+  -- not a second research innovation; RACAF remains the sole one.
+- **Full specification:** `CORN_ARCHITECTURE.md` -- the authoritative design document.
+- **Input:** RACAF's fused output `F=(B,256)` (not Stage 7's raw `E` directly -- RACAF wraps it
+  first) -- verified live against the real `racaf.build_racaf_fusion()` model. No other tensor
+  (Stage 4 masks, Stage 5/6 features, Stage 7's `E`, RACAF's reliability `r`) is consumed.
+- **Architecture:** a single `Dense(256->4)` layer applied directly to `F` -- no hidden layer, no
+  output activation, no attention/convolution. **1,028 trainable parameters** (measured exactly:
+  `256*4+4`).
+- **Ordinal outputs:** 4 raw logits `z=(z0,z1,z2,z3)`, each the logit of a *conditional*
+  probability `P(Y>k | Y>=k)` -- not 4 independent binary classifiers. Cumulative product
+  `p_cum_k = prod(i=0..k) sigmoid(z_i)` gives `P(Y>k)`, monotonically non-increasing by
+  construction.
+- **Loss:** standard CORN conditional-subset loss -- a sample contributes to task `k` iff
+  `y>=k`, with binary target `1[y>k]`; per-pair stable BCE-with-logits, summed and divided by the
+  total included-pair count (pooled across every task/example). No focal loss, class weighting,
+  label smoothing, or auxiliary penalty.
+- **Inference:** `predicted_grade = sum(k)[p_cum_k > 0.5]`, in `{0,...,4}`; per-class
+  probabilities reconstructed via finite-difference of `p_cum`, satisfying
+  `pipeline.ClassificationStage`'s existing `{"label","class_index","confidence","probabilities"}`
+  contract.
+- **Files:** `corn.py` (`build_corn_model()`, `corn_loss()`, `decode_logits()`, `CORNStage`).
+  Implements `pipeline.classification.ClassificationStage` directly -- the project's existing
+  classification-stage contract, already binding on Stage 01/Stage 08 per that ABC's own
+  docstring, not a new interface. `train()`/`evaluate()` raise `NotImplementedError`, mirroring
+  `RACAFStage`/`AdaptiveCrossAttentionStage`'s identical pattern -- no standalone training
+  objective.
+- **Training dataset:** APTOS 2019, via the authoritative committed split
+  (`dataset_splits/aptos2019_train_val_split.csv`, `downstream_split.get_authoritative_split()`)
+  -- the identical partition Stage 5/6 already use. No second split.
+- **Evaluation status:** `test.csv` unlabeled, unusable. IDRiD `grading`'s official test split
+  remains an optional external-evaluation candidate, **PENDING USER APPROVAL** -- not adopted.
+- **Novelty status:** not a research contribution -- CORN's methodology, loss, and decoding rule
+  are all established/cited. RACAF remains the project's sole research innovation.
+- **Dependencies:** Stage 7 (indirectly, via RACAF), RACAF.
+- **Status:** **Implemented and unit-tested (42 tests). Not trained, not frozen.** Verified
+  end-to-end against the real, already-implemented Stage 06/07/RACAF models (not just
+  representative tensors).
 
 > **Note on Stages 5-8:** `PROJECT_CODE.md`'s Models table and the verified Google Drive layout
 > (a single `experiments/FinalClassification/` bucket, not four separate ones) both suggest
-> Stages 5-8 are trained **jointly as one model**, not as four independently checkpointed stages.
-> Confirm this before implementing any of them independently.
+> Stages 5-8 are trained **jointly as one model**, not as four independently checkpointed stages
+> -- confirmed by each stage's own implementation: Stage 5/6/7/RACAF/CORN's `train()`/`evaluate()`
+> all raise `NotImplementedError`, each explicitly deferring to the one joint training script that
+> does not exist yet (`CORN_ARCHITECTURE.md` §9).
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

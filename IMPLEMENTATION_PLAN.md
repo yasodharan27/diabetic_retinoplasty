@@ -83,7 +83,7 @@ see `PROJECT_CODE.md`'s "Approved Research Innovation" section and `RACAF_ARCHIT
 6. Global Feature Extraction — Dual-Scale Swin Transformer
 7. Feature Fusion — Adaptive Cross-Attention — **implemented, not trained** (Global queries Local, $d_{model}=256$, output $E=(B,256)$), see `feature_fusion.py` and `PROJECT_STRUCTURE.md` §7
 8. Reliability-Aware Cross-Attention Fusion (RACAF) — the one approved research innovation; wraps Stage 7's output, does not redefine it; **implemented, not trained** (`racaf.py`), see `RACAF_ARCHITECTURE.md`
-9. Ordinal Classification — CORN
+9. Ordinal Classification — CORN — **implemented, not trained** (`Dense(256->4)` on RACAF's `F`, standard CORN conditional-subset loss, 1,028 trainable parameters), see `corn.py` and `CORN_ARCHITECTURE.md`
 10. Uncertainty Estimation — Monte Carlo Dropout
 11. Explainability — Grad-CAM++, SHAP, Attention Rollout
 12. Evaluation
@@ -104,7 +104,7 @@ Approved datasets: **EyeQ** (image quality, Stage 01 only), **APTOS 2019** (clas
 | 6 | Global Feature Extraction | Dual-Scale Swin Transformer | Implemented: `swin_transformer.py`'s `create_dual_scale_swin_model()` — two parallel Swin branches (patch 4/8, `depths=[2,2,6,2]`/`[2,2,6]`) reusing the existing `PatchEmbed`/`BasicLayer`/`PatchMerging` classes, fused by concatenation only, output `(B,64,1152)`. `create_swin_tiny_model()`/`create_hybrid_model()` untouched. Not trained (no standalone objective — see `PROJECT_STRUCTURE.md` §6). | **Implemented, not trained** |
 | 7 | Feature Fusion | Adaptive Cross-Attention | **Implemented, not trained.** `feature_fusion.py`'s `build_adaptive_cross_attention()` — one-way cross-attention, Global queries Local (`Q`=Global's 64 tokens, `K,V`=Local's 1024 tokens), `d_model=256`, 8 heads, pre-LN block + FFN (`256->1024->256`, GELU, dropout 0.1), factorized 2D positional embeddings, global-average-pooled to `E=(B,256)`. Verified against the real, already-implemented Stage 05/06 models (not just representative tensors) — see `PROJECT_STRUCTURE.md` §7 for the full specification. `feature_fusion.py` fully replaces the old baseline "fusion" (CNN → one Swin block → GlobalAveragePooling2D → Dense) reference — that baseline is not this design and was never a real implementation of this stage. | **Implemented, not trained** |
 | 8 | Reliability-Aware Cross-Attention Fusion (RACAF) | RACAF — TTA-based reliability gate wrapping Stage 7's output | **Implemented, not trained.** `racaf.py`: `tta_views()` (frozen Stage 04, 4 deterministic transforms, called directly, never via `predict_lesion_mask()`), `compute_reliability()` (population-variance disagreement, per-class `kappa`, burden-weighted scalar `r` — fully deterministic, no labels), `get_or_compute_reliability()` (new disk cache, stores only `kappa`/`r`), `build_racaf_fusion()` (the only trainable piece: `gate=σ(w_g·r+b_g)`, `Ĝ=W_r·GAP(G)+b_r`, `F=gate·E+(1-gate)·Ĝ`, exactly 295,170 trainable params, measured). Verified against the real Stage 05/06/07 models end-to-end. | **Implemented, not trained** |
-| 9 | Ordinal Classification | CORN | All classifiers use plain softmax + categorical/focal cross-entropy — nominal, not ordinal. No CORN head, no rank-consistent logits, no QWK metric in the baseline scripts (QWK is, however, already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py`). | **Missing** |
+| 9 | Ordinal Classification | CORN | **Implemented, not trained.** `corn.py`: a single `Dense(256->4)` layer on RACAF's `F`, standard CORN conditional-subset loss (`corn_loss`), sigmoid+cumulative-product decoding (`decode_logits`), 1,028 trainable parameters (measured). `pipeline.classification.ClassificationStage` implementation (`CORNStage`). QWK — already implemented and reusable in `evaluation/metrics.py` / `training/metrics.py` — is the intended ordinal evaluation metric once trained. See `CORN_ARCHITECTURE.md`. | **Implemented, not trained** |
 | 10 | Uncertainty Estimation | Monte Carlo Dropout | Fully implemented in `bayesian_inference.py`: MC sampling, mean/std, predictive entropy, uncertainty visualizations. Reliability diagram uses simulated labels (documented limitation, not a bug). Will need re-pointing at whatever model results from steps 5–9. | **Implemented** (needs integration once the classifier changes) |
 | 11 | Explainability | Grad-CAM++, SHAP, Attention Rollout | Only vanilla Grad-CAM exists (`explainable_ai.py`), hard-coded to the `swin_refine` layer name from the current hybrid model. Grad-CAM++, SHAP, and Attention Rollout are all absent. | **Partially implemented** |
 | 12 | Evaluation | — | Confusion matrix, classification report, accuracy/AUC exist per-script but are duplicated across files rather than a single evaluation module, and none compute ordinal-appropriate metrics (QWK) or real (non-simulated) calibration against the target architecture's models. | **Partially implemented** |
@@ -266,9 +266,25 @@ of every already-referenced roadmap step — Step 8 below corresponds to Stage 9
 Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 
 ### Step 8 — Ordinal Classification (CORN)
+- **Status: Implemented, unit-tested (42 tests). Not trained. Not frozen.** `corn.py` implements
+  exactly `CORN_ARCHITECTURE.md`'s formulation: `build_corn_model()` (`Dense(256->4)`, no hidden
+  layer, no output activation, uncompiled, 1,028 trainable parameters measured exactly),
+  `corn_loss()` (standard conditional-subset ordinal loss — no focal loss, class weighting, label
+  smoothing, or Dice loss added), `decode_logits()` (sigmoid -> cumulative product -> thresholded
+  grade -> per-class probability reconstruction), and `CORNStage`
+  (`pipeline.classification.ClassificationStage`, `train()`/`evaluate()` raise
+  `NotImplementedError`, mirroring `RACAFStage`'s identical pattern).
 - **Why:** Replaces the current nominal softmax heads with a rank-consistent ordinal head appropriate for DR severity grading.
-- **New files:** `ordinal_classifier.py` (CORN head + CORN loss + rank-to-class decoding), and an end-to-end training script wiring Preprocessing → Vessel/Lesion → Local → Global → Fusion → CORN together.
-- **Colab notebook:** yes — the main end-to-end training notebook.
+- **Input:** RACAF's `F=(B,256)` only — verified live against the real, current `racaf.py`. No
+  Stage 4 mask, Stage 5/6 feature, Stage 7 raw `E`, or RACAF reliability vector `r` is consumed.
+- **Dataset/split:** APTOS2019 only, via the already-committed authoritative manifest
+  (`dataset_splits/aptos2019_train_val_split.csv`, `downstream_split.get_authoritative_split()`) —
+  no second split created; the identical partition Stage 5/6 already use.
+- **New files:** `corn.py` (CORN head + CORN loss + rank-to-class decoding). The end-to-end
+  training script wiring Stage 05 -> Stage 06 -> Stage 07 -> RACAF -> CORN together does not exist
+  yet — not implemented in this step, per the explicit no-training instruction for this stage.
+- **Colab notebook:** not yet — the main end-to-end training notebook is future work, alongside the
+  joint training script above.
 
 ### Step 9 — Uncertainty Estimation (Monte Carlo Dropout) — integration only
 - **Why:** Already implemented and correct in `bayesian_inference.py`; this step re-points it at the new model.
@@ -295,23 +311,26 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 Stages 1–4 are complete. Stage 4 (Lesion Segmentation) is finalized as Experiment 2C and is now
 **frozen** — no further training, loss, or architecture changes to it, and no Experiment 2D is
 planned. Stage 5 (Local Feature Extraction), Stage 6 (Global Feature Extraction), Stage 7 (Feature
-Fusion / Adaptive Cross-Attention), and **RACAF** are all now **implemented and unit-tested, but
-not trained and not frozen** — none has a standalone training objective; all four await the joint
-Stage 05–08 + RACAF training script. RACAF's implementation (`racaf.py`) follows exactly the
-approved, audited design (`RACAF_ARCHITECTURE.md`): frozen-Stage-04 TTA disagreement, population
-variance, burden-weighted scalar reliability `r`, and a 295,170-parameter gate + Global-readout
-fusion model, verified against the real Stage 05/06/07 models end-to-end. The downstream dataset
-infrastructure CORN's own training will need — one authoritative, stratified APTOS2019 train/val
-split (`downstream_split.py`) shared by Stages 05/06 today and by Stage 07/RACAF/CORN's eventual
-joint training, plus Drive path resolution for APTOS2019/IDRiD (previously wired only for EyeQ) —
-is now in place (see "Step 5/6 infrastructure update" above); no training was run, no checkpoint
-was produced. Per the "one module at a time, wait for approval" rule, the next implementation
-target is **CORN (Stage 08, Ordinal Classification)**, with explicit approval requested before
-writing code.
+Fusion / Adaptive Cross-Attention), **RACAF**, and **CORN (Stage 08)** are all now **implemented
+and unit-tested, but not trained and not frozen** — none has a standalone training objective; all
+five await the joint Stage 05–08 + RACAF training script (still not implemented). RACAF's
+implementation (`racaf.py`) follows exactly the approved, audited design
+(`RACAF_ARCHITECTURE.md`): frozen-Stage-04 TTA disagreement, population variance, burden-weighted
+scalar reliability `r`, and a 295,170-parameter gate + Global-readout fusion model. CORN's
+implementation (`corn.py`) follows exactly the approved design (`CORN_ARCHITECTURE.md`): a
+1,028-parameter `Dense(256->4)` head on RACAF's `F`, the standard CORN conditional-subset loss and
+sigmoid/cumulative-product decoding — no second research innovation. Both verified against the
+real Stage 05/06/07 models end-to-end. The downstream dataset infrastructure this joint training
+will need — one authoritative, stratified APTOS2019 train/val split (`downstream_split.py`) shared
+by every stage from Stage 5 through CORN, plus Drive path resolution for APTOS2019/IDRiD — is in
+place. No training was run at any point in this pipeline; no checkpoint exists. Per the "one
+module at a time, wait for approval" rule, the next implementation target is the **joint Stage
+05–08 + RACAF training script** itself, with explicit approval requested before writing code.
 
 RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
 Research Innovation" section); no second, competing innovation should be introduced without a
-deliberate revision of that decision — Stage 7's cross-attention mechanism, and every individual
-technique RACAF itself uses (TTA, predictive variance, sigmoid gating, linear projection), remain
-established/literature-derived engineering, not research contributions in their own right; only
-RACAF's specific integration of them is.
+deliberate revision of that decision — Stage 7's cross-attention mechanism, every individual
+technique RACAF itself uses (TTA, predictive variance, sigmoid gating, linear projection), and
+CORN's ordinal-regression methodology (Shi, Cao & Raschka, 2021) all remain established/
+literature-derived engineering, not research contributions in their own right; only RACAF's
+specific integration of them is.

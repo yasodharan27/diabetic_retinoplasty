@@ -145,6 +145,18 @@ class RACAFPaths:
 
 
 @dataclass(frozen=True)
+class CORNPaths:
+    """CORN Ordinal Classification (Stage 08) model and results paths.
+    Mirrors `RACAFPaths`/`FeatureFusionPaths` exactly -- CORN has no frozen
+    upstream inference of its own to cache (its only input is RACAF's
+    already-computed `F`), so `results_dir` exists only for parity with the
+    per-stage model_dir/results_dir convention every other trainable stage
+    in this project already uses."""
+    model_dir: str
+    results_dir: str
+
+
+@dataclass(frozen=True)
 class EyeQPaths:
     """Image Quality Assessment (EyeQ) dataset, model, and results paths.
 
@@ -224,6 +236,11 @@ RACAF = RACAFPaths(
     results_dir=os.environ.get('RACAF_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'racaf'),
 )
 
+CORN = CORNPaths(
+    model_dir=os.environ.get('CORN_MODEL_DIR') or os.path.join(_REPO_ROOT, 'models', 'corn'),
+    results_dir=os.environ.get('CORN_RESULTS_DIR') or os.path.join(_REPO_ROOT, 'results', 'corn'),
+)
+
 # --- Flat, backward-compatible names ---
 # Match the exact variable names every script previously assigned via
 # `os.environ.get(...)`, so existing code can switch to `from config import X`
@@ -265,6 +282,9 @@ FEATURE_FUSION_RESULTS_DIR = FEATURE_FUSION.results_dir
 
 RACAF_MODEL_DIR = RACAF.model_dir
 RACAF_RESULTS_DIR = RACAF.results_dir
+
+CORN_MODEL_DIR = CORN.model_dir
+CORN_RESULTS_DIR = CORN.results_dir
 
 
 # --- Generic per-dataset path helpers (Step 2 preprocessing: EyePACS, APTOS2019, ...) ---
