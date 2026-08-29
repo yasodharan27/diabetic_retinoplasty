@@ -68,10 +68,10 @@ notebook" below before writing training code into one of them.
 | `stage02_preprocessing.ipynb` | 2. Image Preprocessing | Template -- **Ready to Begin.** `image_preprocessing.py` (repository root) already implements the transforms this stage needs -- not yet orchestrated here. |
 | `stage03_vessel_segmentation.ipynb` | 3. Vessel Segmentation | Template. Integrates a pretrained LWNet checkpoint for inference only -- see `SEGMENTATION_ARCHITECTURE.md`. Does **not** follow `stage01_iqa.ipynb`'s Dataset Staging -> Training -> Evaluation lifecycle: no dataset to stage, no training loop, no `experiment_manager.py` training run. Scoped to Setup -> Verification -> Checkpoint Integration -> Inference Verification -> Export. |
 | `stage04_lesion_segmentation.ipynb` | 4. Lesion Segmentation | Template. Trains an Attention U-Net on IDRiD -- see `SEGMENTATION_ARCHITECTURE.md`. |
-| `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. Likely trained jointly with Stages 6-8 -- confirm before implementing independently. |
-| `stage06_global_feature_extraction.ipynb` | 6. Global Feature Extraction | Template. Likely trained jointly with Stages 5, 7, 8. |
-| `stage07_feature_fusion.ipynb` | 7. Feature Fusion | Template. Likely trained jointly with Stages 5, 6, 8. |
-| `stage08_corn_classifier.ipynb` | 8. CORN Classification | Template. Very likely the actual trainable checkpoint boundary for Stages 5-8 combined -- see `colab_config.DRIVE.experiment_dir("FinalClassification")`. |
+| `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. **Locked:** trained jointly with Stages 6-8 + RACAF, not independently -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
+| `stage06_global_feature_extraction.ipynb` | 6. Global Feature Extraction | Template. **Locked:** trained jointly with Stages 5, 7, 8 + RACAF -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
+| `stage07_feature_fusion.ipynb` | 7. Feature Fusion | Template. **Locked:** trained jointly with Stages 5, 6, 8 + RACAF -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
+| `stage08_corn_classifier.ipynb` | 8. CORN Classification | Template. **Locked: repurposed as the joint Stage 05-08+RACAF training notebook** (CORN has no standalone training path of its own) -- see `JOINT_TRAINING_ARCHITECTURE.md` §27. Checkpoint boundary: `colab_config.DRIVE.experiment_dir("FinalClassification")`. No second, competing joint-training notebook exists or should be created. |
 | `stage09_uncertainty_estimation.ipynb` | 9. Uncertainty Estimation | Template. Inference-only against the Stage 8 model -- no new training run. |
 | `stage10_explainability.ipynb` | 10. Explainability | Template. Inference-only against the Stage 8 model -- no new training run. |
 | `stage11_evaluation.ipynb` | 11. Evaluation | Template. Runs after every upstream stage is trained -- never fill this in with placeholder numbers. |

@@ -347,24 +347,55 @@ class BuildSampleAndCacheTests(unittest.TestCase):
             "img_01", 2, self.tree.image_dir, self.tree.cache_dir,
             self.vessel_model, self.lesion_model, image_size=(64, 64),
         )
-        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel")
-        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion")
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", (64, 64))
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion", (64, 64))
         self.assertTrue(os.path.exists(vessel_cache))
         self.assertTrue(os.path.exists(lesion_cache))
 
-    def test_cache_values_are_unaltered_from_a_direct_prediction(self):
-        """Caching must never alter numerical values."""
+    def test_cache_path_is_keyed_by_image_size(self):
+        """A cache built for one canonical resolution must never collide
+        with (or be silently reused for) a different one -- the cached
+        bytes themselves now depend on image_size (Step 3 fix)."""
+        path_512 = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", (512, 512))
+        path_64 = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", (64, 64))
+        self.assertNotEqual(path_512, path_64)
+
+    def test_cache_stores_canonical_resolution_not_native_resolution(self):
+        """The on-disk cache must store the resized-down, canonical
+        (image_size) array, not the native-image-resolution prediction --
+        the actual storage/CPU fix this Step 3 correction makes."""
+        image_size = (64, 64)
         lfed._build_sample(
             "img_01", 2, self.tree.image_dir, self.tree.cache_dir,
-            self.vessel_model, self.lesion_model, image_size=(64, 64),
+            self.vessel_model, self.lesion_model, image_size=image_size,
         )
-        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel")
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", image_size)
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion", image_size)
+        cached_vessel_map = np.load(vessel_cache)
+        cached_lesion_maps = np.load(lesion_cache)
+
+        self.assertEqual(cached_vessel_map.shape[:2], image_size)
+        self.assertEqual(cached_lesion_maps.shape, (*image_size, 4))
+
+    def test_cache_values_match_a_resized_direct_prediction(self):
+        """Caching must never alter values BEYOND the documented, intentional
+        canonical resize (Step 3) -- the cached array must equal a direct
+        Stage 03 prediction resized the same way, not the raw native-
+        resolution prediction (that older invariant no longer holds by
+        design)."""
+        image_size = (64, 64)
+        lfed._build_sample(
+            "img_01", 2, self.tree.image_dir, self.tree.cache_dir,
+            self.vessel_model, self.lesion_model, image_size=image_size,
+        )
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", image_size)
         cached_vessel_map = np.load(vessel_cache)
 
         raw_bgr = lfed._load_raw_bgr(self.tree.image_dir, "img_01")
         rgb = lfed._stage02_processed_rgb(raw_bgr)
         direct_result = lfed.predict_vessel_mask(rgb, model=self.vessel_model)
-        np.testing.assert_array_equal(cached_vessel_map, direct_result["probability_map"].astype(np.float32))
+        expected = lfed._resize_map(direct_result["probability_map"].astype(np.float32), image_size)
+        np.testing.assert_array_equal(cached_vessel_map, expected)
 
 
 class TfDataPipelineTests(unittest.TestCase):

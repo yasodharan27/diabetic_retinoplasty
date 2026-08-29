@@ -12,6 +12,8 @@ Every other `colab/common/` module, and every notebook, should import paths
 from here rather than hardcoding them.
 """
 
+import posixpath
+
 import drive_paths
 
 # --- Repository (Colab VM local disk; ephemeral, code only) ---
@@ -73,3 +75,40 @@ IQA_EXPORTED_MODELS_DIR = DRIVE.exported_model_dir(IQA_MODULE_NAME)
 # load_eyeq_datasets() always splits with this fraction; recorded here only
 # so verify_dataset.py can report the *expected* split sizes ahead of time.
 EYEQ_VAL_SPLIT = 0.15
+
+# --- Frozen Stage 1/3/4 checkpoint locations (Drive) ---
+# config.py's IQA_MODEL_DIR / VESSEL_SEG_MODEL_DIR / LESION_SEG_MODEL_DIR
+# each default to a path inside the LOCAL repository checkout when their
+# matching env var is unset -- correct for local development, but wrong
+# inside a fresh Colab session, where that checkout is the just-cloned,
+# ephemeral VM copy that never contains these already-trained checkpoints.
+# These resolve the SAME already-existing, already-verified Drive paths
+# `exported_models/<Module>/` (via drive_paths.PIPELINE_MODULES) already
+# uses for Stage 1's checkpoint -- extended here to also cover Stage 3/4,
+# which were not previously wired into any Colab-facing constant at all.
+IQA_MODEL_DIR = IQA_EXPORTED_MODELS_DIR
+VESSEL_SEG_MODEL_DIR = DRIVE.exported_model_dir("VesselSegmentation")
+LESION_SEG_MODEL_DIR = DRIVE.exported_model_dir("LesionSegmentation")
+
+# --- Persistent, per-image derived caches (Stage 03/04 predictions, RACAF
+# reliability) for the joint Stage 05-08+RACAF training design -- see
+# drive_paths.py's docstring for why these live under a new `cache/` Drive
+# root rather than `experiments/` (per-run, would defeat cross-run reuse)
+# or `exported_models/` (final trained weights, not a derived cache). ---
+LOCAL_FEATURE_CACHE_DIR = DRIVE.cache_dir("LocalFeatureExtraction")
+RACAF_CACHE_DIR = DRIVE.cache_dir("RACAF")
+
+# --- Stage 05-08 + RACAF joint training ("FinalClassification") ---
+# These five stages train jointly, as ONE model, under the already-reserved
+# "FinalClassification" PIPELINE_MODULES entry (PROJECT_STRUCTURE.md's own
+# note: "a single experiments/FinalClassification/ bucket, not four
+# separate ones") -- so each stage's own exported best_model is nested
+# under that single reserved directory, rather than adding five new
+# PIPELINE_MODULES entries for stages with no independent checkpoint of
+# their own.
+FINAL_CLASSIFICATION_EXPORTED_DIR = DRIVE.exported_model_dir("FinalClassification")
+LOCAL_FEATURE_MODEL_DIR = posixpath.join(FINAL_CLASSIFICATION_EXPORTED_DIR, "local_feature_extraction")
+GLOBAL_FEATURE_MODEL_DIR = posixpath.join(FINAL_CLASSIFICATION_EXPORTED_DIR, "global_feature_extraction")
+FEATURE_FUSION_MODEL_DIR = posixpath.join(FINAL_CLASSIFICATION_EXPORTED_DIR, "feature_fusion")
+RACAF_MODEL_DIR = posixpath.join(FINAL_CLASSIFICATION_EXPORTED_DIR, "racaf")
+CORN_MODEL_DIR = posixpath.join(FINAL_CLASSIFICATION_EXPORTED_DIR, "corn")

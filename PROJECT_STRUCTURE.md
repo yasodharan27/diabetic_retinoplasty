@@ -70,7 +70,7 @@ fill in.
 
 | Dataset | Purpose | Current Usage | Future Usage |
 |---|---|---|---|
-| **EyeQ** | Image quality classification (`Good`/`Usable`/`Reject`) | **Active** -- trains and evaluates Stage 1 (Image Quality Assessment) today, via `image_quality_dataset.py` / `train_image_quality.py` / `colab/notebooks/stage01_iqa.ipynb`. | Continues to gate every later stage: only `Good`/`Usable` images should reach Stage 2 preprocessing. Used only for Stage 1. |
+| **EyeQ** | Image quality classification (`Good`/`Usable`/`Reject`) | **Active** -- trains and evaluates Stage 1 (Image Quality Assessment) today, via `image_quality_dataset.py` / `train_image_quality.py` / `colab/notebooks/stage01_iqa.ipynb`. | Used only for Stage 1 training/evaluation. Stage 1's quality gate applies to EyeQ only, per the Dataset Flow diagram below -- it is **not** currently applied to APTOS2019 or IDRiD, and does NOT gate the Stage 05-08+RACAF joint training run (`JOINT_TRAINING_ARCHITECTURE.md` §3.1, locked). |
 | **APTOS2019** | Diabetic retinopathy severity classification (5 classes, 0-4) | Trains Stage 5/Stage 6 today; referenced by the pre-refactor baseline scripts (`efficientnet_model.py`, `swin_transformer.py`, `train_hybrid_model.py`) at the repository root. `raw/train.csv` (3662 labeled images) is the only labeled split -- `raw/test.csv` (1928 images) has no `diagnosis` column and cannot support supervised training/evaluation. | Primary training set for Stage 8 (CORN Classification) once the target architecture's classification head is implemented. |
 | **IDRiD** | Not a flat dataset -- three named subsets on disk, each with its own `raw/`/`processed/` pair: `grading/` (Disease Grading, 413 train + 103 test images, `Retinopathy grade` 0-4 -- same scale as APTOS), `localization/`, `segmentation/` (54 train + 27 test, pixel-level lesion masks). | `segmentation/` only: trains Stage 4 (Lesion Segmentation, Attention U-Net), via `config.dataset_raw_dir("IDRiD/segmentation")`. `grading/` and `localization/` are present on disk but read by no implemented stage. | `grading/`'s 103-image official test split is an **optional external evaluation candidate** for CORN (Stage 8) -- **not yet adopted; PENDING USER APPROVAL** (see "Authoritative Downstream Classification Split" below). Not a fourth dataset -- it is part of IDRiD, the same dataset Stage 4 already uses. |
 
@@ -430,7 +430,10 @@ for the visual end-to-end flow.
 > Stages 5-8 are trained **jointly as one model**, not as four independently checkpointed stages
 > -- confirmed by each stage's own implementation: Stage 5/6/7/RACAF/CORN's `train()`/`evaluate()`
 > all raise `NotImplementedError`, each explicitly deferring to the one joint training script that
-> does not exist yet (`CORN_ARCHITECTURE.md` §9).
+> does not exist yet (`CORN_ARCHITECTURE.md` §9). The full joint-training design -- dataset flow,
+> caching, gradient boundary, loss, checkpoint format, and the Drive/notebook infrastructure it
+> depends on -- is now resolved in `JOINT_TRAINING_ARCHITECTURE.md`; the joint training script
+> itself still does not exist.
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.
@@ -534,6 +537,7 @@ the resulting model/evaluation artifacts are reviewed locally before being commi
 | Prediction samples | *(module-specific, not centrally defined for CLI runs)* | `experiments/<Module>/<timestamp>/predictions/` (Drive) |
 | Run metadata | *(not tracked for CLI runs)* | `experiments/<Module>/<timestamp>/metadata.json` (Drive) |
 | Session/setup logs | N/A | `logs/setup_<timestamp>.json` (Drive, global) |
+| Persistent, per-image derived caches (Stage 03/04 predictions, RACAF reliability) | `results/<module>/` (local) | `cache/<module>/` (Drive, global -- NOT per-experiment/timestamped, since these must be reused across every training run and resumed session; see `JOINT_TRAINING_ARCHITECTURE.md` §7.1) |
 
 Vessel Segmentation (`models/vessel_segmentation/`) is a special case in this table: it has no `training_run/` and no `results/` directory, since nothing about it is trained or evaluated within this project — only the vendored checkpoint itself lands there.
 

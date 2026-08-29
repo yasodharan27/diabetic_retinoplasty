@@ -283,8 +283,9 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 - **New files:** `corn.py` (CORN head + CORN loss + rank-to-class decoding). The end-to-end
   training script wiring Stage 05 -> Stage 06 -> Stage 07 -> RACAF -> CORN together does not exist
   yet — not implemented in this step, per the explicit no-training instruction for this stage.
-- **Colab notebook:** not yet — the main end-to-end training notebook is future work, alongside the
-  joint training script above.
+- **Colab notebook:** not yet implemented. Its role is now locked: `colab/notebooks/stage08_corn_classifier.ipynb`
+  is repurposed as the joint Stage 05-08+RACAF training notebook (no second, competing notebook) —
+  see `JOINT_TRAINING_ARCHITECTURE.md` §27.
 
 ### Step 9 — Uncertainty Estimation (Monte Carlo Dropout) — integration only
 - **Why:** Already implemented and correct in `bayesian_inference.py`; this step re-points it at the new model.
@@ -322,10 +323,15 @@ implementation (`corn.py`) follows exactly the approved design (`CORN_ARCHITECTU
 sigmoid/cumulative-product decoding — no second research innovation. Both verified against the
 real Stage 05/06/07 models end-to-end. The downstream dataset infrastructure this joint training
 will need — one authoritative, stratified APTOS2019 train/val split (`downstream_split.py`) shared
-by every stage from Stage 5 through CORN, plus Drive path resolution for APTOS2019/IDRiD — is in
-place. No training was run at any point in this pipeline; no checkpoint exists. Per the "one
+by every stage from Stage 5 through CORN, plus Drive path resolution for APTOS2019/IDRiD/the frozen
+Stage 1/3/4 checkpoints/the persistent Stage 03-04/RACAF caches, plus a canonical-resolution
+(rather than native-image-resolution) Stage 03/04 prediction cache — is in place; see
+`JOINT_TRAINING_ARCHITECTURE.md` for the full design (dataset flow, caching, gradient boundary,
+loss, checkpoint format, QWK-based model selection, T4 starting configuration, and the notebook
+role). No training was run at any point in this pipeline; no checkpoint exists. Per the "one
 module at a time, wait for approval" rule, the next implementation target is the **joint Stage
-05–08 + RACAF training script** itself, with explicit approval requested before writing code.
+05–08 + RACAF training script itself** (the joint model builder, the joint dataset loader, and the
+training loop) — the design is resolved, but none of it is implemented yet.
 
 RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
 Research Innovation" section); no second, competing innovation should be introduced without a

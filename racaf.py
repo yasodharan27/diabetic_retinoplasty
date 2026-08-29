@@ -28,7 +28,7 @@ modularity requirement (do not hide the mechanism inside one function):
    `r`. Never reads a label, a Dice/IoU score, or any other test-set
    statistic -- its only inputs are Stage 04's own frozen predictions.
 3. A per-image disk cache (`get_or_compute_reliability`) -- mirrors
-   `local_feature_extraction_dataset.py`'s `_get_or_compute_lesion_maps`
+   `local_feature_extraction_dataset.py`'s `_get_or_compute_stage3_stage4_maps`
    pattern exactly, but is a NEW cache (that existing one only covers a
    single, non-TTA prediction already used by Stage 05) storing only the
    small derived `kappa`/`r` values, not the four raw probability maps.
@@ -272,7 +272,7 @@ def get_or_compute_reliability(prepared_input, cache_path, stage4_model):
     """Returns `(kappa, r)` for one image (`kappa`: `(4,)`, `r`: scalar
     float), from `cache_path` if already computed, otherwise via
     `compute_image_reliability` -- cached to disk afterward. Mirrors
-    `local_feature_extraction_dataset.py`'s `_get_or_compute_lesion_maps`
+    `local_feature_extraction_dataset.py`'s `_get_or_compute_stage3_stage4_maps`
     cache-then-reuse pattern, but is a NEW cache: the existing one only
     stores the single, non-TTA prediction Stage 05 already consumes and
     is unrelated to and unaffected by RACAF. Stores only the small derived

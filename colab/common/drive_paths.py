@@ -21,7 +21,24 @@ Verified layout (do not assume any folder beyond this exists):
         |   +-- FinalClassification/
         +-- tensorboard/
         +-- exported_models/
+        +-- cache/
         +-- logs/
+
+`cache/` is a minimal, additive extension of this same verified layout (added
+for the Stage 05-08+RACAF joint-training design; see `JOINT_TRAINING_ARCHITECTURE.md`),
+not a redesign of it -- it holds the same *category* of content
+`experiments/`/`tensorboard/`/`exported_models/`/`logs/` already hold ("pipeline
+outputs... safe to create automatically", see below), just for a kind of
+output none of those four buckets fit: small, derived, per-image arrays
+(frozen Stage 03/04 predictions, RACAF's reliability signal) that must be
+reused ACROSS every training run and resumed Colab session -- not scoped to
+one timestamped `experiments/<module>/<run>/` folder (which would defeat
+reuse across runs), and not a final trained-weight artifact
+(`exported_models/`). Locally, this same content already lives under
+`results/<module>/` (`config.py`'s `LOCAL_FEATURE_RESULTS_DIR`,
+`RACAF_RESULTS_DIR`); Drive's verified layout has no equivalent top-level
+bucket, so one is added here, following the exact same per-module dict
+pattern `experiment_dirs`/`exported_model_dirs` already use.
 
 `datasets/` holds real, irreplaceable, already-uploaded data -- nothing in
 this module ever creates or writes into it (see `DATASET_DIRS` vs.
@@ -66,6 +83,16 @@ DRIVE_PROJECT_FOLDER_NAME = "DiabeticRetinopathy"
 
 PIPELINE_MODULES = ("IQA", "VesselSegmentation", "LesionSegmentation", "FinalClassification")
 
+# Persistent, per-image derived caches (Step 3/Step 4 of the joint-training
+# infrastructure correction) -- keyed separately from PIPELINE_MODULES,
+# which enumerates independently *trained/checkpointed* modules. Neither
+# cache belongs to an independently-trained module: "LocalFeatureExtraction"
+# caches Stage 03/04's frozen output (consumed by Stage 05, which trains
+# only as part of "FinalClassification"), and "RACAF" caches its own
+# reliability signal (kappa/r) -- both are derived, regenerable artifacts,
+# not trained weights.
+CACHE_MODULES = ("LocalFeatureExtraction", "RACAF")
+
 
 @dataclass(frozen=True)
 class DrivePaths:
@@ -102,10 +129,12 @@ class DrivePaths:
     experiments_root: str
     experiment_dirs: dict  # module name -> experiments_root/<module>
 
-    # tensorboard/, exported_models/<module>/, logs/ -- other outputs
+    # tensorboard/, exported_models/<module>/, cache/<module>/, logs/ -- other outputs
     tensorboard_root: str
     exported_models_root: str
     exported_model_dirs: dict  # module name -> exported_models_root/<module>
+    cache_root: str
+    cache_dirs: dict  # module name -> cache_root/<module>, see CACHE_MODULES
     logs_root: str
 
     def experiment_dir(self, module):
@@ -120,6 +149,12 @@ class DrivePaths:
         except KeyError:
             raise ValueError(f"Unknown pipeline module {module!r}; expected one of {PIPELINE_MODULES}") from None
 
+    def cache_dir(self, module):
+        try:
+            return self.cache_dirs[module]
+        except KeyError:
+            raise ValueError(f"Unknown cache module {module!r}; expected one of {CACHE_MODULES}") from None
+
 
 def build_drive_paths(drive_mount_point="/content/drive"):
     """Resolve every path in the verified Drive layout from a mount point.
@@ -133,6 +168,7 @@ def build_drive_paths(drive_mount_point="/content/drive"):
     datasets_root = posixpath.join(project_root, "datasets")
     experiments_root = posixpath.join(project_root, "experiments")
     exported_models_root = posixpath.join(project_root, "exported_models")
+    cache_root = posixpath.join(project_root, "cache")
 
     eyeq_dataset_dir = posixpath.join(datasets_root, "EyeQ")
     aptos2019_dataset_dir = posixpath.join(datasets_root, "APTOS2019")
@@ -163,6 +199,8 @@ def build_drive_paths(drive_mount_point="/content/drive"):
         tensorboard_root=posixpath.join(project_root, "tensorboard"),
         exported_models_root=exported_models_root,
         exported_model_dirs={m: posixpath.join(exported_models_root, m) for m in PIPELINE_MODULES},
+        cache_root=cache_root,
+        cache_dirs={m: posixpath.join(cache_root, m) for m in CACHE_MODULES},
         logs_root=posixpath.join(project_root, "logs"),
     )
 
@@ -176,6 +214,8 @@ def output_directories(paths: DrivePaths):
         paths.tensorboard_root,
         paths.exported_models_root,
         *paths.exported_model_dirs.values(),
+        paths.cache_root,
+        *paths.cache_dirs.values(),
         paths.logs_root,
     ]
 

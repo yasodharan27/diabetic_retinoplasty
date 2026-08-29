@@ -88,9 +88,27 @@ def configure_environment_variables():
     locally: `datasets/IDRiD/` contains only the three subset folders), so
     no `IDRID_RAW_DIR`/`IDRID_PROCESSED_DIR` is fabricated here.
 
-    Training/evaluation output paths are intentionally *not* set here -- the
-    notebook passes the current experiment's Drive paths explicitly to
-    `train_image_quality.train()` / `evaluate_image_quality.evaluate()`
+    This also wires the frozen Stage 1/3/4 CHECKPOINT paths, and the
+    persistent Stage 05/RACAF derived-cache and Stage 05-08+RACAF exported-model
+    paths -- a gap found auditing the joint-training design: previously only
+    dataset directories were set here, so `image_quality_inference.load_iqa_model()`
+    / `vessel_segmentation_inference.load_vessel_model()` /
+    `lesion_segmentation_model.load_lesion_model()`'s own `DEFAULT_MODEL_PATH`s
+    (each `config.py`-resolved) would fall back to a path inside the just-cloned,
+    ephemeral Colab VM checkout -- which never contains these already-trained
+    checkpoints -- in a fresh Colab session, exactly the same class of gap this
+    function already fixed for datasets. `LOCAL_FEATURE_RESULTS_DIR`/
+    `RACAF_RESULTS_DIR` are the two per-image derived-prediction caches that
+    must persist across resumed Colab sessions (`config.py`'s
+    `LOCAL_FEATURE_EXTRACTION`/`RACAF` dataclasses); `GLOBAL_FEATURE_RESULTS_DIR`/
+    `FEATURE_FUSION_RESULTS_DIR`/`CORN_RESULTS_DIR` are intentionally NOT wired
+    here -- per their own `config.py` docstrings, none of those three stages
+    has any frozen-upstream inference of its own to cache, so nothing is ever
+    written there.
+
+    Training/evaluation output paths otherwise are intentionally *not* set
+    here -- the notebook passes the current experiment's Drive paths
+    explicitly to `train_image_quality.train()` / `evaluate_image_quality.evaluate()`
     instead (see `experiment_manager.py`), which every one of those
     functions already accepts as an argument."""
     env_vars = {
@@ -104,6 +122,23 @@ def configure_environment_variables():
         "IDRID/LOCALIZATION_PROCESSED_DIR": colab_config.IDRID_LOCALIZATION_PROCESSED_DIR,
         "IDRID/SEGMENTATION_RAW_DIR": colab_config.IDRID_SEGMENTATION_RAW_DIR,
         "IDRID/SEGMENTATION_PROCESSED_DIR": colab_config.IDRID_SEGMENTATION_PROCESSED_DIR,
+        # Frozen Stage 1/3/4 checkpoints (existing artifacts -- never
+        # retrained, never written to by this project).
+        "IQA_MODEL_DIR": colab_config.IQA_MODEL_DIR,
+        "VESSEL_SEG_MODEL_DIR": colab_config.VESSEL_SEG_MODEL_DIR,
+        "LESION_SEG_MODEL_DIR": colab_config.LESION_SEG_MODEL_DIR,
+        # Persistent, per-image derived caches (Stage 03/04 predictions,
+        # RACAF reliability) -- must survive a Colab VM restart.
+        "LOCAL_FEATURE_RESULTS_DIR": colab_config.LOCAL_FEATURE_CACHE_DIR,
+        "RACAF_RESULTS_DIR": colab_config.RACAF_CACHE_DIR,
+        # Stage 05-08 + RACAF joint ("FinalClassification") exported models --
+        # each stage's own save()/load() keeps working independently once the
+        # joint checkpoint is sliced back out per stage.
+        "LOCAL_FEATURE_MODEL_DIR": colab_config.LOCAL_FEATURE_MODEL_DIR,
+        "GLOBAL_FEATURE_MODEL_DIR": colab_config.GLOBAL_FEATURE_MODEL_DIR,
+        "FEATURE_FUSION_MODEL_DIR": colab_config.FEATURE_FUSION_MODEL_DIR,
+        "RACAF_MODEL_DIR": colab_config.RACAF_MODEL_DIR,
+        "CORN_MODEL_DIR": colab_config.CORN_MODEL_DIR,
     }
     os.environ.update(env_vars)
     return env_vars

@@ -51,11 +51,18 @@ begin with.
 
 Stage 03/04 inference is expensive (a full LWNet + Attention U-Net
 forward pass per image) but deterministic per image, so each is computed
-once and cached to disk as a `.npy` file under `cache_dir` -- mirroring
-`lesion_segmentation_dataset.py`'s `_get_or_compute_vessel_map` pattern
-exactly, extended here to also cache Stage 04's lesion probability maps.
-Caching only ever stores an already-computed derived array unchanged; it
-never alters a numerical value, and never touches `datasets/*/raw`.
+once and cached to disk as a `.npy` file under `cache_dir`, via
+`_get_or_compute_stage3_stage4_maps` -- both maps are cached together
+because Stage 04's own inference needs the vessel map at Stage 03's native
+resolution. Stage 3/4's OWN inference (FOV detection, working resolution,
+thresholds) is unmodified; only their already-computed output is resized
+down to `image_size` (the canonical downstream resolution -- matching
+Stage 04's own native working resolution, `DEFAULT_IMAGE_SIZE`) before
+being written to disk, so the cache never stores a native-image-resolution
+array (previously several MB-to-tens-of-MB per image at APTOS2019's
+typical resolution; canonical resolution is a small, fixed size instead).
+Caching never touches `datasets/*/raw`, and the cached, canonical-resolution
+value is otherwise never altered once written.
 """
 
 import csv
@@ -190,8 +197,14 @@ def _stage02_processed_rgb(raw_bgr_image):
     return cv2.cvtColor(processed_bgr, cv2.COLOR_BGR2RGB)
 
 
-def _cache_path(cache_dir, id_code, kind):
-    return os.path.join(cache_dir, f"APTOS_{id_code}_{kind}.npy")
+def _cache_path(cache_dir, id_code, kind, image_size):
+    """Cache filename includes `image_size` so a cache built for one
+    canonical resolution can never be silently reused for another --
+    load-bearing since (unlike before this cache stored the resize-down
+    result, not the native-resolution prediction) the cached bytes
+    themselves now depend on `image_size` (see `_get_or_compute_stage3_stage4_maps`)."""
+    height, width = image_size
+    return os.path.join(cache_dir, f"APTOS_{id_code}_{kind}_{height}x{width}.npy")
 
 
 def _resolve_processed_rgb(raw_bgr_image, processed_dir, id_code):
@@ -217,39 +230,96 @@ def _resolve_processed_rgb(raw_bgr_image, processed_dir, id_code):
     return _stage02_processed_rgb(raw_bgr_image)
 
 
-def _get_or_compute_vessel_map(rgb_image, cache_path, vessel_model):
-    """Returns the `(H, W, 1)` float32 Stage 03 vessel probability map for
-    `rgb_image`, from `cache_path` if already computed, otherwise via
-    Stage 03's unmodified `predict_vessel_mask()` -- cached to disk
-    afterward. Mirrors `lesion_segmentation_dataset._get_or_compute_vessel_map`
-    exactly (same cache-then-reuse behavior, same never-recompute-if-cached
-    guarantee), just keyed by an APTOS id instead of an IDRiD one."""
-    if os.path.exists(cache_path):
-        return np.load(cache_path)
-    result = predict_vessel_mask(rgb_image, model=vessel_model)
-    vessel_map = result["probability_map"].astype(np.float32)
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    np.save(cache_path, vessel_map)
-    return vessel_map
-
-
-def _get_or_compute_lesion_maps(rgb_image, vessel_map, cache_path, lesion_model, vessel_model):
-    """Returns the `(H, W, 4)` float32 Stage 04 lesion probability maps for
-    `rgb_image`, from `cache_path` if already computed, otherwise via Stage
-    04's unmodified `predict_lesion_mask()` (frozen Experiment 2C) -- cached
-    to disk afterward. `vessel_map`, if given, is passed straight through as
-    `predict_lesion_mask`'s own `vessel_probability_map=`, so Stage 03 is
-    never re-run here when a vessel map was already computed/cached by
-    `_get_or_compute_vessel_map`."""
-    if os.path.exists(cache_path):
-        return np.load(cache_path)
-    result = predict_lesion_mask(
-        rgb_image, vessel_probability_map=vessel_map, model=lesion_model, vessel_model=vessel_model,
+def _resize_map(map_array, image_size):
+    """Resizes one Stage 03/04 probability map (`(H, W)` or `(H, W, C)`,
+    native image resolution) down to `image_size` -- the canonical
+    downstream resolution Stage 05's tensor and RACAF's own TTA input both
+    actually need (`DEFAULT_IMAGE_SIZE`, matching Stage 04's own native
+    working resolution) -- BEFORE it is written to the on-disk cache. Same
+    resize convention as `_resize_input` (order=1, reflect, anti-aliasing,
+    clipped to [0,1]), applied to a single map rather than the full 8-channel
+    stack. Introduced to fix the pre-existing cache design storing
+    native-image-resolution arrays (up to tens of MB per image at APTOS2019's
+    typical resolution) instead of the small, fixed-size arrays every
+    consumer actually reads."""
+    output_shape = (*image_size, map_array.shape[-1]) if map_array.ndim == 3 else image_size
+    resized = sk_resize(
+        map_array, output_shape, order=1, mode="reflect", anti_aliasing=True, preserve_range=True,
     )
-    lesion_maps = result["probability_maps"].astype(np.float32)
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    np.save(cache_path, lesion_maps)
-    return lesion_maps
+    return np.clip(resized, 0.0, 1.0).astype(np.float32)
+
+
+def _resize_rgb(rgb_uint8, image_size):
+    """Resizes a native-resolution uint8 RGB image down to `image_size`,
+    preserving its [0, 255] uint8 encoding (never normalizing here --
+    `build_local_feature_input`'s own `/255.0` normalization still owns
+    that step, unchanged). Exists only so the RGB passed into
+    `build_local_feature_input` already matches the canonical resolution
+    Stage 03/04's caches are now stored at (`_get_or_compute_stage3_stage4_maps`),
+    satisfying that function's existing, UNMODIFIED native-shape-match
+    validation without altering it at all."""
+    resized = sk_resize(
+        rgb_uint8, (*image_size, 3), order=1, mode="reflect", anti_aliasing=True, preserve_range=True,
+    )
+    return np.clip(resized, 0, 255).astype(np.uint8)
+
+
+def _get_or_compute_stage3_stage4_maps(rgb_image, vessel_cache_path, lesion_cache_path,
+                                        vessel_model, lesion_model, image_size):
+    """Returns `(vessel_map, lesion_maps)`, both resized to the canonical
+    `image_size` resolution -- `vessel_map` `(*image_size,)` float32,
+    `lesion_maps` `(*image_size, 4)` float32 -- populating (or reusing) both
+    on-disk caches together.
+
+    Stage 03/04's OWN inference is completely unchanged: `predict_vessel_mask`/
+    `predict_lesion_mask` still run on the full, native-resolution
+    `rgb_image` exactly as before (same FOV-detection, same working
+    resolution, same threshold conventions) -- only their ALREADY-COMPUTED
+    output is resized down, once, before being written to disk. This is a
+    downstream caching optimization only; Stage 3/4's official inference
+    behavior is not altered.
+
+    The two caches are populated together (not by two independent
+    functions, as before) because Stage 04's own inference inherently needs
+    the vessel map at the SAME NATIVE resolution as `rgb_image` for its
+    internal RGB+vessel concatenation (`predict_lesion_mask`'s existing,
+    unmodified contract) -- the small, canonical-resolution vessel map
+    alone is not enough to reconstruct that input. So: if both caches
+    already exist, neither Stage 3 nor Stage 4 runs at all (the common
+    case, every epoch after the first). Otherwise Stage 3's native-resolution
+    vessel map is (re)computed in memory -- and, if the vessel cache itself
+    was already populated but the lesion cache was not (a rare, partial-cache
+    edge case), this recomputes Stage 3 once more rather than persisting a
+    second, native-resolution copy purely to avoid it. The native-resolution
+    vessel map itself is never written to disk -- only its canonical,
+    resized-down copy is, exactly like the lesion map.
+    """
+    vessel_cached = os.path.exists(vessel_cache_path)
+    lesion_cached = os.path.exists(lesion_cache_path)
+
+    if vessel_cached and lesion_cached:
+        return np.load(vessel_cache_path), np.load(lesion_cache_path)
+
+    native_vessel_map = predict_vessel_mask(rgb_image, model=vessel_model)["probability_map"].astype(np.float32)
+
+    if vessel_cached:
+        canonical_vessel_map = np.load(vessel_cache_path)
+    else:
+        canonical_vessel_map = _resize_map(native_vessel_map, image_size)
+        os.makedirs(os.path.dirname(vessel_cache_path), exist_ok=True)
+        np.save(vessel_cache_path, canonical_vessel_map)
+
+    if lesion_cached:
+        lesion_maps = np.load(lesion_cache_path)
+    else:
+        result = predict_lesion_mask(
+            rgb_image, vessel_probability_map=native_vessel_map, model=lesion_model, vessel_model=vessel_model,
+        )
+        lesion_maps = _resize_map(result["probability_maps"].astype(np.float32), image_size)
+        os.makedirs(os.path.dirname(lesion_cache_path), exist_ok=True)
+        np.save(lesion_cache_path, lesion_maps)
+
+    return canonical_vessel_map, lesion_maps
 
 
 def _resize_input(input_array, image_size):
@@ -347,13 +417,20 @@ def _build_sample(id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion
     `colab/notebooks/stage05_local_feature_extraction.ipynb`'s direct call)
     keeps working unchanged."""
     raw_bgr = _load_raw_bgr(image_dir, id_code)
-    rgb = _resolve_processed_rgb(raw_bgr, processed_dir, id_code)
+    rgb_native = _resolve_processed_rgb(raw_bgr, processed_dir, id_code)
 
-    vessel_cache = _cache_path(cache_dir, id_code, "vessel")
-    vessel_map = _get_or_compute_vessel_map(rgb, vessel_cache, vessel_model)
+    vessel_cache = _cache_path(cache_dir, id_code, "vessel", image_size)
+    lesion_cache = _cache_path(cache_dir, id_code, "lesion", image_size)
+    vessel_map, lesion_maps = _get_or_compute_stage3_stage4_maps(
+        rgb_native, vessel_cache, lesion_cache, vessel_model, lesion_model, image_size,
+    )
 
-    lesion_cache = _cache_path(cache_dir, id_code, "lesion")
-    lesion_maps = _get_or_compute_lesion_maps(rgb, vessel_map, lesion_cache, lesion_model, vessel_model)
+    # Stage 3/4 ran on the full native-resolution rgb_native above (their
+    # own inference is unchanged); only their cached output is canonical
+    # resolution. Resize the RGB itself down to the same resolution here so
+    # build_local_feature_input's existing native-shape-match validation
+    # (unmodified) is satisfied without altering that function at all.
+    rgb = _resize_rgb(rgb_native, image_size)
 
     input_array = build_local_feature_input(
         rgb, vessel_probability_map=vessel_map, lesion_probability_maps=lesion_maps, image_size=image_size,

@@ -99,6 +99,31 @@ class DrivePathsResolutionTests(unittest.TestCase):
             "/content/drive/MyDrive/DiabeticRetinopathy/experiments/FinalClassification",
         )
 
+    def test_cache_root_and_module_dirs(self):
+        """cache/ is the new, minimal, additive Drive bucket for persistent
+        per-image derived caches (Step 2/3 of the joint-training
+        infrastructure correction) -- must sit alongside, not replace or
+        rename, the four already-verified buckets."""
+        self.assertEqual(self.paths.cache_root, "/content/drive/MyDrive/DiabeticRetinopathy/cache")
+        self.assertEqual(
+            self.paths.cache_dir("LocalFeatureExtraction"),
+            "/content/drive/MyDrive/DiabeticRetinopathy/cache/LocalFeatureExtraction",
+        )
+        self.assertEqual(
+            self.paths.cache_dir("RACAF"),
+            "/content/drive/MyDrive/DiabeticRetinopathy/cache/RACAF",
+        )
+
+    def test_cache_dir_unknown_module_raises(self):
+        with self.assertRaises(ValueError):
+            self.paths.cache_dir("NotARealModule")
+
+    def test_output_directories_includes_cache(self):
+        outputs = drive_paths.output_directories(self.paths)
+        self.assertIn(self.paths.cache_root, outputs)
+        for cache_dir in self.paths.cache_dirs.values():
+            self.assertIn(cache_dir, outputs)
+
 
 class ColabConfigFlatConstantsTests(unittest.TestCase):
     """colab_config.py's new flat constants must exactly match the
@@ -117,6 +142,39 @@ class ColabConfigFlatConstantsTests(unittest.TestCase):
             colab_config.IDRID_SEGMENTATION_PROCESSED_DIR, colab_config.DRIVE.idrid_segmentation_processed_dir,
         )
 
+    def test_frozen_checkpoint_constants_match_drive_paths(self):
+        """Stage 1/3/4's checkpoint dirs -- the actual gap this task fixes:
+        previously these were not resolved to Drive at all anywhere in
+        colab/common/."""
+        self.assertEqual(colab_config.IQA_MODEL_DIR, colab_config.DRIVE.exported_model_dir("IQA"))
+        self.assertEqual(
+            colab_config.VESSEL_SEG_MODEL_DIR, colab_config.DRIVE.exported_model_dir("VesselSegmentation"),
+        )
+        self.assertEqual(
+            colab_config.LESION_SEG_MODEL_DIR, colab_config.DRIVE.exported_model_dir("LesionSegmentation"),
+        )
+
+    def test_cache_constants_match_drive_paths(self):
+        self.assertEqual(colab_config.LOCAL_FEATURE_CACHE_DIR, colab_config.DRIVE.cache_dir("LocalFeatureExtraction"))
+        self.assertEqual(colab_config.RACAF_CACHE_DIR, colab_config.DRIVE.cache_dir("RACAF"))
+
+    def test_final_classification_stage_model_dirs_are_nested_under_the_reserved_bucket(self):
+        """Stage 05-08+RACAF train jointly under the single, already-reserved
+        'FinalClassification' module -- their five model dirs must each be a
+        subdirectory of it, not five new top-level PIPELINE_MODULES entries."""
+        base = colab_config.DRIVE.exported_model_dir("FinalClassification")
+        for constant in (
+            colab_config.LOCAL_FEATURE_MODEL_DIR, colab_config.GLOBAL_FEATURE_MODEL_DIR,
+            colab_config.FEATURE_FUSION_MODEL_DIR, colab_config.RACAF_MODEL_DIR, colab_config.CORN_MODEL_DIR,
+        ):
+            self.assertTrue(constant.startswith(base + "/"), f"{constant} is not nested under {base}")
+        # And each stage gets its own, distinct subdirectory.
+        stage_dirs = {
+            colab_config.LOCAL_FEATURE_MODEL_DIR, colab_config.GLOBAL_FEATURE_MODEL_DIR,
+            colab_config.FEATURE_FUSION_MODEL_DIR, colab_config.RACAF_MODEL_DIR, colab_config.CORN_MODEL_DIR,
+        }
+        self.assertEqual(len(stage_dirs), 5)
+
 
 class ConfigureEnvironmentVariablesTests(unittest.TestCase):
     """The actual gap this task fixes: previously only EYEQ_RAW_DIR was
@@ -128,6 +186,10 @@ class ConfigureEnvironmentVariablesTests(unittest.TestCase):
         "IDRID/GRADING_RAW_DIR", "IDRID/GRADING_PROCESSED_DIR",
         "IDRID/LOCALIZATION_RAW_DIR", "IDRID/LOCALIZATION_PROCESSED_DIR",
         "IDRID/SEGMENTATION_RAW_DIR", "IDRID/SEGMENTATION_PROCESSED_DIR",
+        "IQA_MODEL_DIR", "VESSEL_SEG_MODEL_DIR", "LESION_SEG_MODEL_DIR",
+        "LOCAL_FEATURE_RESULTS_DIR", "RACAF_RESULTS_DIR",
+        "LOCAL_FEATURE_MODEL_DIR", "GLOBAL_FEATURE_MODEL_DIR",
+        "FEATURE_FUSION_MODEL_DIR", "RACAF_MODEL_DIR", "CORN_MODEL_DIR",
     )
 
     def setUp(self):
@@ -185,6 +247,44 @@ class ConfigureEnvironmentVariablesTests(unittest.TestCase):
         env_vars = colab_setup.configure_environment_variables()
         self.assertNotIn("IDRID_RAW_DIR", env_vars)
         self.assertNotIn("IDRID_PROCESSED_DIR", env_vars)
+
+    def test_stages_with_no_frozen_upstream_cache_are_not_fabricated(self):
+        """GLOBAL_FEATURE_RESULTS_DIR / FEATURE_FUSION_RESULTS_DIR /
+        CORN_RESULTS_DIR are never written to by any of those three
+        stages (config.py's own docstrings) -- must not be wired here."""
+        env_vars = colab_setup.configure_environment_variables()
+        for key in ("GLOBAL_FEATURE_RESULTS_DIR", "FEATURE_FUSION_RESULTS_DIR", "CORN_RESULTS_DIR"):
+            self.assertNotIn(key, env_vars)
+
+    def test_frozen_checkpoint_env_vars_resolve_config_model_dirs(self):
+        """The actual proof Stage 1/3/4's checkpoints resolve to Drive, not
+        the ephemeral cloned-repo checkout, in a fresh Colab session."""
+        colab_setup.configure_environment_variables()
+        import importlib
+        import config as config_module
+        importlib.reload(config_module)
+        try:
+            self.assertEqual(config_module.IQA_MODEL_DIR, colab_config.IQA_MODEL_DIR)
+            self.assertEqual(config_module.VESSEL_SEG_MODEL_DIR, colab_config.VESSEL_SEG_MODEL_DIR)
+            self.assertEqual(config_module.LESION_SEG_MODEL_DIR, colab_config.LESION_SEG_MODEL_DIR)
+        finally:
+            importlib.reload(config_module)
+
+    def test_cache_and_final_classification_env_vars_resolve_config_dirs(self):
+        colab_setup.configure_environment_variables()
+        import importlib
+        import config as config_module
+        importlib.reload(config_module)
+        try:
+            self.assertEqual(config_module.LOCAL_FEATURE_RESULTS_DIR, colab_config.LOCAL_FEATURE_CACHE_DIR)
+            self.assertEqual(config_module.RACAF_RESULTS_DIR, colab_config.RACAF_CACHE_DIR)
+            self.assertEqual(config_module.LOCAL_FEATURE_MODEL_DIR, colab_config.LOCAL_FEATURE_MODEL_DIR)
+            self.assertEqual(config_module.GLOBAL_FEATURE_MODEL_DIR, colab_config.GLOBAL_FEATURE_MODEL_DIR)
+            self.assertEqual(config_module.FEATURE_FUSION_MODEL_DIR, colab_config.FEATURE_FUSION_MODEL_DIR)
+            self.assertEqual(config_module.RACAF_MODEL_DIR, colab_config.RACAF_MODEL_DIR)
+            self.assertEqual(config_module.CORN_MODEL_DIR, colab_config.CORN_MODEL_DIR)
+        finally:
+            importlib.reload(config_module)
 
 
 class VerifyIdridDatasetDirTests(unittest.TestCase):
