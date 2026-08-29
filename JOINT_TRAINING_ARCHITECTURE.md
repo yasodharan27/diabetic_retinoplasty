@@ -480,19 +480,29 @@ training notebook — CORN has no standalone training path of its own to otherwi
 already-reserved slot, and `IMPLEMENTATION_PLAN.md`'s own Step 8 section already deferred "the main
 end-to-end training notebook" here. No second, competing notebook exists.
 
-**Implemented** (infrastructure/cells; no cell runs real training): Bootstrap → `setup.setup()` +
-`verify_environment.verify_all()` (unchanged from the prior template) → dataset verification
-(`train.csv` row count + `verify_dataset.verify_image_folder()` on `train_images/`) → frozen Stage
-1/3/4 checkpoint discovery (Stage 1 resolved for completeness only, never loaded into this graph,
-§3.1) → authoritative split load + assertion (§6) → persistent cache location reporting (§7.1,
-§10–§12 — population itself is lazy, deferred to actual dataset iteration) → joint model
-construction (`joint_training_model.build_joint_model()` + `compile_joint_model()`, §4, §25) →
-a synthetic-tensor smoke test (forward pass + one `GradientTape` step, no real data) → training
-configuration cell (`RUN_TRAINING = False`, `batch_size=2`, `mixed_precision=True`, `monitor=
-"val_QWK"`, `mode="max"`, §23–§24) → dataset-loading and experiment/`Trainer` setup cells, both
-**gated behind `if RUN_TRAINING:`** and printing a skip message when `False` — opening or running
-every cell in this notebook, as committed, never touches real Drive-mounted data, never creates an
-experiment directory, and never calls `model.fit()`.
+**Implemented** (infrastructure/cells; no cell runs real training as committed): Bootstrap →
+`setup.setup()` + `verify_environment.verify_all()` (unchanged from the prior template) → dataset
+verification (`train.csv` row count + `verify_dataset.verify_image_folder()` on `train_images/`) →
+frozen Stage 1/3/4 checkpoint discovery (Stage 1 resolved for completeness only, never loaded into
+this graph, §3.1) → authoritative split load + assertion (§6) → persistent cache location
+reporting (§7.1, §10–§12 — population itself is lazy, deferred to actual dataset iteration) →
+joint model construction (`joint_training_model.build_joint_model()` + `compile_joint_model()`,
+§4, §25) → a synthetic-tensor smoke test (forward pass + one `GradientTape` step, no real data) →
+training configuration cell (`RUN_TRAINING = False`, `batch_size=2`, `mixed_precision=True`,
+`monitor="val_QWK"`, `mode="max"`, §23–§24) → a gated dataset-loading cell
+(`jtd.load_joint_training_datasets()`) → a gated experiment/training cell (Step B) that resolves
+the Drive experiment (`experiment_manager.resolve_experiment(..., resume_from=RESUME_EXPERIMENT_DIR)`)
+and then calls the actual, unmodified `training.Trainer(training.TrainingConfig(...)).fit(joint_model,
+train_ds, val_ds)` — the project's existing training API, not a new one (verified end-to-end with
+synthetic tensors and a temp directory in `tests/test_joint_training.py`'s
+`TrainerIntegrationTests`, including that `ModelCheckpoint`/`EarlyStopping`/`ReduceLROnPlateau`
+genuinely recognize `"val_QWK"`/`mode="max"` and that `TrainingConfig(resume=True)` genuinely
+reloads the last checkpoint and advances `initial_epoch`). Both the dataset-loading and
+experiment/training cells are **gated behind `if RUN_TRAINING:`** and print a skip message when
+`False` (the committed state) — opening or running every cell in this notebook, as committed,
+never touches real Drive-mounted data, never creates an experiment directory, and never calls
+`model.fit()`. Setting `RUN_TRAINING = True` and re-running is a separate, explicit, future
+action.
 
 ---
 

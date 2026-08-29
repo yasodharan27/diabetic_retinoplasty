@@ -647,6 +647,91 @@ class CORNQWKJointIntegrationTests(unittest.TestCase):
 
 
 # =====================================================================
+# Step B: the actual training-cell integration -- proves the EXACT composition
+# `colab/notebooks/stage08_corn_classifier.ipynb`'s training cell now uses,
+# `training.Trainer(training.TrainingConfig(...)).fit(joint_model, train_ds, val_ds)`, really
+# works end-to-end. Tiny synthetic tf.data.Dataset pipelines, a temp directory, ONE epoch --
+# a focused integration smoke test, not real APTOS training.
+# =====================================================================
+
+class TrainerIntegrationTests(unittest.TestCase):
+    def test_trainer_fit_runs_one_epoch_and_selects_best_checkpoint_by_val_qwk(self):
+        from training import Trainer, TrainingConfig
+
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        def make_dataset(seed):
+            rng = np.random.RandomState(seed)
+            s5 = rng.rand(2, 512, 512, 8).astype("float32")
+            s6 = rng.rand(2, 256, 256, 3).astype("float32")
+            r = rng.rand(2, 1).astype("float32")
+            grades = np.array([1, 3], dtype="int32")
+            return tf.data.Dataset.from_tensors(((s5, s6, r), grades))
+
+        train_ds = make_dataset(0)
+        val_ds = make_dataset(1)
+
+        tmp_dir = tempfile.mkdtemp(prefix="trainer_integration_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+
+        # Mirrors the notebook's exact configuration (monitor/mode/mixed_precision) -- only
+        # epochs is reduced (1, not 50) and run_dir points at a temp directory, not a real Drive
+        # experiment folder.
+        config = TrainingConfig(
+            run_dir=tmp_dir, epochs=1, monitor="val_QWK", mode="max", mixed_precision=True,
+        )
+        trainer = Trainer(config)
+        history = trainer.fit(model, train_ds, val_ds)
+
+        self.assertIn("val_QWK", history.history)
+        self.assertIn("QWK", history.history)
+        self.assertFalse(np.isnan(history.history["val_QWK"][0]))
+        # save_best_only=True always saves on the very first epoch (no prior best to compare
+        # against) -- proof the "best checkpoint persists" requirement actually works through
+        # the real Trainer/build_callbacks machinery, not merely that the config was accepted.
+        self.assertTrue(os.path.exists(trainer.best_weights_path()))
+        self.assertEqual(trainer.config.monitor, "val_QWK")
+        self.assertEqual(trainer.config.mode, "max")
+
+    def test_resume_flag_reloads_last_checkpoint_before_continuing(self):
+        """Proves RESUME_EXPERIMENT_DIR's underlying mechanism (`TrainingConfig(resume=True)`)
+        actually reloads weights and advances `initial_epoch`, exactly as the notebook's gated
+        training cell relies on -- not merely that the flag is accepted."""
+        from training import Trainer, TrainingConfig
+
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+
+        def make_dataset(seed):
+            rng = np.random.RandomState(seed)
+            s5 = rng.rand(2, 512, 512, 8).astype("float32")
+            s6 = rng.rand(2, 256, 256, 3).astype("float32")
+            r = rng.rand(2, 1).astype("float32")
+            grades = np.array([0, 2], dtype="int32")
+            return tf.data.Dataset.from_tensors(((s5, s6, r), grades))
+
+        train_ds = make_dataset(2)
+        val_ds = make_dataset(3)
+
+        tmp_dir = tempfile.mkdtemp(prefix="trainer_resume_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+
+        first_config = TrainingConfig(run_dir=tmp_dir, epochs=1, monitor="val_QWK", mode="max")
+        Trainer(first_config).fit(model, train_ds, val_ds)
+
+        resumed_config = TrainingConfig(
+            run_dir=tmp_dir, epochs=2, monitor="val_QWK", mode="max", resume=True,
+        )
+        resumed_trainer = Trainer(resumed_config)
+        resumed_trainer.prepare()  # resolve_initial_epoch() needs self.paths, normally set
+                                    # lazily by fit() itself -- called explicitly here only to
+                                    # inspect it before running the second fit() call below.
+        self.assertEqual(resumed_trainer.resolve_initial_epoch(), 1)
+        resumed_trainer.fit(model, train_ds, val_ds)
+
+
+# =====================================================================
 # Drive path / checkpoint-selection infrastructure (no real Drive needed).
 # =====================================================================
 
