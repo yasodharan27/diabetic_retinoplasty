@@ -1,9 +1,12 @@
 # Joint Training Architecture — Stages 5–8 + RACAF
 
 **Status:** Authoritative design document for the joint Stage 05–08 + RACAF training run.
-**Design and supporting infrastructure resolved. Joint training itself is NOT implemented** —
-no joint model builder, no joint dataset loader, no training loop, no checkpoint, no notebook
-execution exists yet. This document is what that future implementation must follow, exactly as
+**Design, infrastructure, joint dataset loader, and joint model builder are implemented and
+unit-tested** (`joint_training_dataset.py`, `joint_training_model.py`,
+`tests/test_joint_training.py`). **No training loop has been run and no checkpoint has been
+generated** — `colab/notebooks/stage08_corn_classifier.ipynb`'s training cells exist but are
+gated behind `RUN_TRAINING = False`; opening or running the notebook as committed does not start
+real training. This document is what that implementation follows, exactly as
 `RACAF_ARCHITECTURE.md`/`CORN_ARCHITECTURE.md` play the same role for RACAF/CORN.
 
 This document does not redefine RACAF's or CORN's mathematics — `RACAF_ARCHITECTURE.md` and
@@ -217,28 +220,28 @@ native resolution as the RGB image for its internal concatenation — the small,
 map alone cannot reconstruct that input. If both caches already exist for an image, neither Stage
 3 nor Stage 4 runs at all.
 
-### 11.1 Redundant Stage-4 identity computation (Step 4) — analyzed, deferred, not silently skipped
+### 11.1 Redundant Stage-4 identity computation (Step 4) — RESOLVED, in the joint dataset loader
 
-RACAF's own TTA (`racaf.tta_views()`) computes four Stage-4 forward passes per image — identity,
-h-flip, v-flip, 180°-rotation — at canonical 512×512 resolution, via `racaf.prepare_stage4_input()`
-+ direct model calls (never through `predict_lesion_mask()`). Stage 5's lesion cache (§11) needs
-only the identity view. Today these are two separate computations.
+Previously analyzed and deferred (a prior revision of this document): true elimination requires a
+single per-image computation point that populates both Stage 5's lesion cache and RACAF's
+reliability cache from one `racaf.tta_views()` call — that computation point is, by definition,
+the joint dataset loader, which had not been built yet.
 
-**True elimination of this redundancy requires a single per-image computation point that
-populates both Stage 5's lesion cache and RACAF's reliability cache from one `tta_views()` call.**
-That computation point is, by definition, the joint dataset loader — which this task (and Step 18
-specifically) explicitly forbids implementing now. A partial fix confined to Stage 5's existing
-**standalone** loader would not deliver the claimed benefit: calling `racaf.tta_views()` from
-Stage 5's own cache-builder to obtain one identity view still runs all four TTA transforms — worse
-than today's single `predict_lesion_mask()` call, not better — and would add a new Stage 5 → RACAF
-module dependency for no net gain. Per this task's own explicit instruction ("If reuse would
-compromise the frozen Stage-4/TTA contract, keep the separate computation and document why"), this
-is documented and deferred rather than forced: **the joint dataset loader (next task) is the
-correct, and only correct, place to implement this reuse** — it should call `racaf.tta_views()`
-once per image and derive both Stage 5's lesion-cache entry (the `"identity"`-indexed view) and
-RACAF's `kappa`/`r` from that one call. RACAF's own mathematics, its own cache
-(`get_or_compute_reliability`), and Stage 5's dataset-loading contract are all unmodified by this
-finding.
+**Now implemented exactly that way**, in `joint_training_dataset.py`'s
+`_get_or_compute_joint_frozen_outputs()`: for each uncached image, `racaf.prepare_stage4_input()`
++ `racaf.tta_views()` (both unmodified) are each called **exactly once**; the `"identity"`-indexed
+view of that single call's four aligned predictions becomes Stage 5's canonical lesion-map cache
+value, and `racaf.compute_reliability()` (unmodified) derives `kappa`/`r` from the SAME four views
+— never a second, separate `predict_lesion_mask()` call. Verified: `tests/test_joint_training.py`'s
+`CacheReuseAndRedundancyTests.test_tta_views_called_exactly_once_per_uncached_image` (mocks
+`racaf.tta_views` and asserts a call count of 1) and
+`test_lesion_cache_equals_the_identity_tta_view` (numerically compares the cached lesion map
+against a directly-computed `racaf.tta_views()` identity slice, `atol=1e-5`). Stage 5's own
+standalone loader (`local_feature_extraction_dataset.py`) is completely untouched by this — the
+new dependency runs `joint_training_dataset.py → racaf.py`, never `local_feature_extraction_dataset.py
+→ racaf.py`, so no Stage 5 → RACAF dependency was introduced into Stage 5's own module. RACAF's own
+mathematics, its own cache function (`get_or_compute_reliability`), and Stage 5's dataset-loading
+contract are all unmodified by this implementation.
 
 ---
 
@@ -402,17 +405,27 @@ documented gap) — a full single-file `.keras` save of a joint model embedding 
 fail to reconstruct on load. `training.TrainingConfig.save_weights_only` already defaults to
 `True`, and `PROJECT_STRUCTURE.md` §6 already states the joint run "will itself default to
 weights-only checkpointing unless a future implementer deliberately overrides it" — this document
-does not introduce that decision, it reuses it. Design: a `build_joint_model()` function
-reconstructs the composed architecture fresh (chaining `build_local_feature_extractor()`,
-`create_dual_scale_swin_model()`, `build_adaptive_cross_attention()`, `build_racaf_fusion()`,
-`build_corn_model()`), then `save_weights()`/`load_weights()` against
-`experiments/FinalClassification/<timestamp>/checkpoints/` — mirroring
-`GlobalFeatureExtractionStage.load()`'s existing "rebuild then load_weights" pattern. Supports
-resume (via `experiment_manager.resolve_experiment(..., resume_from=...)` and `Trainer`'s existing
-`epoch_state.json` mechanism), best checkpoint, final checkpoint, and exported inference weights
-(each sub-model's own slice additionally saved to its `config.py` `MODEL_DIR`, §7.1, so each
-stage's own already-implemented `Stage.load()` keeps working independently). Stage 1–4 checkpoints
-are never overwritten.
+does not introduce that decision, it reuses it.
+
+**Implemented** in `joint_training_model.py`: `build_joint_model()` reconstructs the composed
+architecture fresh (chaining `local_feature_extraction_model.build_local_feature_extractor()`,
+`swin_transformer.create_dual_scale_swin_model()`, `feature_fusion.build_adaptive_cross_attention()`,
+`racaf.build_racaf_fusion()`, `corn.build_corn_model()`), and
+`save_joint_model_weights()`/`load_joint_model_weights()` are the weights-only save/reload pair —
+mirroring `GlobalFeatureExtractionStage.load()`'s existing "rebuild then load_weights" pattern.
+Verified: `tests/test_joint_training.py`'s `test_save_and_load_weights_round_trip` (predictions
+match exactly, `atol=1e-5`, after a save/reload round trip in a temp directory). Both functions are
+pure, path-parameterized (`path` is a required argument, no built-in default —
+`test_checkpoint_functions_take_no_hardcoded_path`) — the actual persistent Drive location
+(`experiments/FinalClassification/<timestamp>/checkpoints/`) is resolved by the caller (the
+notebook, §27) via the EXISTING, unmodified `experiment_manager.resolve_experiment()` +
+`colab_config.DRIVE.experiment_dir("FinalClassification")` infrastructure — this module makes no
+Drive/local assumption of its own. Resume support (`resume_from=...`, `Trainer`'s existing
+`epoch_state.json` mechanism), best/final checkpoint, and per-stage exported-weight slices (into
+each stage's own `config.py` `MODEL_DIR`, §7.1, so each stage's own already-implemented
+`Stage.load()` keeps working independently) are all designed for but **not exercised** by this
+task — no real checkpoint has been generated, per this task's explicit "no training" constraint.
+Stage 1–4 checkpoints are never overwritten.
 
 ---
 
@@ -429,13 +442,21 @@ timestamp/run system is introduced. Large, reusable, cross-run caches (§10–§
 `colab/notebooks/stage08_corn_classifier.ipynb` is repurposed as the joint Stage 05–08+RACAF
 training notebook — CORN has no standalone training path of its own to otherwise fill this
 already-reserved slot, and `IMPLEMENTATION_PLAN.md`'s own Step 8 section already deferred "the main
-end-to-end training notebook" here. No second, competing notebook is created. Intended future
-structure (not implemented by this document): mount Drive → clone/update repo → verify
-dependencies/GPU → configure Drive paths (§7.1) → verify datasets → stage APTOS to local SSD if
-appropriate → locate frozen Stage 1/3/4 checkpoints → load frozen Stage 3/4 → prepare persistent
-caches (§10–§12) → load authoritative split (§6) → build the joint model (§4, §25) → compile with
-`corn_loss` (§21) → train (§24) → validate with QWK/F1/accuracy, select on `val_QWK` (§23) → save
-best/final checkpoint to Drive (§25) → export artifacts → save config/metrics/TensorBoard logs.
+end-to-end training notebook" here. No second, competing notebook exists.
+
+**Implemented** (infrastructure/cells; no cell runs real training): Bootstrap → `setup.setup()` +
+`verify_environment.verify_all()` (unchanged from the prior template) → dataset verification
+(`train.csv` row count + `verify_dataset.verify_image_folder()` on `train_images/`) → frozen Stage
+1/3/4 checkpoint discovery (Stage 1 resolved for completeness only, never loaded into this graph,
+§3.1) → authoritative split load + assertion (§6) → persistent cache location reporting (§7.1,
+§10–§12 — population itself is lazy, deferred to actual dataset iteration) → joint model
+construction (`joint_training_model.build_joint_model()` + `compile_joint_model()`, §4, §25) →
+a synthetic-tensor smoke test (forward pass + one `GradientTape` step, no real data) → training
+configuration cell (`RUN_TRAINING = False`, `batch_size=2`, `mixed_precision=True`, `monitor=
+"val_QWK"`, `mode="max"`, §23–§24) → dataset-loading and experiment/`Trainer` setup cells, both
+**gated behind `if RUN_TRAINING:`** and printing a skip message when `False` — opening or running
+every cell in this notebook, as committed, never touches real Drive-mounted data, never creates an
+experiment directory, and never calls `model.fit()`.
 
 ---
 
@@ -451,8 +472,11 @@ substituted later with zero architecture change.
 
 ## 29. Explicit non-goals (this document and this task)
 
-- No joint model builder, joint dataset loader, training loop, checkpoint, or notebook execution
-  exists after this task — that is the next task.
+- The joint model builder and joint dataset loader ARE implemented and unit-tested
+  (`joint_training_model.py`, `joint_training_dataset.py`). No training loop is run, no checkpoint
+  is generated, and no notebook cell is executed by this task — `RUN_TRAINING = False` throughout
+  `colab/notebooks/stage08_corn_classifier.ipynb`; real training is a separate, future, explicit
+  action.
 - No retraining, modification, or Git-copying of Stage 1/3/4's checkpoints.
 - No change to RACAF's or CORN's mathematics, loss, or tensor contracts.
 - No second dataset hierarchy; no fourth project dataset.

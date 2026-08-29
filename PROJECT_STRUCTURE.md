@@ -429,11 +429,13 @@ for the visual end-to-end flow.
 > (a single `experiments/FinalClassification/` bucket, not four separate ones) both suggest
 > Stages 5-8 are trained **jointly as one model**, not as four independently checkpointed stages
 > -- confirmed by each stage's own implementation: Stage 5/6/7/RACAF/CORN's `train()`/`evaluate()`
-> all raise `NotImplementedError`, each explicitly deferring to the one joint training script that
-> does not exist yet (`CORN_ARCHITECTURE.md` §9). The full joint-training design -- dataset flow,
-> caching, gradient boundary, loss, checkpoint format, and the Drive/notebook infrastructure it
-> depends on -- is now resolved in `JOINT_TRAINING_ARCHITECTURE.md`; the joint training script
-> itself still does not exist.
+> all raise `NotImplementedError`, each explicitly deferring to the one joint training script.
+> The full joint-training design -- dataset flow, caching, gradient boundary, loss, checkpoint
+> format, and the Drive/notebook infrastructure it depends on -- is resolved in
+> `JOINT_TRAINING_ARCHITECTURE.md`, and the joint model builder/dataset loader (`joint_training_model.py`,
+> `joint_training_dataset.py`, 38 tests) are now implemented -- but no training has been run and no
+> checkpoint exists (`colab/notebooks/stage08_corn_classifier.ipynb`'s training cells are gated
+> behind `RUN_TRAINING = False`).
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

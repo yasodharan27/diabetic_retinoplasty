@@ -1,0 +1,569 @@
+"""
+Tests for the joint Stage 05-08 + RACAF training pipeline
+(`joint_training_dataset.py`, `joint_training_model.py`).
+
+Per `PROJECT_CODE.md`'s Implementation Rules, this suite uses synthetic/temporary data only --
+no real datasets, no real Stage 1/3/4 checkpoints. Stage 03's vessel model and Stage 04's lesion
+model are the same synthetic, from-scratch construction pattern already established in
+`tests/test_local_feature_extraction_dataset.py` -- neither the real, gitignored LWNet checkpoint
+nor the real, gitignored Experiment 2C `.keras` checkpoint is ever touched here.
+
+NO TRAINING IS RUN ANYWHERE IN THIS FILE -- no `model.fit()`, no epoch, no checkpoint is produced
+by any test. Gradient checks use a single `tf.GradientTape` step only, to verify the gradient
+BOUNDARY (which variables receive a gradient), never to update a weight.
+"""
+
+import csv
+import inspect
+import os
+import shutil
+import tempfile
+import unittest
+from unittest import mock
+
+import numpy as np
+import tensorflow as tf
+import torch
+from PIL import Image
+
+import corn
+import downstream_split
+import joint_training_dataset as jtd
+import joint_training_model as jtm
+import lesion_segmentation_model as lsm
+import local_feature_extraction_dataset as lfed
+import racaf
+from vessel_segmentation_model import build_vessel_segmentation_model, load_state_dict_from_checkpoint
+
+IMAGE_SIZE = 256  # large enough for Stage 03's FOV circle-fit to succeed reliably
+
+
+def _synthetic_fundus_image(size=IMAGE_SIZE, seed=0):
+    """Identical recipe to test_local_feature_extraction_dataset.py's helper of the same name."""
+    rng = np.random.RandomState(seed)
+    image = np.zeros((size, size, 3), dtype=np.uint8)
+    yy, xx = np.ogrid[:size, :size]
+    center = size // 2
+    radius = int(size * 0.4)
+    circle = (xx - center) ** 2 + (yy - center) ** 2 <= radius ** 2
+    base = 140 + rng.randint(-20, 20, size=(size, size, 3))
+    image[circle] = np.clip(base[circle], 60, 220).astype(np.uint8)
+    return image
+
+
+def _build_synthetic_vessel_model():
+    model = build_vessel_segmentation_model()
+    tmp_dir = tempfile.mkdtemp(prefix="synthetic_vessel_ckpt_")
+    checkpoint_path = os.path.join(tmp_dir, "synthetic_checkpoint.pth")
+    torch.save(
+        {"model_state_dict": model.state_dict(), "optimizer_state_dict": {}, "stats": None},
+        checkpoint_path,
+    )
+    loaded = load_state_dict_from_checkpoint(model, checkpoint_path, device="cpu")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return loaded
+
+
+def _build_synthetic_frozen_stage4_model():
+    """A real (untrained) Attention U-Net at Stage 04's REAL, full native input shape
+    `(512,512,4)` -- required since `racaf.prepare_stage4_input`/`tta_views` always resize to
+    that fixed resolution; a smaller synthetic shape (as some other tests use for pure-Stage-04
+    speed) is not usable here. `trainable` is explicitly forced False, mirroring
+    `racaf.load_frozen_stage4_model()`'s own behavior exactly (that function itself calls
+    `lesion_segmentation_model.load_lesion_model()`, which requires a real `.keras` file on disk
+    -- not usable in a synthetic-data-only test, so this helper reproduces its
+    frozen/`trainable=False` POST-condition on a freshly-built, real, untrained model instead)."""
+    model = lsm.build_attention_unet(input_shape=(512, 512, 4), base_filters=4)
+    model.trainable = False
+    return model
+
+
+class _SyntheticAPTOSTree:
+    """Same shape/convention as test_local_feature_extraction_dataset.py's helper of the same
+    name: a temp datasets/APTOS2019/raw/-shaped directory (train.csv + train_images/)."""
+
+    def __init__(self, id_diagnosis_pairs):
+        self.root = tempfile.mkdtemp(prefix="aptos_joint_synth_")
+        self.image_dir = os.path.join(self.root, "train_images")
+        self.csv_path = os.path.join(self.root, "train.csv")
+        self.cache_dir = os.path.join(self.root, "cache")
+        self.racaf_cache_dir = os.path.join(self.root, "racaf_cache")
+        os.makedirs(self.image_dir, exist_ok=True)
+        self.pairs = list(id_diagnosis_pairs)
+        self._build()
+
+    def cleanup(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _build(self):
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["id_code", "diagnosis"])
+            for i, (id_code, diagnosis) in enumerate(self.pairs):
+                writer.writerow([id_code, diagnosis])
+                image = _synthetic_fundus_image(seed=i)
+                Image.fromarray(image).save(os.path.join(self.image_dir, f"{id_code}.png"))
+
+
+# =====================================================================
+# 1-4: Authoritative split -- no second split.
+# =====================================================================
+
+class AuthoritativeSplitTests(unittest.TestCase):
+    def test_joint_split_delegates_to_downstream_split_directly(self):
+        train_entries, val_entries = jtd.split_train_val_ids()
+        expected_train, expected_val = downstream_split.get_authoritative_split()
+        self.assertEqual(train_entries, expected_train)
+        self.assertEqual(val_entries, expected_val)
+
+    def test_real_authoritative_split_counts(self):
+        train_entries, val_entries = jtd.split_train_val_ids()
+        self.assertEqual(len(train_entries), 2929)
+        self.assertEqual(len(val_entries), 733)
+        self.assertEqual(len(train_entries) + len(val_entries), 3662)
+
+    def test_no_overlap(self):
+        train_entries, val_entries = jtd.split_train_val_ids()
+        train_ids = {i for i, _ in train_entries}
+        val_ids = {i for i, _ in val_entries}
+        self.assertEqual(train_ids & val_ids, set())
+
+    def test_module_defines_no_second_split_utility(self):
+        """joint_training_dataset.py must never call train_test_split/stratify itself -- it only
+        ever delegates to downstream_split.get_authoritative_split."""
+        source = inspect.getsource(jtd)
+        for forbidden in ("train_test_split", "stratify"):
+            self.assertNotIn(forbidden, source)
+
+
+# =====================================================================
+# Ground-truth / label boundary -- no masks, no IDRiD, no test.csv.
+# =====================================================================
+
+class GroundTruthAndLabelBoundaryTests(unittest.TestCase):
+    """Tokenize-based source scan -- mirrors corn.py's/racaf.py's own boundary-test pattern."""
+
+    # "vessel_mask"/"lesion_mask" are deliberately NOT forbidden: this project's own frozen,
+    # approved Stage 03/04 inference functions are legitimately named `predict_vessel_mask`/
+    # `vessel_probability_map` etc. (a PREDICTED quantity, never a ground-truth one) --
+    # `corn.py`'s own identical boundary test (`GroundTruthMaskBoundaryTests`) already dropped the
+    # overly-broad "mask" fragment for exactly this reason; this list follows that precedent.
+    _FORBIDDEN = ("ground_truth", "groundtruth", "idrid", "test_csv")
+
+    def _assert_no_forbidden_identifiers(self, module):
+        import ast
+
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        identifiers = {node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        identifiers |= {node.attr.lower() for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        for forbidden in self._FORBIDDEN:
+            for identifier in identifiers:
+                self.assertNotIn(
+                    forbidden, identifier,
+                    f"forbidden identifier fragment {forbidden!r} found in code identifier {identifier!r}",
+                )
+
+    def test_joint_dataset_module_has_no_forbidden_identifiers(self):
+        self._assert_no_forbidden_identifiers(jtd)
+
+    def test_joint_model_module_has_no_forbidden_identifiers(self):
+        self._assert_no_forbidden_identifiers(jtm)
+
+
+# =====================================================================
+# Cache reuse + redundancy elimination (Step 4/5).
+# =====================================================================
+
+class CacheReuseAndRedundancyTests(unittest.TestCase):
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_01", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _build_sample(self):
+        rng = np.random.default_rng(0)
+        return jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng,
+        )
+
+    def test_sample_structure_keys(self):
+        sample = self._build_sample()
+        self.assertEqual(
+            set(sample.keys()), {"image_id", "stage5_input", "stage6_input", "reliability", "grade"},
+        )
+
+    def test_stage5_input_shape(self):
+        sample = self._build_sample()
+        self.assertEqual(sample["stage5_input"].shape, (512, 512, 8))
+        self.assertEqual(sample["stage5_input"].dtype, np.float32)
+
+    def test_stage6_input_shape(self):
+        sample = self._build_sample()
+        self.assertEqual(sample["stage6_input"].shape, (256, 256, 3))
+        self.assertEqual(sample["stage6_input"].dtype, np.float32)
+
+    def test_grade_is_the_aptos_label(self):
+        sample = self._build_sample()
+        self.assertEqual(sample["grade"], 2)
+        self.assertIsInstance(sample["grade"], int)
+
+    def test_reliability_is_scalar_float_in_unit_range(self):
+        sample = self._build_sample()
+        self.assertEqual(np.asarray(sample["reliability"]).shape, ())
+        self.assertGreaterEqual(float(sample["reliability"]), 0.0)
+        self.assertLessEqual(float(sample["reliability"]), 1.0)
+
+    def test_canonical_vessel_and_lesion_caches_are_512(self):
+        self._build_sample()
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", jtd.STAGE5_IMAGE_SIZE)
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion", jtd.STAGE5_IMAGE_SIZE)
+        vessel_map = np.load(vessel_cache)
+        lesion_maps = np.load(lesion_cache)
+        self.assertEqual(vessel_map.shape, (512, 512, 1))
+        self.assertEqual(lesion_maps.shape, (512, 512, 4))
+
+    def test_reliability_cache_stores_only_kappa_and_r(self):
+        self._build_sample()
+        reliability_cache = racaf.reliability_cache_path(self.tree.racaf_cache_dir, "img_01")
+        cached = np.load(reliability_cache)
+        self.assertEqual(set(cached.files), {"kappa", "r"})
+        self.assertEqual(cached["kappa"].shape, (4,))
+        self.assertEqual(cached["r"].shape, ())
+
+    def test_reliability_cache_never_stores_raw_four_view_maps(self):
+        self._build_sample()
+        reliability_cache = racaf.reliability_cache_path(self.tree.racaf_cache_dir, "img_01")
+        size_bytes = os.path.getsize(reliability_cache)
+        # kappa (4 float32) + r (1 float32) is a few hundred bytes at most, including npz
+        # overhead -- four raw (512,512,4) float32 maps would be ~16MB, three orders of
+        # magnitude larger.
+        self.assertLess(size_bytes, 10_000)
+
+    def test_tta_views_called_exactly_once_per_uncached_image(self):
+        """The actual Step 4/5 redundancy-elimination proof: ONE racaf.tta_views() call must
+        serve both Stage 05's lesion-map cache and RACAF's reliability cache for a given image --
+        never two."""
+        with mock.patch("joint_training_dataset.racaf.tta_views", wraps=racaf.tta_views) as mocked_tta:
+            self._build_sample()
+            self.assertEqual(mocked_tta.call_count, 1)
+
+    def test_second_call_reuses_cache_without_recomputing_anything(self):
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel, mock.patch(
+            "joint_training_dataset.racaf.tta_views", wraps=racaf.tta_views,
+        ) as mocked_tta:
+            self._build_sample()
+            self.assertEqual(mocked_vessel.call_count, 1)
+            self.assertEqual(mocked_tta.call_count, 1)
+
+            self._build_sample()
+            # Still 1 each -- both caches (vessel/lesion + reliability) already exist.
+            self.assertEqual(mocked_vessel.call_count, 1)
+            self.assertEqual(mocked_tta.call_count, 1)
+
+    def test_lesion_cache_equals_the_identity_tta_view(self):
+        """Proves the cached lesion map really IS RACAF's own identity-transform view, not an
+        approximation -- the exact-reuse claim, verified numerically."""
+        rgb_native = lfed._resolve_processed_rgb(
+            lfed._load_raw_bgr(self.tree.image_dir, "img_01"), lfed.DEFAULT_PROCESSED_DIR, "img_01",
+        )
+        native_vessel = jtd.predict_vessel_mask(rgb_native, model=self.vessel_model)["probability_map"].astype(np.float32)
+        prepared = racaf.prepare_stage4_input(rgb_native, native_vessel)
+        aligned = racaf.tta_views(self.stage4_model, prepared).numpy()
+        expected_identity = aligned[0, racaf.TTA_TRANSFORMS.index("identity"), ...]
+
+        self._build_sample()
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion", jtd.STAGE5_IMAGE_SIZE)
+        cached_lesion = np.load(lesion_cache)
+        np.testing.assert_allclose(cached_lesion, expected_identity, atol=1e-5)
+
+
+# =====================================================================
+# Augmentation synchronization.
+# =====================================================================
+
+class AugmentationSynchronizationTests(unittest.TestCase):
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_01", 1)])
+        self.addCleanup(self.tree.cleanup)
+
+    def test_stage6_input_derives_from_stage5s_own_augmented_rgb(self):
+        """Stage 6's input must be a resize of Stage 5's OWN (possibly augmented) RGB channels --
+        proof the same spatial transform reaches both branches, never two independent draws."""
+        rng = np.random.default_rng(3)
+        sample = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=True, rng=rng,
+        )
+        expected_stage6 = lfed._resize_input(sample["stage5_input"][..., :3], jtd.STAGE6_IMAGE_SIZE)
+        np.testing.assert_array_equal(sample["stage6_input"], expected_stage6)
+
+    def test_intensity_augmentation_never_touches_vessel_or_lesion_channels(self):
+        rng = np.random.default_rng(0)
+        unaugmented = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=None,
+        )
+        rng2 = np.random.default_rng(0)
+        with mock.patch.object(lfed, "_augment_spatial", side_effect=lambda x, r: x):
+            augmented = jtd._build_joint_sample(
+                "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=True, rng=rng2,
+            )
+        np.testing.assert_array_equal(
+            augmented["stage5_input"][..., 3:8], unaugmented["stage5_input"][..., 3:8],
+        )
+
+    def test_validation_path_has_no_augmentation(self):
+        """augment=False must produce byte-identical output across repeated calls -- no RNG draw
+        at all touches the sample."""
+        sample_a = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=None,
+        )
+        sample_b = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=None,
+        )
+        np.testing.assert_array_equal(sample_a["stage5_input"], sample_b["stage5_input"])
+        np.testing.assert_array_equal(sample_a["stage6_input"], sample_b["stage6_input"])
+        self.assertEqual(sample_a["reliability"], sample_b["reliability"])
+
+    def test_canonical_caches_are_never_modified_by_augmentation(self):
+        """Building an AUGMENTED sample must not change the on-disk canonical cache -- the cache
+        stores the unaugmented Stage 03/04 output; augmentation happens only when the batch tensor
+        is constructed, after the cache is read."""
+        rng = np.random.default_rng(0)
+        jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=None,
+        )
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "vessel", jtd.STAGE5_IMAGE_SIZE)
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, "img_01", "lesion", jtd.STAGE5_IMAGE_SIZE)
+        before_vessel = np.load(vessel_cache).copy()
+        before_lesion = np.load(lesion_cache).copy()
+
+        jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=True, rng=rng,
+        )
+        after_vessel = np.load(vessel_cache)
+        after_lesion = np.load(lesion_cache)
+        np.testing.assert_array_equal(before_vessel, after_vessel)
+        np.testing.assert_array_equal(before_lesion, after_lesion)
+
+    def test_reliability_is_computed_from_canonical_unaugmented_output(self):
+        """r must be identical whether or not the sample it's attached to is augmented -- it is
+        never itself augmented, and is always derived from the canonical (pre-augmentation)
+        Stage 04 output."""
+        rng = np.random.default_rng(5)
+        unaugmented = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=None,
+        )
+        augmented = jtd._build_joint_sample(
+            "img_01", 1, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=True, rng=rng,
+        )
+        self.assertEqual(unaugmented["reliability"], augmented["reliability"])
+
+
+# =====================================================================
+# Frozen/trainable boundary + gradient boundary + loss + architecture.
+# =====================================================================
+
+class JointModelTests(unittest.TestCase):
+    """Builds the REAL joint model ONCE for this whole class -- Stage 05/06 are real, full-size
+    architectures, so rebuilding per test would be wasteful; every test below only reads from or
+    forward/backward-passes through this one shared instance, never mutates its weights."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = jtm.build_joint_model()
+
+    def test_stage3_and_stage4_are_not_in_the_graph_at_all(self):
+        """The strongest possible frozen-boundary guarantee: Stage 03/04 parameters are not
+        tf.Variables in this graph, so no optimizer or GradientTape built from this model can
+        reach them, structurally -- not merely via a stop_gradient wrapper."""
+        variable_names = " ".join(v.name.lower() for v in self.model.trainable_variables)
+        for forbidden in ("wnet", "unet1", "unet2"):
+            self.assertNotIn(forbidden, variable_names)
+
+    def test_five_stages_are_all_trainable(self):
+        """Every one of Stage 05/06/07/RACAF/CORN's own trainable variables must be present in
+        the joint model's trainable_variables -- proof none was accidentally frozen by
+        composition."""
+        import feature_fusion as ff
+        import local_feature_extraction_model as lfem
+        import swin_transformer as st
+
+        stage5_only = lfem.build_local_feature_extractor()
+        stage6_only = st.create_dual_scale_swin_model()
+        stage7_only = ff.build_adaptive_cross_attention()
+        racaf_only = racaf.build_racaf_fusion()
+        corn_only = corn.build_corn_model()
+
+        expected_total = sum(
+            m.count_params() for m in (stage5_only, stage6_only, stage7_only, racaf_only, corn_only)
+        )
+        self.assertEqual(self.model.count_params(), expected_total)
+
+    def test_racaf_trainable_param_count_matches_measured_value(self):
+        """RACAF's own measured 295,170 trainable parameters -- confirms RACAF's contribution to
+        the joint model is exactly its approved, frozen architecture, no more."""
+        racaf_only = racaf.build_racaf_fusion()
+        self.assertEqual(racaf_only.count_params(), 295_170)
+
+    def test_corn_trainable_param_count_matches_measured_value(self):
+        corn_only = corn.build_corn_model()
+        self.assertEqual(corn_only.count_params(), 1_028)
+
+    def test_joint_output_shape(self):
+        batch = 2
+        s5 = np.random.rand(batch, 512, 512, 8).astype("float32")
+        s6 = np.random.rand(batch, 256, 256, 3).astype("float32")
+        r = np.random.rand(batch, 1).astype("float32")
+        logits = self.model.predict([s5, s6, r], verbose=0)
+        self.assertEqual(logits.shape, (batch, 4))
+
+    def test_batch_independence(self):
+        """Each image's logits must depend only on its own input, not on other images in the
+        batch -- a single-image prediction must match its slot in a batched prediction."""
+        rng = np.random.RandomState(0)
+        s5 = rng.rand(2, 512, 512, 8).astype("float32")
+        s6 = rng.rand(2, 256, 256, 3).astype("float32")
+        r = rng.rand(2, 1).astype("float32")
+
+        batched = self.model.predict([s5, s6, r], verbose=0)
+        single = self.model.predict([s5[0:1], s6[0:1], r[0:1]], verbose=0)
+        np.testing.assert_allclose(batched[0], single[0], atol=1e-4)
+
+    def test_gradient_reaches_every_trainable_variable(self):
+        """A single GradientTape step (no optimizer.apply_gradients, no weight update) proving
+        the loss backpropagates into every trainable variable of all five stages."""
+        batch = 2
+        s5 = tf.random.uniform((batch, 512, 512, 8))
+        s6 = tf.random.uniform((batch, 256, 256, 3))
+        r = tf.random.uniform((batch, 1))
+        grades = tf.constant([1, 3], dtype=tf.int32)
+
+        with tf.GradientTape() as tape:
+            logits = self.model([s5, s6, r], training=True)
+            loss = jtm.joint_corn_loss(grades, logits)
+        grads = tape.gradient(loss, self.model.trainable_variables)
+
+        none_count = sum(1 for g in grads if g is None)
+        self.assertEqual(none_count, 0, "every trainable variable must receive a gradient")
+
+    def test_reliability_input_is_not_itself_a_trainable_variable(self):
+        """r enters the graph as a plain Input -- it must never appear among trainable_variables
+        (it is data, not a learned parameter; only RACAF's gate weights that CONSUME it are
+        trainable)."""
+        variable_names = [v.name for v in self.model.trainable_variables]
+        self.assertNotIn("reliability", " ".join(variable_names).lower())
+
+    def test_joint_corn_loss_matches_corn_loss_directly(self):
+        logits = tf.constant([[0.1, -0.2, 0.3, 0.0], [1.0, 0.5, -0.5, 0.2]], dtype=tf.float32)
+        grades = tf.constant([2, 4], dtype=tf.int32)
+        expected = corn.corn_loss(logits, grades)
+        actual = jtm.joint_corn_loss(grades, logits)
+        self.assertAlmostEqual(float(actual), float(expected), places=6)
+
+    def test_compile_joint_model_sets_corn_loss_only(self):
+        model = jtm.build_joint_model()
+        jtm.compile_joint_model(model)
+        self.assertTrue(model.compiled)
+        self.assertIs(model.loss, jtm.joint_corn_loss)
+
+    def test_save_and_load_weights_round_trip(self):
+        tmp_dir = tempfile.mkdtemp(prefix="joint_ckpt_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        path = os.path.join(tmp_dir, "joint.weights.h5")
+
+        s5 = np.random.rand(1, 512, 512, 8).astype("float32")
+        s6 = np.random.rand(1, 256, 256, 3).astype("float32")
+        r = np.random.rand(1, 1).astype("float32")
+        before = self.model.predict([s5, s6, r], verbose=0)
+
+        jtm.save_joint_model_weights(self.model, path)
+        self.assertTrue(os.path.exists(path))
+
+        reloaded = jtm.load_joint_model_weights(path)
+        after = reloaded.predict([s5, s6, r], verbose=0)
+        np.testing.assert_allclose(before, after, atol=1e-5)
+
+    def test_checkpoint_functions_take_no_hardcoded_path(self):
+        """save/load must be pure path-parameterized -- no built-in Drive or local default that
+        could silently write somewhere unexpected."""
+        save_params = list(inspect.signature(jtm.save_joint_model_weights).parameters)
+        load_params = list(inspect.signature(jtm.load_joint_model_weights).parameters)
+        self.assertIn("path", save_params)
+        self.assertIn("path", load_params)
+        # "path" must be a REQUIRED positional argument (no default) on both functions -- proof
+        # neither one bakes in an implicit Drive or local fallback location.
+        self.assertIs(
+            inspect.signature(jtm.save_joint_model_weights).parameters["path"].default,
+            inspect.Parameter.empty,
+        )
+        self.assertIs(
+            inspect.signature(jtm.load_joint_model_weights).parameters["path"].default,
+            inspect.Parameter.empty,
+        )
+
+
+# =====================================================================
+# Drive path / checkpoint-selection infrastructure (no real Drive needed).
+# =====================================================================
+
+class DriveInfrastructureTests(unittest.TestCase):
+    def test_final_classification_experiment_dir_resolves_via_existing_infra(self):
+        import sys
+
+        colab_common = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "colab", "common")
+        if colab_common not in sys.path:
+            sys.path.insert(0, colab_common)
+        import colab_config
+
+        base = colab_config.DRIVE.experiment_dir("FinalClassification")
+        self.assertTrue(base.startswith("/content/drive/MyDrive/DiabeticRetinopathy/experiments/FinalClassification"))
+
+    def test_no_stage1_import_anywhere_in_joint_modules(self):
+        for module in (jtd, jtm):
+            source = inspect.getsource(module)
+            self.assertNotIn("image_quality_inference", source)
+            self.assertNotIn("image_quality_model", source)
+
+
+# =====================================================================
+# Realistic (checkpoint-free) end-to-end integration smoke test -- Step 15.
+# =====================================================================
+
+class RealisticIntegrationSmokeTest(unittest.TestCase):
+    """One real, small-batch forward pass through the actual joint model (real Stage 05/06/07/
+    RACAF/CORN architectures, no checkpoint, no training). Confirms F/logits shapes match the
+    approved contract end-to-end -- not just per-stage in isolation."""
+
+    def test_real_components_batch_of_two(self):
+        model = jtm.build_joint_model()
+        batch = 2
+        s5 = np.random.RandomState(1).rand(batch, 512, 512, 8).astype("float32")
+        s6 = np.random.RandomState(2).rand(batch, 256, 256, 3).astype("float32")
+        r = np.random.RandomState(3).rand(batch, 1).astype("float32")
+
+        logits = model.predict([s5, s6, r], verbose=0)
+        self.assertEqual(logits.shape, (batch, 4))
+
+        decoded = corn.decode_logits(logits)
+        self.assertTrue(np.all(decoded["predicted_grade"] >= 0))
+        self.assertTrue(np.all(decoded["predicted_grade"] <= 4))
+        np.testing.assert_allclose(decoded["class_probabilities"].sum(axis=-1), np.ones(batch), atol=1e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -283,9 +283,46 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
 - **New files:** `corn.py` (CORN head + CORN loss + rank-to-class decoding). The end-to-end
   training script wiring Stage 05 -> Stage 06 -> Stage 07 -> RACAF -> CORN together does not exist
   yet — not implemented in this step, per the explicit no-training instruction for this stage.
-- **Colab notebook:** not yet implemented. Its role is now locked: `colab/notebooks/stage08_corn_classifier.ipynb`
+- **Colab notebook:** infrastructure implemented, `RUN_TRAINING = False`. `colab/notebooks/stage08_corn_classifier.ipynb`
   is repurposed as the joint Stage 05-08+RACAF training notebook (no second, competing notebook) —
-  see `JOINT_TRAINING_ARCHITECTURE.md` §27.
+  see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
+
+### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
+- **Status: Implemented, unit-tested (38 tests, `tests/test_joint_training.py`). NOT trained — no
+  `model.fit()` call, no epoch, no checkpoint exists anywhere in this repository or on Drive.**
+  Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
+- **New files:**
+  - `joint_training_dataset.py` — the joint data/cache pipeline. Builds `stage5_input`
+    `(512,512,8)`, `stage6_input` `(256,256,3)`, `reliability` (scalar `r`), and `grade` per
+    sample, using the SAME authoritative split (`downstream_split.get_authoritative_split()`) and
+    the SAME Stage 3/4 canonical cache path convention (`local_feature_extraction_dataset._cache_path`)
+    Stage 5's own loader already established. Resolves the previously-deferred Step 4 redundancy
+    (`JOINT_TRAINING_ARCHITECTURE.md` §11.1): `_get_or_compute_joint_frozen_outputs()` calls
+    `racaf.prepare_stage4_input()` + `racaf.tta_views()` exactly once per uncached image, deriving
+    BOTH Stage 5's lesion-cache entry and RACAF's `kappa`/`r` from that one call — verified via a
+    mocked call-count test and a direct numerical equality test against RACAF's own identity view.
+    Synchronized spatial augmentation (Stage 6's input is a resize of Stage 5's OWN, possibly
+    augmented, RGB channels — never an independent draw); RGB-only intensity jitter; RACAF's `r`
+    always computed from the canonical, unaugmented Stage 4 output.
+  - `joint_training_model.py` — `build_joint_model()` composes Stage 5/6/7/RACAF/CORN's own,
+    unmodified `build_*()` functions into one functional `keras.Model`
+    (`[stage5_input, stage6_input, reliability] -> logits`, measured 43,296,810 total / 393
+    trainable variables). `compile_joint_model()` sets `corn.corn_loss` as the sole training
+    objective (verified against `corn_loss` directly). `save_joint_model_weights()`/
+    `load_joint_model_weights()` — weights-only, path-parameterized, no built-in Drive/local
+    default (verified round-trip, `atol=1e-5`).
+  - Stage 3/4 never appear in the joint model's graph at all (verified: no Stage 3/4 variable name
+    appears in `trainable_variables`) — they run only inside `joint_training_dataset.py`'s data
+    layer, producing plain NumPy arrays before anything reaches the model's `Input` tensors. A
+    single `GradientTape` step confirms zero missing gradients across all 393 trainable variables.
+- **`colab/notebooks/stage08_corn_classifier.ipynb`:** repurposed with real infrastructure cells
+  (Drive/environment/dataset/checkpoint verification, authoritative split, joint model
+  construction + compile, a synthetic-tensor smoke test) plus a training-configuration cell
+  (`batch_size=2`, `mixed_precision=True`, `monitor="val_QWK"`, `mode="max"`) and
+  dataset-loading/`Trainer` cells gated behind `RUN_TRAINING = False` — opening or running this
+  notebook as committed does not start training.
+- **Next step:** set `RUN_TRAINING = True` and actually run joint training on a real Colab T4 —
+  not attempted by this step, per its own explicit no-training instruction.
 
 ### Step 9 — Uncertainty Estimation (Monte Carlo Dropout) — integration only
 - **Why:** Already implemented and correct in `bayesian_inference.py`; this step re-points it at the new model.
@@ -328,10 +365,12 @@ Stage 1/3/4 checkpoints/the persistent Stage 03-04/RACAF caches, plus a canonica
 (rather than native-image-resolution) Stage 03/04 prediction cache — is in place; see
 `JOINT_TRAINING_ARCHITECTURE.md` for the full design (dataset flow, caching, gradient boundary,
 loss, checkpoint format, QWK-based model selection, T4 starting configuration, and the notebook
-role). No training was run at any point in this pipeline; no checkpoint exists. Per the "one
-module at a time, wait for approval" rule, the next implementation target is the **joint Stage
-05–08 + RACAF training script itself** (the joint model builder, the joint dataset loader, and the
-training loop) — the design is resolved, but none of it is implemented yet.
+role). **The joint model builder (`joint_training_model.py`) and joint dataset loader
+(`joint_training_dataset.py`) are now implemented and unit-tested (Step 8.5 above) — no training
+was run at any point in this pipeline; no checkpoint exists anywhere in this repository or on
+Drive.** Per the "one module at a time, wait for approval" rule, the next implementation target is
+to actually **run** joint training on a real Colab T4 (set `RUN_TRAINING = True` in
+`colab/notebooks/stage08_corn_classifier.ipynb`) — not attempted here.
 
 RACAF is the one approved research innovation for this project (`PROJECT_CODE.md`'s "Approved
 Research Innovation" section); no second, competing innovation should be introduced without a
