@@ -130,8 +130,19 @@ def corn_loss(logits, grades, num_thresholds=NUM_THRESHOLDS):
 
     No focal loss, class weighting, label smoothing, or auxiliary penalty
     is added here -- APTOS2019's class imbalance (`CORN_ARCHITECTURE.md`)
-    is a separate, future training decision, not folded into this loss."""
-    logits = tf.convert_to_tensor(logits, dtype=tf.float32)
+    is a separate, future training decision, not folded into this loss.
+
+    Accepts `logits` in any float dtype (in particular float16, CORN's Dense layer has no
+    explicit float32 output override, so under a `mixed_float16` policy its raw output is
+    float16) -- `tf.convert_to_tensor(logits, dtype=tf.float32)` does NOT cast an
+    already-a-tensor input of a different dtype, it raises `ValueError: Tensor conversion
+    requested dtype float32 for Tensor with dtype float16`; converting first, then casting
+    explicitly, is what actually casts. The loss itself is still always computed in float32
+    (`sigmoid_cross_entropy_with_logits`'s numerically-stable formulation, division), matching
+    every other stage's "float16 activations, float32 loss" mixed-precision convention in this
+    project -- no CORN mathematics changes."""
+    logits = tf.convert_to_tensor(logits)
+    logits = tf.cast(logits, tf.float32)
     grades = tf.cast(tf.convert_to_tensor(grades), tf.float32)
 
     thresholds = tf.range(num_thresholds, dtype=tf.float32)  # [0, 1, 2, 3]
@@ -234,7 +245,12 @@ class CORNQuadraticWeightedKappa(QuadraticWeightedKappa):
         super().__init__(num_classes=num_classes, name=name, **kwargs)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        logits = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+        # Same dtype-safety fix as corn_loss (see its docstring): `y_pred` is CORN's raw
+        # logits, float16 under a mixed_float16 policy -- convert first, THEN cast, since
+        # `tf.convert_to_tensor(x, dtype=...)` does not cast an already-a-tensor input of a
+        # different dtype.
+        logits = tf.convert_to_tensor(y_pred)
+        logits = tf.cast(logits, tf.float32)
         p_cond = tf.sigmoid(logits)
         p_cum = tf.math.cumprod(p_cond, axis=-1)
         predicted_grade = tf.reduce_sum(tf.cast(p_cum > 0.5, tf.int32), axis=-1)

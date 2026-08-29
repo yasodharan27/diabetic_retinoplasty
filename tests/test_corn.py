@@ -149,6 +149,23 @@ class CornLossExactReferenceTests(unittest.TestCase):
         loss = corn.corn_loss(logits, grades)
         self.assertEqual(loss.shape, ())
 
+    def test_corn_loss_accepts_float16_logits(self):
+        """Regression test for the mixed-precision crash found on the first real T4 joint
+        smoke test: under `mixed_float16`, CORN's Dense layer (no explicit float32 output
+        override) produces float16 logits, and `corn_loss` used to do
+        `tf.convert_to_tensor(logits, dtype=tf.float32)`, which does NOT cast an already-a-
+        tensor input of a different dtype -- it raised `ValueError: Tensor conversion
+        requested dtype float32 for Tensor with dtype float16`. Must not raise, and must match
+        the float32 computation on the same values (within float16's own precision)."""
+        logits_f32 = tf.constant([[0.3, -0.2, 1.1, -0.7], [2.0, 1.5, -1.0, 0.5]], dtype=tf.float32)
+        logits_f16 = tf.cast(logits_f32, tf.float16)
+        grades = tf.constant([2, 4])
+
+        loss_f16 = corn.corn_loss(logits_f16, grades)
+        loss_f32 = corn.corn_loss(logits_f32, grades)
+        self.assertEqual(loss_f16.dtype, tf.float32)  # loss itself always computed in float32
+        self.assertAlmostEqual(float(loss_f16), float(loss_f32), places=3)
+
     def test_loss_is_differentiable_with_respect_to_logits(self):
         logits = tf.Variable(tf.random.normal((3, 4)))
         grades = tf.constant([0, 2, 4])
@@ -311,6 +328,20 @@ class CORNQuadraticWeightedKappaTests(unittest.TestCase):
         metric.reset_state()
         np.testing.assert_array_equal(metric.confusion.numpy(), np.zeros((5, 5)))
         self.assertEqual(float(metric.result()), 0.0)
+
+    def test_accepts_float16_logits(self):
+        """Same mixed-precision dtype-safety fix as `corn_loss` -- CORN's raw output is
+        float16 under `mixed_float16`, and `update_state` used to do
+        `tf.convert_to_tensor(y_pred, dtype=tf.float32)`, which raises on an already-a-tensor
+        float16 input instead of casting it. Must not raise, and must decode/accumulate
+        identically to the float32 equivalent."""
+        logits_f32 = tf.constant([[10.0, 10.0, 10.0, 10.0], [-10.0, -10.0, -10.0, -10.0]])
+        logits_f16 = tf.cast(logits_f32, tf.float16)
+
+        metric = corn.CORNQuadraticWeightedKappa()
+        metric.update_state(tf.constant([4, 0]), logits_f16)
+        self.assertEqual(metric.confusion.numpy()[4, 4], 1.0)
+        self.assertEqual(metric.confusion.numpy()[0, 0], 1.0)
 
     def test_metric_shape_and_dtype(self):
         metric = corn.CORNQuadraticWeightedKappa()
