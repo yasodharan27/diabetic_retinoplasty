@@ -417,6 +417,21 @@ if the framework already supports it (`training/trainer.py` currently does **not
 gradient accumulation — adding it is a separate, small framework change, not assumed here). The
 architecture is never changed to solve a memory problem.
 
+**Implementation note (T4 smoke-test fix):** the first real T4 smoke test
+(`joint_model.predict(...)`) failed with `InvalidArgumentError: Trying to access resource
+relative_position_index ... located on device CPU:0 from device GPU:0`. Root cause:
+`swin_transformer.py`'s `WindowAttention.relative_position_index` was a bare
+`tf.Variable(trainable=False)` — an int32 RESOURCE variable, which TensorFlow's own placement
+policy pins to CPU regardless of GPU availability; reading a resource variable requires the
+reading op to run on the same device it lives on, so the GPU-placed `tf.gather` inside
+`WindowAttention.call()` could not read it once the joint model ran end-to-end on GPU. Fixed by
+storing it as a plain `tf.constant` instead (not a resource, so it is copied to whatever device
+consumes it, exactly like any other tensor) — no relative-position value, window geometry,
+attention behavior, output shape, or parameter count changed (`tests/test_swin_transformer_dual_scale.py`'s
+`RelativePositionIndexDeviceRegressionTests`: Stage 06 still reports `39,697,956` params and
+`(B,64,1152)` output; GPU-specific tests are skipped on this project's CPU-only local/CI
+environment and run only where a GPU is actually present).
+
 ---
 
 ## 25. Checkpoint/resume

@@ -115,6 +115,108 @@ class SharedSwinInfrastructureRegressionTests(unittest.TestCase):
         self.assertTrue(all(g is not None for g in grads))
 
 
+class RelativePositionIndexDeviceRegressionTests(unittest.TestCase):
+    """Regression tests for a device-placement bug found on a real T4 GPU smoke test:
+    `WindowAttention.relative_position_index` used to be a bare `tf.Variable(trainable=False)`
+    -- an int32 RESOURCE variable. TensorFlow's own placement policy pins int32 resource
+    variables to CPU regardless of GPU availability, and reading a resource variable requires
+    the reading op to run on the SAME device it lives on -- so once a model containing this
+    layer executed end-to-end on GPU (e.g. the joint model's `model.predict()`), the GPU-placed
+    `tf.gather` inside `WindowAttention.call()` could not read the CPU-pinned resource, raising
+    `InvalidArgumentError: Trying to access resource relative_position_index ... located on
+    device CPU:0 from device GPU:0`. Fixed by making it a plain `tf.constant` instead -- not a
+    resource, so it carries no persistent device pinning and TensorFlow copies it to whatever
+    device the consuming op actually runs on, CPU or GPU alike."""
+
+    def test_relative_position_index_is_not_a_resource_variable(self):
+        """The exact mechanism of the fix -- a `tf.constant`, never a `tf.Variable` -- verified
+        directly. This needs no GPU: it is about the OBJECT TYPE, which is what determines
+        whether the cross-device resource-access error is even possible in the first place."""
+        wa = swin.WindowAttention(dim=32, window_size=6, num_heads=2, name="rpi_type_check")
+        self.assertNotIsInstance(wa.relative_position_index, tf.Variable)
+        self.assertIsInstance(wa.relative_position_index, tf.Tensor)
+
+    def test_relative_position_index_not_tracked_as_a_layer_weight(self):
+        """Preserves the exact pre-fix behavior: this buffer was never part of
+        `layer.weights`/`model.count_params()` (a bare `tf.Variable` attribute was not tracked
+        by Keras's own weight system either) -- only `relative_position_bias_table` (the real,
+        trainable parameter) is."""
+        wa = swin.WindowAttention(dim=32, window_size=6, num_heads=2, name="rpi_tracking_check")
+        weight_names = [w.name for w in wa.weights]
+        self.assertNotIn("relative_position_index", " ".join(weight_names))
+        self.assertEqual(len(wa.weights), 1)  # only relative_position_bias_table
+
+    def test_relative_position_index_values_are_unchanged(self):
+        """The fix changes ONLY how the buffer is stored (tf.constant vs. tf.Variable), never
+        the relative-position math itself -- cross-checked against an independent NumPy
+        re-derivation of the exact same formula."""
+        window_h = window_w = 8
+        wa = swin.WindowAttention(dim=96, window_size=8, num_heads=3, name="rpi_values_check")
+
+        coords_h = np.arange(window_h)
+        coords_w = np.arange(window_w)
+        coords = np.stack(np.meshgrid(coords_h, coords_w, indexing="ij")).reshape(2, -1).T
+        relative_coords = (coords[:, None, :] - coords[None, :, :]).astype(np.int32)
+        relative_coords[..., 0] += window_h - 1
+        relative_coords[..., 1] += window_w - 1
+        expected = (relative_coords[..., 0] * (2 * window_w - 1) + relative_coords[..., 1]).astype(np.int32)
+
+        np.testing.assert_array_equal(wa.relative_position_index.numpy(), expected)
+
+    def test_stage6_parameter_count_and_output_shape_unaffected_by_the_fix(self):
+        """Regression guard for this fix's own explicit constraint: it must not change Stage
+        06's parameter count or output shape."""
+        model = swin.create_dual_scale_swin_model()
+        x = np.random.RandomState(5).rand(1, 256, 256, 3).astype("float32")
+        y = model.predict(x, verbose=0)
+        self.assertEqual(y.shape, (1, 64, 1152))
+        self.assertEqual(model.count_params(), 39_697_956)
+
+    @unittest.skipUnless(
+        tf.config.list_physical_devices("GPU"), "requires a GPU to reproduce the original failure",
+    )
+    def test_window_attention_runs_under_explicit_gpu_placement(self):
+        """Reproduces the exact original failure condition on a real GPU: forcing execution
+        under `/GPU:0` used to raise `InvalidArgumentError: Trying to access resource
+        relative_position_index ... located on device CPU:0 from device GPU:0`. Skipped when no
+        GPU is present (this project's local/CI environment is CPU-only) -- the CPU-only tests
+        above already cover the buffer's type, tracking, and numerical correctness portably."""
+        with tf.device("/GPU:0"):
+            wa = swin.WindowAttention(dim=32, window_size=6, num_heads=2, name="rpi_gpu_check")
+            x = tf.random.normal((2, 36, 32))
+            y = wa(x)
+        self.assertEqual(y.shape, (2, 36, 32))
+        self.assertTrue(np.all(np.isfinite(y.numpy())))
+
+    @unittest.skipUnless(
+        tf.config.list_physical_devices("GPU"), "requires a GPU to reproduce the original failure",
+    )
+    def test_joint_model_forward_and_gradient_pass_on_gpu(self):
+        """The actual reported failure: the FULL joint model (Stage 05-08 + RACAF, with Stage 06
+        nested inside it) executing end-to-end on GPU via `model.predict()`, then a
+        `GradientTape` step -- mirrors `colab/notebooks/stage08_corn_classifier.ipynb`'s own
+        smoke-test cell exactly. No optimizer step; this is still a smoke test, not training."""
+        import joint_training_model as jtm
+
+        with tf.device("/GPU:0"):
+            model = jtm.build_joint_model()
+            jtm.compile_joint_model(model)
+
+            s5 = np.random.RandomState(6).rand(2, 512, 512, 8).astype("float32")
+            s6 = np.random.RandomState(7).rand(2, 256, 256, 3).astype("float32")
+            r = np.random.RandomState(8).rand(2, 1).astype("float32")
+            grades = tf.constant([1, 3], dtype=tf.int32)
+
+            logits = model.predict([s5, s6, r], verbose=0)
+            self.assertEqual(logits.shape, (2, 4))
+
+            with tf.GradientTape() as tape:
+                out = model([s5, s6, r], training=True)
+                loss = jtm.joint_corn_loss(grades, out)
+            grads = tape.gradient(loss, model.trainable_variables)
+            self.assertEqual(sum(1 for g in grads if g is None), 0)
+
+
 class KnownLegacyIssueTests(unittest.TestCase):
     """SwinTransformer.__init__'s `self.layers = []` shadows Keras 3's
     reserved `Model.layers` property -- a pre-existing defect, independent

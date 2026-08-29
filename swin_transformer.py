@@ -73,10 +73,37 @@ class WindowAttention(layers.Layer):
         relative_coords = tf.cast(relative_coords, tf.int32)
         relative_coords = relative_coords + tf.constant([window_h - 1, window_w - 1], dtype=tf.int32)
         relative_coords = relative_coords[..., 0] * (2 * window_w - 1) + relative_coords[..., 1]
-        self.relative_position_index = tf.Variable(
-            initial_value=tf.cast(relative_coords, tf.int32),
-            trainable=False,
-            name='relative_position_index')
+        # Device-placement fix: this used to be a bare `tf.Variable(..., trainable=False)`. A
+        # `tf.Variable` is a RESOURCE -- it has a persistent handle pinned to one device forever,
+        # and TensorFlow's own placement policy for int32 tensors defaults that device to CPU
+        # regardless of GPU availability (this is a well-known, TF-wide convention: most int32
+        # index-like ops/kernels are CPU-only or CPU-preferred, so the placer keeps int32
+        # Variables on CPU). Reading a resource variable requires the reading op to run on the
+        # SAME device as the variable, so once the whole joint model executes end-to-end on a
+        # GPU, the GPU-placed `tf.gather`/`tf.reshape` in `call()` below cannot read this
+        # CPU-pinned resource -- exactly `InvalidArgumentError: Trying to access resource
+        # relative_position_index ... located on device CPU:0 from device GPU:0`. The sibling
+        # `relative_position_bias_table` above never had this problem: it is float32 (freely
+        # GPU-placeable) -- dtype, not `add_weight` vs. bare `tf.Variable`, is what matters here.
+        #
+        # `relative_position_index` is not a learned parameter -- it is a fixed, deterministic
+        # function of `window_h`/`window_w` alone, recomputed identically every time this layer
+        # is constructed (including after a `create_dual_scale_swin_model()` rebuild + weights
+        # reload -- Stage 06's own established "rebuild architecture, then load_weights()"
+        # checkpoint strategy, see `GlobalFeatureExtractionStage.load()`). So it does not need
+        # `tf.Variable`'s mutability/checkpoint semantics at all -- a plain `tf.constant` is the
+        # correct representation: constants are NOT resources, carry no persistent device-pinned
+        # handle, and are implicitly copied by TensorFlow's runtime to whatever device the
+        # consuming op (the `tf.gather` in `call()`) actually executes on, CPU or GPU alike. This
+        # also keeps `relative_position_index` out of `layer.weights`/`model.count_params()`,
+        # exactly matching its behavior before this fix (a bare `tf.Variable` attribute is not
+        # tracked by Keras's own weight-tracking either) -- Stage 06's total/trainable parameter
+        # count is therefore unchanged by this fix. `relative_coords` above is computed with the
+        # EXACT SAME TensorFlow ops as before (an eager tensor -- window_h/window_w are static
+        # Python ints, so this has no dependency on any runtime/graph tensor); only how the
+        # resulting values are turned into a persistent buffer changes.
+        self.relative_position_index = tf.constant(
+            relative_coords.numpy(), dtype=tf.int32, name='relative_position_index')
 
     def call(self, x, mask=None, training=None):
         B_, N, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
