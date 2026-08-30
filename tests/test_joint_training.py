@@ -446,6 +446,212 @@ class EmptyFieldOfViewLowLevelTests(unittest.TestCase):
 
 
 # =====================================================================
+# Two-phase workflow (STEP B RAM-exhaustion fix): bounded shuffle buffer +
+# cache precomputation decoupled from training.
+# =====================================================================
+
+class ShuffleBufferBoundTests(unittest.TestCase):
+    """Regression test for the actual RAM-growth root cause behind the first real T4 training
+    run's crash: `_make_joint_dataset` previously sized its shuffle buffer to `len(entries)`
+    (up to 2929), but each already-materialized sample is a `(512,512,8)` + `(256,256,3)` float32
+    pair (~8.75 MB) -- that alone demanded ~25 GB before an epoch could even start. The buffer
+    must now be a FIXED cap, never scale with dataset size."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1), ("img_c", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _captured_buffer_size(self):
+        original_shuffle = tf.data.Dataset.shuffle
+        captured = {}
+
+        def spy_shuffle(ds_self, buffer_size, **kwargs):
+            captured["buffer_size"] = buffer_size
+            return original_shuffle(ds_self, buffer_size, **kwargs)
+
+        with mock.patch.object(tf.data.Dataset, "shuffle", new=spy_shuffle):
+            jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=True, augment=False, seed=0,
+            )
+        return captured["buffer_size"]
+
+    def test_buffer_size_is_capped_when_dataset_exceeds_the_cap(self):
+        with mock.patch("joint_training_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE", 2):
+            self.assertEqual(self._captured_buffer_size(), 2)
+
+    def test_buffer_size_equals_dataset_size_when_smaller_than_the_cap(self):
+        with mock.patch("joint_training_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE", 10):
+            self.assertEqual(self._captured_buffer_size(), 3)
+
+    def test_default_shuffle_buffer_size_never_scales_with_the_real_dataset_size(self):
+        """The actual bug was `buffer_size=max(len(entries), 1)` -- proven here by asserting the
+        real, shipped default is a small constant, far below the real authoritative train split
+        size (2929), without needing to build 2929 real samples."""
+        self.assertLess(jtd.DEFAULT_SHUFFLE_BUFFER_SIZE, 2929)
+        self.assertGreater(jtd.DEFAULT_SHUFFLE_BUFFER_SIZE, 0)
+
+
+class CachePrecomputationTests(unittest.TestCase):
+    """Phase 1 (`precompute_joint_frozen_caches`): bounded/streaming cache generation, reuse, and
+    resumability -- independent of any `tf.data` pipeline."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1), ("img_c", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _precompute(self, entries=None):
+        return jtd.precompute_joint_frozen_caches(
+            entries if entries is not None else self.tree.pairs,
+            self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+    def test_precompute_writes_caches_for_every_entry(self):
+        stats = self._precompute()
+        self.assertEqual(stats["cached"], 3)
+        self.assertEqual(stats["already_cached"], 0)
+        self.assertEqual(stats["skipped_empty_fov"], [])
+        for id_code, _ in self.tree.pairs:
+            vessel_cache = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+            lesion_cache = lfed._cache_path(self.tree.cache_dir, id_code, "lesion", jtd.STAGE5_IMAGE_SIZE)
+            reliability_cache = racaf.reliability_cache_path(self.tree.racaf_cache_dir, id_code)
+            self.assertTrue(os.path.exists(vessel_cache))
+            self.assertTrue(os.path.exists(lesion_cache))
+            self.assertTrue(os.path.exists(reliability_cache))
+
+    def test_rerun_reuses_existing_caches_without_invoking_stage3_inference(self):
+        """Cache reuse: a second precomputation pass over the same entries must not call Stage
+        03's real inference function at all."""
+        self._precompute()
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            stats = self._precompute()
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertEqual(stats["already_cached"], 3)
+        self.assertEqual(stats["cached"], 0)
+
+    def test_interrupted_precomputation_resumes_without_touching_valid_entries(self):
+        """Simulates an interruption after only the first entry finished: re-running over the
+        FULL entry list must fill in exactly the remaining two, and must not recompute (or
+        otherwise touch) the first, already-valid cache entry."""
+        self._precompute(entries=[self.tree.pairs[0]])
+        vessel_cache_0 = lfed._cache_path(self.tree.cache_dir, self.tree.pairs[0][0], "vessel", jtd.STAGE5_IMAGE_SIZE)
+        mtime_before = os.path.getmtime(vessel_cache_0)
+
+        stats = self._precompute()
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["cached"], 2)
+        self.assertEqual(os.path.getmtime(vessel_cache_0), mtime_before)
+
+    def test_returned_stats_are_small_fixed_size_bookkeeping_only(self):
+        """Bounded-memory proof: the returned stats must never carry a per-image array -- only
+        counters and a list of (small) string ids for skipped images."""
+        stats = self._precompute()
+        self.assertEqual(set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov"})
+        self.assertIsInstance(stats["cached"], int)
+        self.assertIsInstance(stats["already_cached"], int)
+        self.assertIsInstance(stats["skipped_empty_fov"], list)
+        for item in stats["skipped_empty_fov"]:
+            self.assertIsInstance(item, str)
+
+    def test_precomputation_processes_one_image_at_a_time_not_in_bulk(self):
+        """Streaming proof: the per-image cache-populating function is called exactly once per
+        entry needing computation, never given more than one image's data at once."""
+        real_fn = jtd._get_or_compute_joint_frozen_outputs
+        seen_cache_paths = []
+
+        def spy(rgb_native, vessel_cache_path, *args, **kwargs):
+            seen_cache_paths.append(vessel_cache_path)
+            return real_fn(rgb_native, vessel_cache_path, *args, **kwargs)
+
+        with mock.patch("joint_training_dataset._get_or_compute_joint_frozen_outputs", side_effect=spy):
+            self._precompute()
+
+        self.assertEqual(len(seen_cache_paths), 3)
+        self.assertEqual(len(set(seen_cache_paths)), 3)
+
+    def test_empty_fov_image_is_skipped_and_does_not_block_remaining_entries(self):
+        real_fn = jtd._get_or_compute_joint_frozen_outputs
+
+        def flaky(rgb_native, vessel_cache_path, *args, **kwargs):
+            if "img_b" in vessel_cache_path:
+                raise jtd.EmptyFieldOfViewError("no fundus disk detected")
+            return real_fn(rgb_native, vessel_cache_path, *args, **kwargs)
+
+        with mock.patch("joint_training_dataset._get_or_compute_joint_frozen_outputs", side_effect=flaky):
+            stats = self._precompute()
+
+        self.assertEqual(stats["cached"], 2)
+        self.assertEqual(stats["skipped_empty_fov"], ["img_b"])
+
+
+class PrecomputeAuthoritativeCachesTests(unittest.TestCase):
+    """`precompute_authoritative_joint_caches` -- the real-training-workflow entry point -- must
+    delegate to the SAME authoritative split and the SAME streaming function above, never a
+    second split or a second cache-population code path."""
+
+    def test_delegates_to_the_authoritative_split_and_the_streaming_precompute_function(self):
+        with mock.patch(
+            "joint_training_dataset.split_train_val_ids", return_value=([("a", 0)], [("b", 1)]),
+        ) as mocked_split, mock.patch(
+            "joint_training_dataset.load_vessel_model", return_value="VESSEL_MODEL",
+        ) as mocked_vessel_loader, mock.patch(
+            "joint_training_dataset.racaf.load_frozen_stage4_model", return_value="STAGE4_MODEL",
+        ) as mocked_stage4_loader, mock.patch(
+            "joint_training_dataset.precompute_joint_frozen_caches",
+            return_value={"cached": 0, "already_cached": 0, "skipped_empty_fov": []},
+        ) as mocked_precompute:
+            jtd.precompute_authoritative_joint_caches()
+
+        mocked_split.assert_called_once()
+        mocked_vessel_loader.assert_called_once()
+        mocked_stage4_loader.assert_called_once()
+        mocked_precompute.assert_called_once()
+        called_entries = mocked_precompute.call_args[0][0]
+        self.assertEqual(called_entries, [("a", 0), ("b", 1)])
+        _, kwargs = mocked_precompute.call_args
+        self.assertEqual(kwargs["vessel_model"], "VESSEL_MODEL")
+        self.assertEqual(kwargs["stage4_model"], "STAGE4_MODEL")
+
+
+class Phase2UsesExistingCachesTests(unittest.TestCase):
+    """Requirement: the training dataset must use existing caches without invoking Stage 3/4
+    inference when caches already exist -- verified at the actual `_make_joint_dataset` level
+    (Phase 2), after Phase 1 has already populated every entry's cache."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1)])
+        self.addCleanup(self.tree.cleanup)
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+    def test_iterating_the_dataset_never_calls_stage3_or_stage4_inference(self):
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel, mock.patch(
+            "joint_training_dataset.racaf.tta_views", wraps=racaf.tta_views,
+        ) as mocked_tta:
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            list(ds)
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertEqual(mocked_tta.call_count, 0)
+
+
+# =====================================================================
 # Augmentation synchronization.
 # =====================================================================
 

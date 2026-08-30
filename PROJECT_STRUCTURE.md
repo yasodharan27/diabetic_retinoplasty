@@ -433,13 +433,17 @@ for the visual end-to-end flow.
 > The full joint-training design -- dataset flow, caching, gradient boundary, loss, checkpoint
 > format, and the Drive/notebook infrastructure it depends on -- is resolved in
 > `JOINT_TRAINING_ARCHITECTURE.md`, and the joint model builder/dataset loader (`joint_training_model.py`,
-> `joint_training_dataset.py`, 43 tests) are now implemented -- but no training has been run and no
+> `joint_training_dataset.py`, 66 tests) are now implemented -- but no training has completed and no
 > checkpoint exists (`colab/notebooks/stage08_corn_classifier.ipynb`'s training cells are gated
 > behind `RUN_TRAINING = False`). Checkpoint selection (`monitor="val_QWK", mode="max"`) is backed
-> by `corn.CORNQuadraticWeightedKappa` -- a CORN-aware Keras metric (11 more tests in
+> by `corn.CORNQuadraticWeightedKappa` -- a CORN-aware Keras metric (12 more tests in
 > `tests/test_corn.py`) that decodes CORN's logits via `decode_logits`'s own rule rather than
 > the generic, argmax-based `training.metrics.QuadraticWeightedKappa`, which cannot be applied to
-> CORN's conditional-task logits directly.
+> CORN's conditional-task logits directly. The first real T4 run hit and fixed two blockers
+> (`JOINT_TRAINING_ARCHITECTURE.md` §31-32): an empty-Stage-03-FOV crash on one real APTOS image,
+> and RAM exhaustion from an unbounded `tf.data` shuffle buffer -- the latter's fix also adds an
+> optional `precompute_authoritative_joint_caches()` phase that populates Stage 03/04/RACAF's
+> cache independently of training, gated behind the notebook's own `RUN_CACHE_PRECOMPUTATION` flag.
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

@@ -574,3 +574,83 @@ Regression tests: `tests/test_joint_training.py` (`EmptyFieldOfViewHandlingTests
 (`EmptyFieldOfViewHandlingTests`) — the exact crash path (`crop_to_fov` on an empty mask), the
 unchanged bbox for a normal mask, the generator's selective skip-and-log behavior, and that normal
 images are entirely unaffected.
+
+---
+
+## 32. RAM exhaustion — fixed (two-phase workflow: cache precomputation / training)
+
+**Finding:** with the §31 empty-FOV fix in place, the first real T4 training attempt ran for
+~50 minutes, skipped 4 empty-FOV images as designed, and then exhausted all of Colab's available
+RAM before epoch 1 ever completed — while still inside the dataset/cache pipeline, not inside
+`model.fit()`'s actual gradient computation. Measured root cause: `_make_joint_dataset()` sized
+its `tf.data` shuffle buffer to `buffer_size=max(len(entries), 1)` — the ENTIRE dataset (up to
+2929 for train). `tf.data.Dataset.shuffle()` holds `buffer_size` **fully-materialized** elements
+at once, not file paths or lazy references — and each element here is a
+`(512,512,8)` + `(256,256,3)` float32 sample pair, ≈8.75 MB. `2929 × 8.75 MB ≈ 25.6 GB`, which by
+itself exceeds even Colab Pro's higher-RAM tier, independent of Stage 03/04/RACAF inference cost,
+Drive I/O speed, or any Python-side list accumulation (there was none — the existing
+`_get_or_compute_joint_frozen_outputs()` per-image caching already discarded each image's arrays
+before moving to the next; it was never the accumulation mechanism). The identical
+`buffer_size=len(entries)` pattern was independently confirmed in three sibling dataset loaders:
+`local_feature_extraction_dataset.py` (Stage 05, same ≈8 MB/sample — same severity),
+`global_feature_extraction_dataset.py` (Stage 06, ≈0.75 MB/sample — smaller but still unbounded),
+and `lesion_segmentation_dataset.py` (IDRiD, only 81 fixed images total — harmless in practice, so
+left unchanged, same reasoning as §31's identical judgment call).
+
+**Fix made — two parts:**
+
+1. **Bounded shuffle buffer.** `joint_training_dataset.py`, `local_feature_extraction_dataset.py`,
+   and `global_feature_extraction_dataset.py` each now cap their shuffle buffer at a small, FIXED
+   `DEFAULT_SHUFFLE_BUFFER_SIZE = 256` (`buffer_size = max(1, min(len(entries), <cap>))`) instead
+   of `max(len(entries), 1)` — memory now stays bounded (~2.2 GB worst case for the joint
+   pipeline) regardless of how large the dataset is. This alone fixes the crash: `RUN_TRAINING`
+   in the notebook is memory-safe again even with no other change.
+
+2. **Phase 1 / Phase 2 separation (recommended, not required for correctness).**
+   `joint_training_dataset.precompute_joint_frozen_caches(entries, ...)` streams over `entries`
+   ONE IMAGE AT A TIME, calling the same, unmodified `_get_or_compute_joint_frozen_outputs()`
+   every existing consumer already uses — no per-image array is ever held past its own loop
+   iteration, no list of samples is ever accumulated, and an entry whose cache already fully
+   exists is skipped without touching `vessel_model`/`stage4_model` at all. This makes cache
+   precomputation safe to interrupt and resume indefinitely: a valid cache entry is never
+   recomputed or deleted, only missing ones are filled in.
+   `precompute_authoritative_joint_caches(...)` is the real-workflow entry point — it reads the
+   SAME authoritative split (§6) as `load_joint_training_datasets()` (never a second one) and
+   precomputes caches for both train and val. Phase 2 (`load_joint_training_datasets`) is
+   functionally unchanged: it still computes-and-caches any still-uncached entry on the fly if
+   Phase 1 was skipped, so running Phase 1 first is a recommended optimization (it decouples slow,
+   Drive-I/O-bound Stage 03/04/RACAF inference from the actual `Trainer.fit()` call, and makes
+   repeated training runs, e.g. with different hyperparameters, much faster once caches exist) —
+   never a hard requirement.
+
+**No architecture, tensor contract, loss, or split changed.** Stage 3/4 remain frozen and
+untouched; Stage 5/6/7/RACAF/CORN architecture is unchanged; the authoritative split is still
+exactly 2929 train / 733 val, read from the same manifest, never a second one; the canonical
+512×512 cache contract and RACAF `kappa`/`r` cache contract are unchanged (Phase 1 writes to the
+exact same cache files Phase 2 already read); synchronized augmentation is unaffected (it still
+happens after cached frozen outputs are read, inside `_build_joint_sample`, never by modifying a
+canonical cache file). No `.cache()` (in-RAM `tf.data` cache) is used anywhere in this pipeline —
+confirmed by inspection, not assumed.
+
+**Existing Drive caches remain valid.** Nothing about the cache file format, path convention, or
+contents changed — only how/when caches get populated. Any cache entries already written by a
+prior run (including the 4 images already skipped for empty FOV, and whatever fraction of the
+dataset the crashed run got through before running out of RAM) are reused as-is.
+
+**Notebook workflow (`colab/notebooks/stage08_corn_classifier.ipynb`):** a new gated cell pair
+("Phase 1 -- Cache precomputation", `RUN_CACHE_PRECOMPUTATION = False` by default) was inserted
+between the existing "Persistent cache locations" and "Joint model construction" cells. Setting
+`RUN_CACHE_PRECOMPUTATION = True` and running that cell first stages APTOS2019's raw images onto
+the Colab VM's local SSD (`dataset_staging.stage_dataset()` — the SAME generic staging module
+`stage01_iqa.ipynb` already uses for EyeQ, not reimplemented), then calls
+`precompute_authoritative_joint_caches(image_dir=<staged train_images dir>, ...)` for the whole
+dataset; it is always safe to interrupt and re-run (re-staging is a no-op if already staged, and
+already-cached entries are skipped as always). The existing "Dataset loading" / "Experiment +
+training" cells (`RUN_TRAINING`) are otherwise unchanged — they still read directly from Drive and
+work standalone, now with the bounded shuffle buffer.
+
+Regression tests: `tests/test_joint_training.py` (`ShuffleBufferBoundTests`,
+`CachePrecomputationTests`, `PrecomputeAuthoritativeCachesTests`, `Phase2UsesExistingCachesTests`),
+`tests/test_local_feature_extraction_dataset.py` (`ShuffleBufferBoundTests`),
+`tests/test_global_feature_extraction_dataset.py` (`ShuffleBufferBoundTests`) — all synthetic,
+tiny fixtures; no 3662-image cache generation is ever run in the test suite.

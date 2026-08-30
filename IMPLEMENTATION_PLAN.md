@@ -288,9 +288,13 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (43 tests, `tests/test_joint_training.py`, plus 11 more in
-  `tests/test_corn.py` for the CORN-aware QWK metric below). NOT trained — no `model.fit()` call
-  on real data, no epoch, no checkpoint exists anywhere in this repository or on Drive.**
+- **Status: Implemented, unit-tested (66 tests, `tests/test_joint_training.py`, plus 12 more in
+  `tests/test_corn.py` for the CORN-aware QWK metric below). The first real T4 training attempt
+  hit two blockers, both fixed and unit-tested (no real training or checkpoint produced by either
+  fix) — see `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a
+  real APTOS image) and §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed
+  alongside a new, optional cache-precomputation phase). Not yet trained to completion — no
+  finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
 - **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that
   `compile_joint_model()` originally compiled with no metric at all, so `monitor="val_QWK"`
@@ -335,8 +339,16 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   (`batch_size=2`, `mixed_precision=True`, `monitor="val_QWK"`, `mode="max"`) and
   dataset-loading/`Trainer` cells gated behind `RUN_TRAINING = False` — opening or running this
   notebook as committed does not start training.
-- **Next step:** set `RUN_TRAINING = True` and actually run joint training on a real Colab T4 —
-  not attempted by this step, per its own explicit no-training instruction.
+- **`joint_training_dataset.precompute_joint_frozen_caches()` / `precompute_authoritative_joint_caches()`**
+  — an optional Phase 1 that streams Stage 03/04/RACAF cache population one image at a time
+  (bounded memory, resumable, reuses the existing on-disk cache check), decoupled from
+  `load_joint_training_datasets()`/`Trainer.fit()` (Phase 2). Not required for correctness — Phase
+  2 still computes-and-caches any uncached entry on the fly — but recommended for a real training
+  run so slow, Drive-I/O-bound inference doesn't happen inline with the first epoch. Wired into the
+  notebook as a new gated cell (`RUN_CACHE_PRECOMPUTATION = False` by default).
+- **Next step:** set `RUN_TRAINING = True` (optionally after `RUN_CACHE_PRECOMPUTATION = True`) and
+  actually run joint training on a real Colab T4 — not attempted by this step, per its own explicit
+  no-training instruction.
 
 ### Step 9 — Uncertainty Estimation (Monte Carlo Dropout) — integration only
 - **Why:** Already implemented and correct in `bayesian_inference.py`; this step re-points it at the new model.

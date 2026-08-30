@@ -124,6 +124,14 @@ DEFAULT_VAL_SPLIT = 0.2
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_SEED = 42
 
+# A FIXED cap, never `len(entries)` -- each already-materialized `(512,512,8)` float32 sample is
+# ~8 MB, so a shuffle buffer sized to the whole dataset (e.g. up to 2929 for APTOS2019) would
+# demand tens of GB before an epoch could even start, independent of Stage 03/04 inference cost
+# (the actual root cause of the joint training pipeline's first real-run RAM exhaustion --
+# `joint_training_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE`'s comment). 256 samples (~2 GB) gives
+# meaningful shuffling while staying bounded regardless of dataset size.
+DEFAULT_SHUFFLE_BUFFER_SIZE = 256
+
 
 # --- Filesystem discovery -- APTOS2019's own labeled train.csv ---
 
@@ -528,7 +536,9 @@ def _make_dataset(entries, image_dir, cache_dir, vessel_model, lesion_model,
     )
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     if shuffle:
-        ds = ds.shuffle(buffer_size=max(len(entries), 1), seed=seed, reshuffle_each_iteration=True)
+        # A FIXED cap (never len(entries)) -- see DEFAULT_SHUFFLE_BUFFER_SIZE's comment.
+        buffer_size = max(1, min(len(entries), DEFAULT_SHUFFLE_BUFFER_SIZE))
+        ds = ds.shuffle(buffer_size=buffer_size, seed=seed, reshuffle_each_iteration=True)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 

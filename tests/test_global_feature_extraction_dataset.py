@@ -15,8 +15,10 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
+import tensorflow as tf
 from PIL import Image
 
 import global_feature_extraction_dataset as gfed
@@ -175,6 +177,40 @@ class TfDataPipelineTests(unittest.TestCase):
         x_b, _ = next(iter(val_ds_b))
 
         np.testing.assert_array_equal(np.asarray(x_a), np.asarray(x_b))
+
+
+class ShuffleBufferBoundTests(unittest.TestCase):
+    """Regression test mirroring `tests/test_joint_training.py`'s `ShuffleBufferBoundTests`: the
+    RAM-exhaustion root cause fixed there (`buffer_size=len(entries)` on already-materialized
+    tensors) was the exact same pattern in this module's `_make_dataset` -- fixed the same way,
+    with the same FIXED-cap requirement."""
+
+    def setUp(self):
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1), ("img_c", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _captured_buffer_size(self):
+        original_shuffle = tf.data.Dataset.shuffle
+        captured = {}
+
+        def spy_shuffle(ds_self, buffer_size, **kwargs):
+            captured["buffer_size"] = buffer_size
+            return original_shuffle(ds_self, buffer_size, **kwargs)
+
+        with mock.patch.object(tf.data.Dataset, "shuffle", new=spy_shuffle):
+            gfed._make_dataset(
+                self.tree.pairs, self.tree.image_dir, (32, 32), batch_size=1,
+                shuffle=True, augment=False, seed=0,
+            )
+        return captured["buffer_size"]
+
+    def test_buffer_size_is_capped_when_dataset_exceeds_the_cap(self):
+        with mock.patch("global_feature_extraction_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE", 2):
+            self.assertEqual(self._captured_buffer_size(), 2)
+
+    def test_buffer_size_never_scales_with_dataset_size(self):
+        self.assertLess(gfed.DEFAULT_SHUFFLE_BUFFER_SIZE, 2929)
+        self.assertGreater(gfed.DEFAULT_SHUFFLE_BUFFER_SIZE, 0)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import tensorflow as tf
 import torch
 from PIL import Image
 
@@ -449,6 +450,47 @@ class EmptyFieldOfViewHandlingTests(unittest.TestCase):
         )
         labels = [int(y.numpy()[0]) for _, y in ds]
         self.assertEqual(sorted(labels), [0, 1, 3])
+
+
+class ShuffleBufferBoundTests(unittest.TestCase):
+    """Regression test for the joint training pipeline's RAM-exhaustion root cause
+    (`tests/test_joint_training.py`'s `ShuffleBufferBoundTests`) -- `_make_dataset` here used the
+    exact same `buffer_size=len(entries)` pattern on already-materialized `(512,512,8)` float32
+    samples (~8 MB each), fixed the same way: a FIXED cap that never scales with dataset size."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.lesion_model = _build_synthetic_lesion_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1), ("img_c", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _captured_buffer_size(self):
+        original_shuffle = tf.data.Dataset.shuffle
+        captured = {}
+
+        def spy_shuffle(ds_self, buffer_size, **kwargs):
+            captured["buffer_size"] = buffer_size
+            return original_shuffle(ds_self, buffer_size, **kwargs)
+
+        with mock.patch.object(tf.data.Dataset, "shuffle", new=spy_shuffle):
+            lfed._make_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                self.vessel_model, self.lesion_model, image_size=(64, 64),
+                batch_size=1, shuffle=True, augment=False, seed=0,
+            )
+        return captured["buffer_size"]
+
+    def test_buffer_size_is_capped_when_dataset_exceeds_the_cap(self):
+        with mock.patch("local_feature_extraction_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE", 2):
+            self.assertEqual(self._captured_buffer_size(), 2)
+
+    def test_buffer_size_equals_dataset_size_when_smaller_than_the_cap(self):
+        with mock.patch("local_feature_extraction_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE", 10):
+            self.assertEqual(self._captured_buffer_size(), 3)
+
+    def test_buffer_size_never_scales_with_dataset_size(self):
+        self.assertLess(lfed.DEFAULT_SHUFFLE_BUFFER_SIZE, 2929)
+        self.assertGreater(lfed.DEFAULT_SHUFFLE_BUFFER_SIZE, 0)
 
 
 class TfDataPipelineTests(unittest.TestCase):

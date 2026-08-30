@@ -51,6 +51,26 @@ skipped `image_id`, and excludes just that sample from the epoch. This does NOT 
 authoritative split manifest on disk (`dataset_splits/aptos2019_train_val_split.csv` keeps every
 id, unchanged) -- it only means a `tf.data.Dataset` built here may yield slightly fewer than the
 manifest's nominal 2929 (train) / 733 (val) samples per epoch, by however many ids are affected.
+
+Two-phase workflow (`JOINT_TRAINING_ARCHITECTURE.md` §32) -- fixes the first real T4 run's RAM
+exhaustion:
+  - Root cause: `_make_joint_dataset()` previously sized its `tf.data` shuffle buffer to the
+    ENTIRE dataset (`buffer_size=len(entries)`, up to 2929) -- but each already-materialized
+    sample here is a `(512,512,8)` + `(256,256,3)` float32 pair (~8.75 MB), so that buffer alone
+    demanded ~25 GB before an epoch could even start, regardless of Stage 3/4 inference cost.
+    Fixed: the shuffle buffer is now capped at `DEFAULT_SHUFFLE_BUFFER_SIZE`, a small, FIXED
+    constant that never scales with dataset size.
+  - `precompute_joint_frozen_caches()` / `precompute_authoritative_joint_caches()` (Phase 1) let
+    Stage 03/04/RACAF's expensive, Drive-I/O-bound per-image inference run as its own pass,
+    BEFORE `load_joint_training_datasets()` (Phase 2) ever builds a `tf.data` pipeline or starts
+    `Trainer.fit()`. Phase 1 processes one image at a time -- no per-image array is ever held
+    past its own loop iteration, no list of samples is ever accumulated -- and writes straight to
+    the SAME persistent, on-disk cache Phase 2 already reads (`_get_or_compute_joint_frozen_outputs`,
+    unchanged). Already-cached entries are skipped (that function's own existing check), so Phase
+    1 is always safe to interrupt and re-run: no valid cache entry is ever recomputed or deleted.
+    Phase 2 still works correctly on its own even if Phase 1 was never run (any still-uncached
+    entry is computed on the fly, exactly as before) -- Phase 1 is a recommended optimization to
+    decouple slow cache-building from the training loop, not a new requirement for correctness.
 """
 
 import logging
@@ -89,6 +109,14 @@ DEFAULT_RACAF_CACHE_DIR = racaf.DEFAULT_CACHE_DIR
 DEFAULT_VAL_SPLIT = lfed.DEFAULT_VAL_SPLIT
 DEFAULT_BATCH_SIZE = lfed.DEFAULT_BATCH_SIZE
 DEFAULT_SEED = lfed.DEFAULT_SEED
+
+# A FIXED cap, never `len(entries)` -- each already-materialized sample here is ~8.75 MB
+# (`(512,512,8)` + `(256,256,3)` float32), so a shuffle buffer sized to the whole dataset (up to
+# 2929) previously demanded ~25 GB and was the actual cause of the first real T4 run's RAM
+# exhaustion (see module docstring's "Two-phase workflow" section). 256 samples (~2.2 GB) gives
+# meaningful shuffling while staying well within a T4 Colab runtime's memory budget regardless of
+# how large the dataset itself is.
+DEFAULT_SHUFFLE_BUFFER_SIZE = 256
 
 
 def split_train_val_ids(csv_path=DEFAULT_TRAIN_CSV, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED):
@@ -234,6 +262,93 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
     }
 
 
+# --- Phase 1: cache precomputation, decoupled from Phase 2 (tf.data construction / training) ---
+
+def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, cache_dir=DEFAULT_CACHE_DIR,
+                                    racaf_cache_dir=DEFAULT_RACAF_CACHE_DIR, vessel_model=None,
+                                    vessel_model_path=DEFAULT_VESSEL_MODEL_PATH, stage4_model=None,
+                                    processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
+                                    progress_every=50):
+    """Phase 1 of the two-phase joint training workflow (module docstring; `JOINT_TRAINING_
+    ARCHITECTURE.md` §32): populates every entry's Stage 03/04 + RACAF on-disk cache, ONE IMAGE AT
+    A TIME, with no `tf.data` pipeline involved at all -- this is the expensive, CPU/Drive-I/O-
+    bound half of joint training, deliberately separable from `load_joint_training_datasets()`
+    (Phase 2) so it can be run, interrupted, and resumed independently of the actual `.fit()` call.
+
+    Bounded memory: only ONE image's `(vessel_map, lesion_maps, kappa, r)` ever exists at a time
+    -- each is discarded (via `_get_or_compute_joint_frozen_outputs`'s own cache-write and this
+    function's loop moving on) before the next entry starts. Nothing per-image is accumulated
+    into a list or returned; only small, fixed-size integer/string bookkeeping is.
+
+    Resumable / cache-safe: an entry whose vessel/lesion/reliability cache files ALL already exist
+    is skipped without touching `vessel_model`/`stage4_model` at all (the same check
+    `_get_or_compute_joint_frozen_outputs` already performs) -- so interrupting this function
+    (a Colab disconnect, a manual stop) and re-running it later never recomputes or deletes a
+    valid cache entry; it only fills in whatever is still missing.
+
+    `EmptyFieldOfViewError` (see that class's docstring, `vessel_segmentation_inference.py`) is
+    caught per-image here too, logged, and skipped -- identical to `_make_joint_dataset`'s
+    generator -- so one unprocessable image never blocks precomputing every other image's cache.
+
+    Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...]}`.
+    """
+    entries = list(entries)
+    resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
+    resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
+
+    stats = {"cached": 0, "already_cached": 0, "skipped_empty_fov": []}
+    for i, (id_code, _diagnosis) in enumerate(entries):
+        vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
+        lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
+        reliability_cache = racaf.reliability_cache_path(racaf_cache_dir, id_code)
+
+        if os.path.exists(vessel_cache) and os.path.exists(lesion_cache) and os.path.exists(reliability_cache):
+            stats["already_cached"] += 1
+        else:
+            raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
+            rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
+            try:
+                _get_or_compute_joint_frozen_outputs(
+                    rgb_native, vessel_cache, lesion_cache, reliability_cache,
+                    resolved_vessel_model, resolved_stage4_model, image_size=image_size,
+                )
+                stats["cached"] += 1
+            except EmptyFieldOfViewError:
+                logger.warning(
+                    "Skipping image_id=%s during cache precomputation: empty Stage 03 "
+                    "field-of-view (no fundus disk detected).", id_code,
+                )
+                stats["skipped_empty_fov"].append(id_code)
+
+        if progress_every and (i + 1) % progress_every == 0:
+            logger.info(
+                "Cache precomputation: %d/%d images processed (%d newly cached, %d already "
+                "cached, %d skipped).",
+                i + 1, len(entries), stats["cached"], stats["already_cached"],
+                len(stats["skipped_empty_fov"]),
+            )
+    return stats
+
+
+def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=DEFAULT_TRAIN_IMAGE_DIR,
+                                           cache_dir=DEFAULT_CACHE_DIR, racaf_cache_dir=DEFAULT_RACAF_CACHE_DIR,
+                                           vessel_model=None, vessel_model_path=DEFAULT_VESSEL_MODEL_PATH,
+                                           stage4_model=None, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED,
+                                           processed_dir=DEFAULT_PROCESSED_DIR, progress_every=50):
+    """Phase 1 entry point for the real training workflow -- precomputes caches for BOTH halves of
+    the SAME authoritative split (`split_train_val_ids`) `load_joint_training_datasets()` (Phase
+    2) reads, never a second one. Loads `vessel_model`/`stage4_model` at most once each, regardless
+    of how many of the combined 3662 entries still need computing."""
+    train_entries, val_entries = split_train_val_ids(csv_path, val_split=val_split, seed=seed)
+    resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
+    resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
+    return precompute_joint_frozen_caches(
+        train_entries + val_entries, image_dir=image_dir, cache_dir=cache_dir, racaf_cache_dir=racaf_cache_dir,
+        vessel_model=resolved_vessel_model, stage4_model=resolved_stage4_model,
+        processed_dir=processed_dir, progress_every=progress_every,
+    )
+
+
 # --- tf.data construction -- mirrors local_feature_extraction_dataset.py's /
 # global_feature_extraction_dataset.py's own _make_dataset pattern exactly ---
 
@@ -279,7 +394,11 @@ def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_m
     )
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     if shuffle:
-        ds = ds.shuffle(buffer_size=max(len(entries), 1), seed=seed, reshuffle_each_iteration=True)
+        # A FIXED cap (never len(entries)) -- see DEFAULT_SHUFFLE_BUFFER_SIZE's comment. Sizing
+        # this to the full dataset is what exhausted Colab's RAM on the first real T4 run: tf.data
+        # holds `buffer_size` fully-materialized samples at once, not just their file paths.
+        buffer_size = max(1, min(len(entries), DEFAULT_SHUFFLE_BUFFER_SIZE))
+        ds = ds.shuffle(buffer_size=buffer_size, seed=seed, reshuffle_each_iteration=True)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 

@@ -59,6 +59,11 @@ DEFAULT_VAL_SPLIT = lfed.DEFAULT_VAL_SPLIT
 DEFAULT_BATCH_SIZE = lfed.DEFAULT_BATCH_SIZE
 DEFAULT_SEED = lfed.DEFAULT_SEED
 
+# Re-exported, not reimplemented -- same FIXED shuffle-buffer cap as Stage 05
+# (`local_feature_extraction_dataset.DEFAULT_SHUFFLE_BUFFER_SIZE`'s comment); a buffer sized to
+# the whole dataset would scale memory with dataset size regardless of per-sample tensor size.
+DEFAULT_SHUFFLE_BUFFER_SIZE = lfed.DEFAULT_SHUFFLE_BUFFER_SIZE
+
 
 def split_train_val_ids(csv_path=DEFAULT_TRAIN_CSV, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED):
     """Identical to `local_feature_extraction_dataset.split_train_val_ids`
@@ -133,7 +138,9 @@ def _make_dataset(entries, image_dir, image_size, batch_size, shuffle, augment, 
     )
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     if shuffle:
-        ds = ds.shuffle(buffer_size=max(len(entries), 1), seed=seed, reshuffle_each_iteration=True)
+        # A FIXED cap (never len(entries)) -- see DEFAULT_SHUFFLE_BUFFER_SIZE's comment.
+        buffer_size = max(1, min(len(entries), DEFAULT_SHUFFLE_BUFFER_SIZE))
+        ds = ds.shuffle(buffer_size=buffer_size, seed=seed, reshuffle_each_iteration=True)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
