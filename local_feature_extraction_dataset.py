@@ -66,6 +66,7 @@ value is otherwise never altered once written.
 """
 
 import csv
+import logging
 import os
 
 import cv2
@@ -85,10 +86,13 @@ from lesion_segmentation_model import (
 )
 from vessel_segmentation_inference import (
     DEFAULT_MODEL_PATH as DEFAULT_VESSEL_MODEL_PATH,
+    EmptyFieldOfViewError,
     _load_rgb_array,
     load_vessel_model,
     predict_vessel_mask,
 )
+
+logger = logging.getLogger(__name__)
 
 NUM_CHANNELS = 8  # 3 RGB + 1 vessel probability + 4 lesion probabilities
 
@@ -497,10 +501,23 @@ def _make_dataset(entries, image_dir, cache_dir, vessel_model, lesion_model,
     def gen():
         rng = np.random.default_rng(seed) if augment else None
         for id_code, diagnosis in entries:
-            x, y = _build_sample(
-                id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size,
-                processed_dir=processed_dir,
-            )
+            try:
+                x, y = _build_sample(
+                    id_code, diagnosis, image_dir, cache_dir, vessel_model, lesion_model, image_size,
+                    processed_dir=processed_dir,
+                )
+            except EmptyFieldOfViewError:
+                # Same real, rare condition documented in EmptyFieldOfViewError: Stage 03's FOV
+                # circle-fit found no fundus disk for this image. No project-sanctioned fallback
+                # exists, so the image is skipped/quarantined for this epoch, not fabricated or
+                # allowed to crash the whole run. The authoritative split manifest is unchanged.
+                logger.warning(
+                    "Skipping image_id=%s: empty Stage 03 field-of-view (no fundus disk "
+                    "detected). This image cannot be processed by the frozen vessel "
+                    "segmentation FOV-crop step and is excluded from this epoch.",
+                    id_code,
+                )
+                continue
             if augment:
                 x = _augment(x, rng)
             yield x, y

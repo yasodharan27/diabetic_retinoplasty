@@ -41,8 +41,19 @@ Stage 1 (IQA) is never imported or called anywhere in this module -- per
 training. No ground-truth segmentation mask, IDRiD label, or `test.csv` value is ever read here --
 only Stage 03/04's own frozen, predicted outputs and `train.csv`'s `diagnosis` column via the
 authoritative split.
+
+Empty-FOV handling: a small number of real APTOS images make Stage 03's FOV circle-fit
+(`vessel_segmentation_inference.compute_fov_mask`) degenerate to an empty result (see
+`EmptyFieldOfViewError`'s docstring there for the exact mechanism). There is no project-sanctioned
+fallback for this -- no full-image FOV substitute, no synthetic vessel/lesion map -- so
+`_make_joint_dataset`'s generator explicitly catches `EmptyFieldOfViewError` per-image, logs the
+skipped `image_id`, and excludes just that sample from the epoch. This does NOT modify the
+authoritative split manifest on disk (`dataset_splits/aptos2019_train_val_split.csv` keeps every
+id, unchanged) -- it only means a `tf.data.Dataset` built here may yield slightly fewer than the
+manifest's nominal 2929 (train) / 733 (val) samples per epoch, by however many ids are affected.
 """
 
+import logging
 import os
 
 import numpy as np
@@ -55,9 +66,12 @@ import local_feature_extraction_dataset as lfed
 import racaf
 from vessel_segmentation_inference import (
     DEFAULT_MODEL_PATH as DEFAULT_VESSEL_MODEL_PATH,
+    EmptyFieldOfViewError,
     load_vessel_model,
     predict_vessel_mask,
 )
+
+logger = logging.getLogger(__name__)
 
 # --- Fixed by the approved joint design -- not free parameters of this module ---
 STAGE5_IMAGE_SIZE = lfed.DEFAULT_IMAGE_SIZE  # (512, 512), also Stage 04's own native resolution
@@ -230,10 +244,26 @@ def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_m
     def gen():
         rng = np.random.default_rng(seed) if augment else None
         for id_code, diagnosis in entries:
-            sample = _build_joint_sample(
-                id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
-                vessel_model, stage4_model, augment, rng, processed_dir=processed_dir,
-            )
+            try:
+                sample = _build_joint_sample(
+                    id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
+                    vessel_model, stage4_model, augment, rng, processed_dir=processed_dir,
+                )
+            except EmptyFieldOfViewError:
+                # A real but exceptional APTOS image: Stage 03's FOV circle-fit found no
+                # fundus disk at all (see `EmptyFieldOfViewError`'s docstring). There is no
+                # project-sanctioned fallback (no full-image FOV, no synthetic vessel/lesion
+                # map) for this case, so the image is explicitly skipped/quarantined for this
+                # epoch rather than crashing the whole run or fabricating a result. The
+                # authoritative split manifest on disk is NOT modified -- this id remains
+                # listed there; it is simply not yielded by this generator.
+                logger.warning(
+                    "Skipping image_id=%s: empty Stage 03 field-of-view (no fundus disk "
+                    "detected). This image cannot be processed by the frozen vessel "
+                    "segmentation FOV-crop step and is excluded from this epoch.",
+                    id_code,
+                )
+                continue
             yield (
                 (sample["stage5_input"], sample["stage6_input"], sample["reliability"]),
                 sample["grade"],

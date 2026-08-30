@@ -283,6 +283,169 @@ class CacheReuseAndRedundancyTests(unittest.TestCase):
 
 
 # =====================================================================
+# Empty-FOV handling (STEP B empty-FOV crash fix).
+# =====================================================================
+
+class EmptyFieldOfViewHandlingTests(unittest.TestCase):
+    """Regression tests for the empty-Stage-03-FOV crash: `crop_to_fov()`'s
+    `regionprops(fov_mask.astype(int))[0].bbox` raised a bare, context-free `IndexError` for a
+    real APTOS image whose FOV circle-fit degenerated to an empty mask (no fundus disk detected).
+    `vessel_segmentation_inference.py` now raises a named `EmptyFieldOfViewError` for that case
+    (see its docstring for the exact mechanism), and this module's dataset generator
+    (`_make_joint_dataset`) catches it, logs the skipped `image_id`, and excludes just that
+    sample -- rather than crashing the whole `.fit()` run or fabricating a vessel/FOV result. The
+    authoritative split manifest on disk is never touched by this handling."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_good", 1), ("img_empty_fov", 3), ("img_good_2", 0)])
+        self.addCleanup(self.tree.cleanup)
+
+    def test_build_joint_sample_propagates_empty_fov_error(self):
+        """The check itself lives at the narrowest layer (vessel_segmentation_inference's
+        crop_to_fov) -- _build_joint_sample does not swallow it; only the generator does."""
+        rng = np.random.default_rng(0)
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask",
+            side_effect=jtd.EmptyFieldOfViewError("no fundus disk detected"),
+        ):
+            with self.assertRaises(jtd.EmptyFieldOfViewError):
+                jtd._build_joint_sample(
+                    "img_empty_fov", 3, self.tree.image_dir, self.tree.cache_dir,
+                    self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                    augment=False, rng=rng,
+                )
+
+    def _flaky_build_sample(self, id_code, diagnosis, *args, **kwargs):
+        """Reproduces exactly one id (`img_empty_fov`) always failing with the real empty-FOV
+        exception, while every other id builds its sample normally -- proves the generator's
+        skip logic is selective, not a blanket catch that would also swallow unrelated errors."""
+        if id_code == "img_empty_fov":
+            raise jtd.EmptyFieldOfViewError("no fundus disk detected")
+        return self._real_build_sample(id_code, diagnosis, *args, **kwargs)
+
+    def test_generator_skips_only_the_empty_fov_image_and_continues(self):
+        """A 3-image dataset where one image always raises EmptyFieldOfViewError must yield
+        exactly the other 2 samples -- not crash, and not yield a fabricated 3rd sample."""
+        self._real_build_sample = jtd._build_joint_sample
+        with mock.patch("joint_training_dataset._build_joint_sample", side_effect=self._flaky_build_sample):
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            grades = [int(grade.numpy()[0]) for _, grade in ds]
+
+        self.assertEqual(len(grades), 2)
+        self.assertEqual(sorted(grades), [0, 1])
+
+    def test_generator_logs_a_warning_naming_the_skipped_image_id(self):
+        self._real_build_sample = jtd._build_joint_sample
+        with mock.patch("joint_training_dataset._build_joint_sample", side_effect=self._flaky_build_sample):
+            with self.assertLogs("joint_training_dataset", level="WARNING") as captured:
+                ds = jtd._make_joint_dataset(
+                    self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                    self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+                )
+                list(ds)
+        self.assertTrue(any("img_empty_fov" in message for message in captured.output))
+
+    def test_normal_images_are_completely_unaffected(self):
+        """No mocking at all -- every image in the synthetic tree has a normal, real fundus-disk
+        FOV, so the generator must yield exactly len(pairs) samples, none skipped. Proves the fix
+        preserves valid-image behavior exactly."""
+        ds = jtd._make_joint_dataset(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+        )
+        grades = [int(grade.numpy()[0]) for _, grade in ds]
+        self.assertEqual(sorted(grades), [0, 1, 3])
+
+    def test_authoritative_split_manifest_is_never_touched_by_skip_handling(self):
+        """The empty-FOV skip is a purely in-memory, generator-level exclusion -- it must never
+        write to or otherwise mutate the real authoritative split manifest on disk."""
+        manifest_path = downstream_split.DEFAULT_SPLIT_MANIFEST
+        before = os.path.getmtime(manifest_path) if os.path.exists(manifest_path) else None
+
+        self._real_build_sample = jtd._build_joint_sample
+        with mock.patch("joint_training_dataset._build_joint_sample", side_effect=self._flaky_build_sample):
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            list(ds)
+
+        after = os.path.getmtime(manifest_path) if os.path.exists(manifest_path) else None
+        self.assertEqual(before, after)
+
+
+class EmptyFieldOfViewLowLevelTests(unittest.TestCase):
+    """Direct, deterministic tests of the root-cause fix in
+    `vessel_segmentation_inference.py`, independent of the joint dataset -- exercising exactly
+    the code path the real crash traceback named (`crop_to_fov` -> `regionprops(...)[0].bbox`)."""
+
+    def test_crop_to_fov_raises_named_error_on_empty_mask(self):
+        from vessel_segmentation_inference import EmptyFieldOfViewError as VSIError
+        from vessel_segmentation_inference import crop_to_fov
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        empty_mask = np.zeros((64, 64), dtype=bool)
+        with self.assertRaises(VSIError):
+            crop_to_fov(image, empty_mask)
+
+    def test_crop_to_fov_unchanged_for_a_normal_nonempty_mask(self):
+        """Regression: proves the fix does not alter the bbox computed for any real, non-empty
+        FOV mask -- identical result to the pre-fix `regionprops(...)[0].bbox` call."""
+        from skimage.measure import regionprops
+
+        from vessel_segmentation_inference import crop_to_fov
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=bool)
+        mask[10:30, 5:20] = True
+        crop, bbox = crop_to_fov(image, mask)
+        expected_bbox = regionprops(mask.astype(int))[0].bbox
+        self.assertEqual(bbox, expected_bbox)
+        self.assertEqual(crop.shape, (20, 15, 3))
+
+    def test_fit_circle_raises_named_error_on_all_empty_binary_mask(self):
+        from vessel_segmentation_inference import EmptyFieldOfViewError as VSIError
+        from vessel_segmentation_inference import _fit_circle
+
+        with self.assertRaises(VSIError):
+            _fit_circle(np.zeros((64, 64), dtype=bool))
+
+    def test_compute_fov_mask_and_crop_still_succeed_end_to_end_for_a_real_fundus_image(self):
+        """No mocking -- the real `compute_fov_mask` + `crop_to_fov` pipeline on a normal
+        synthetic fundus photo, proving the added checks never fire for a valid image."""
+        from vessel_segmentation_inference import compute_fov_mask, crop_to_fov
+
+        image_array = _synthetic_fundus_image(size=256, seed=0)
+        fov_mask = compute_fov_mask(Image.fromarray(image_array))
+        self.assertTrue(fov_mask.any())
+        crop, bbox = crop_to_fov(image_array, fov_mask)
+        self.assertGreater(crop.shape[0], 0)
+        self.assertGreater(crop.shape[1], 0)
+
+    def test_predict_vessel_mask_raises_before_any_forward_pass_on_empty_fov(self):
+        """`compute_fov_mask` returning an empty mask must abort `predict_vessel_mask` via
+        `EmptyFieldOfViewError` before the (expensive) LWNet forward pass ever runs -- proven by
+        mocking compute_fov_mask alone and confirming the vessel model is never invoked."""
+        import vessel_segmentation_inference as vsi
+
+        model = _build_synthetic_vessel_model()
+        image_array = _synthetic_fundus_image(size=256, seed=0)
+        with mock.patch(
+            "vessel_segmentation_inference.compute_fov_mask",
+            return_value=np.zeros((256, 256), dtype=bool),
+        ):
+            with mock.patch.object(model, "forward", wraps=model.forward) as mocked_forward:
+                with self.assertRaises(vsi.EmptyFieldOfViewError):
+                    vsi.predict_vessel_mask(image_array, model=model)
+                mocked_forward.assert_not_called()
+
+
+# =====================================================================
 # Augmentation synchronization.
 # =====================================================================
 

@@ -23,6 +23,13 @@ unaltered port of the upstream circle-fitting algorithm.
 Stage 02's own preprocessing (Gamma Correction + CLAHE) is untouched by
 this module -- everything here runs *after* Stage 02, on its RGB PNG
 output, and never re-derives or duplicates that computation.
+
+`compute_fov_mask`/`crop_to_fov` can raise `EmptyFieldOfViewError` for a
+real (rare) atypical fundus photo whose foreground doesn't resemble a
+single filled disk -- see that class's docstring for the exact mechanism.
+Callers that iterate many images should catch it and skip/log the
+offending image explicitly rather than letting it (or the bare
+`IndexError` it replaces) abort the whole run.
 """
 
 import os
@@ -67,6 +74,28 @@ _INPUT_TRANSFORM = transforms.Compose([
 
 # --- FOV mask (ported from predict_one_image.py, skimage.draw.circle -> disk) ---
 
+class EmptyFieldOfViewError(ValueError):
+    """Raised when Stage 03's FOV-detection heuristic (`_fit_circle` /
+    `compute_fov_mask` / `crop_to_fov`) finds no fundus disk at all for a
+    given image, instead of the usual filled circle.
+
+    This is a data-quality condition, not a Stage 03 architecture or model
+    concern -- the vendored LWNet model is never invoked before this check
+    fires. It happens because `_fit_circle`'s local (Nelder-Mead) search
+    minimizes mismatch against the thresholded foreground mask with an
+    *unconstrained* radius: for an image whose foreground (after
+    `equalize_adapthist` + `threshold_minimum` + `binary_fill_holes`) is
+    sparse/scattered rather than one solid disk -- e.g. a very dark,
+    overexposed, or otherwise atypical/poor-quality fundus photo -- "no
+    circle at all" (radius <= 0) minimizes that mismatch better than any
+    real circle does, so the fit degenerates to an empty result.
+
+    Callers that iterate many images (dataset generators) should catch this
+    and skip/log the offending image_id explicitly rather than letting a
+    bare, context-free `IndexError` (from `regionprops(...)[0]` finding no
+    labeled regions) propagate."""
+
+
 def _fit_circle(binary_mask):
     """Fit a circle to `binary_mask` by local search, starting from its
     largest connected region's centroid/major-axis-length. Returns
@@ -74,9 +103,19 @@ def _fit_circle(binary_mask):
     `external/lwnet/predict_one_image.py`'s `get_circ` exactly, except for
     the `skimage.draw.circle` -> `skimage.draw.disk` swap (removed in
     scikit-image >=0.19; `disk((row, col), radius, shape=...)` returns the
-    same `(rr, cc)` pixel-coordinate pair `circle(row, col, radius, ...)` did)."""
+    same `(rr, cc)` pixel-coordinate pair `circle(row, col, radius, ...)` did).
+
+    Raises `EmptyFieldOfViewError` if `binary_mask` itself has no foreground
+    pixels (nothing for the circle fit to even start from) -- see that
+    class's docstring for why this can happen on a real fundus photo."""
     labeled = binary_mask.astype(int)
-    region = regionprops(labeled)[0]
+    regions = regionprops(labeled)
+    if not regions:
+        raise EmptyFieldOfViewError(
+            "_fit_circle received a binary_mask with no foreground pixels at all -- "
+            "threshold_minimum/binary_fill_holes found nothing to fit a circle to."
+        )
+    region = regions[0]
     row0, col0 = region.centroid
     radius0 = region.major_axis_length / 2.0
 
@@ -134,7 +173,19 @@ def compute_fov_mask(pil_image):
 def crop_to_fov(image_array, fov_mask):
     """Crop `image_array` (H, W, 3) to `fov_mask`'s bounding box. Ported
     from `crop_to_fov`, operating on numpy arrays directly rather than
-    round-tripping through PIL. Returns (crop, (minr, minc, maxr, maxc))."""
+    round-tripping through PIL. Returns (crop, (minr, minc, maxr, maxc)).
+
+    Raises `EmptyFieldOfViewError` if `fov_mask` has no foreground pixels --
+    i.e. `compute_fov_mask`'s circle fit degenerated to a zero-area region
+    for this image (see that class's docstring). This never changes
+    behavior for any image with a normal, non-empty FOV mask: the bbox
+    computed below is identical to before this check was added."""
+    if not fov_mask.any():
+        raise EmptyFieldOfViewError(
+            "fov_mask has no foreground pixels -- compute_fov_mask's circle fit degenerated "
+            "to an empty (zero-area) region for this image, so there is no bounding box to "
+            "crop to. This image cannot be processed by Stage 03's FOV-based cropping."
+        )
     minr, minc, maxr, maxc = regionprops(fov_mask.astype(int))[0].bbox
     crop = image_array[minr:maxr, minc:maxc]
     return crop, (minr, minc, maxr, maxc)

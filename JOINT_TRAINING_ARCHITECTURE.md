@@ -538,3 +538,39 @@ joint training procedure, Drive/cache infrastructure, augmentation synchronizati
 format, QWK-based model selection — is training/engineering strategy, not a second innovation. No
 new attention mechanism, fusion mechanism, uncertainty module, auxiliary loss, or feature extractor
 is introduced anywhere in this design.
+
+---
+
+## 31. Empty-FOV handling — fixed (first real T4 run blocker)
+
+**Finding:** the first real T4 training run crashed during epoch 1 with `IndexError: list index
+out of range` in `vessel_segmentation_inference.crop_to_fov()` (`regionprops(fov_mask.astype(int))
+[0].bbox`). Root cause: `compute_fov_mask()`'s circle-fit (`_fit_circle`, an unconstrained
+Nelder-Mead search) minimizes mismatch against the thresholded foreground mask with no radius
+constraint — for a real APTOS image whose thresholded foreground is sparse/scattered rather than
+one solid disk (confirmed for `id_code=0ce062f26edc`, train split, diagnosis 0: only ~2.3% of
+pixels pass `threshold_minimum`, and the fit converges to `radius≈-0.44`), "no circle at all"
+minimizes that mismatch better than any real circle, so `fov_mask` ends up with zero foreground
+pixels. This is a data-quality condition, not a Stage 03 architecture or model defect — the LWNet
+model is never invoked before the crash.
+
+**Fix made:** `vessel_segmentation_inference.py` now raises a named, documented
+`EmptyFieldOfViewError` (from `crop_to_fov`, and from `_fit_circle` for the sibling all-empty-input
+case) instead of letting the bare `IndexError` propagate — behavior for any image with a normal,
+non-empty FOV is completely unchanged (identical bbox, identical crop). There is no
+project-sanctioned full-image-FOV fallback and none was added. `joint_training_dataset.py`'s
+`_make_joint_dataset()` generator (and, for the identical exposure, `local_feature_extraction_
+dataset.py`'s `_make_dataset()` generator — both call the same `predict_vessel_mask`) now catch
+`EmptyFieldOfViewError` per-image, log the skipped `image_id`, and exclude just that sample from
+the epoch, rather than crashing the whole run or fabricating a vessel/FOV result. This does NOT
+modify the authoritative split manifest on disk (§6) — every id, including `0ce062f26edc`, remains
+listed there; a `tf.data.Dataset` built from it may simply yield one fewer sample than the nominal
+2929 (train) count per epoch. `lesion_segmentation_dataset.py` (IDRiD, 81 fixed images, already
+used to train the frozen Stage 04 checkpoint without incident) was left unchanged — no evidence
+this class of image exists in that small, already-processed set.
+
+Regression tests: `tests/test_joint_training.py` (`EmptyFieldOfViewHandlingTests`,
+`EmptyFieldOfViewLowLevelTests`) and `tests/test_local_feature_extraction_dataset.py`
+(`EmptyFieldOfViewHandlingTests`) — the exact crash path (`crop_to_fov` on an empty mask), the
+unchanged bbox for a normal mask, the generator's selective skip-and-log behavior, and that normal
+images are entirely unaffected.

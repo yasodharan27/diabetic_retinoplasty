@@ -398,6 +398,59 @@ class BuildSampleAndCacheTests(unittest.TestCase):
         np.testing.assert_array_equal(cached_vessel_map, expected)
 
 
+class EmptyFieldOfViewHandlingTests(unittest.TestCase):
+    """Regression tests mirroring `tests/test_joint_training.py`'s `EmptyFieldOfViewHandlingTests`:
+    Stage 05's own standalone loader shares the exact same `predict_vessel_mask` call (and thus
+    the exact same empty-FOV crash exposure) as the joint dataset, so it gets the identical
+    catch-and-skip fix in `_make_dataset`'s generator."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.lesion_model = _build_synthetic_lesion_model()
+        self.tree = _SyntheticAPTOSTree([("img_good", 1), ("img_empty_fov", 3), ("img_good_2", 0)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _flaky_build_sample(self, id_code, diagnosis, *args, **kwargs):
+        if id_code == "img_empty_fov":
+            from vessel_segmentation_inference import EmptyFieldOfViewError
+            raise EmptyFieldOfViewError("no fundus disk detected")
+        return self._real_build_sample(id_code, diagnosis, *args, **kwargs)
+
+    def test_generator_skips_only_the_empty_fov_image_and_continues(self):
+        self._real_build_sample = lfed._build_sample
+        with mock.patch("local_feature_extraction_dataset._build_sample", side_effect=self._flaky_build_sample):
+            ds = lfed._make_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                self.vessel_model, self.lesion_model, image_size=(64, 64),
+                batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            labels = [int(y.numpy()[0]) for _, y in ds]
+
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(sorted(labels), [0, 1])
+
+    def test_generator_logs_a_warning_naming_the_skipped_image_id(self):
+        self._real_build_sample = lfed._build_sample
+        with mock.patch("local_feature_extraction_dataset._build_sample", side_effect=self._flaky_build_sample):
+            with self.assertLogs("local_feature_extraction_dataset", level="WARNING") as captured:
+                ds = lfed._make_dataset(
+                    self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                    self.vessel_model, self.lesion_model, image_size=(64, 64),
+                    batch_size=1, shuffle=False, augment=False, seed=0,
+                )
+                list(ds)
+        self.assertTrue(any("img_empty_fov" in message for message in captured.output))
+
+    def test_normal_images_are_completely_unaffected(self):
+        ds = lfed._make_dataset(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+            self.vessel_model, self.lesion_model, image_size=(64, 64),
+            batch_size=1, shuffle=False, augment=False, seed=0,
+        )
+        labels = [int(y.numpy()[0]) for _, y in ds]
+        self.assertEqual(sorted(labels), [0, 1, 3])
+
+
 class TfDataPipelineTests(unittest.TestCase):
     """End-to-end: the public tf.data-producing function, over a tiny
     synthetic APTOS-shaped dataset."""
