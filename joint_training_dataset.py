@@ -75,6 +75,7 @@ exhaustion:
 
 import logging
 import os
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -141,7 +142,7 @@ def _resize_rgb_01(rgb_native_uint8, image_size):
 
 def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_cache_path,
                                           reliability_cache_path, vessel_model, stage4_model,
-                                          image_size=STAGE5_IMAGE_SIZE):
+                                          image_size=STAGE5_IMAGE_SIZE, known_not_all_cached=False):
     """Returns `(canonical_rgb, vessel_map, lesion_maps, kappa, r)` for one image --
     `canonical_rgb`/`vessel_map`: `(*image_size, {3,1})`, `lesion_maps`: `(*image_size, 4)`,
     `kappa`: `(4,)`, `r`: scalar float. `canonical_rgb` is always freshly resized (cheap, never
@@ -164,8 +165,18 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
     Stage 04 stays frozen throughout: `stage4_model` must be loaded via
     `racaf.load_frozen_stage4_model()` (`trainable=False`), and `racaf.tta_views()` already wraps
     every prediction in `tf.stop_gradient` -- neither is altered here.
+
+    `known_not_all_cached=True` lets a caller that has ALREADY verified (via its own
+    `os.path.exists` checks) that at least one of the three cache files is missing skip this
+    function's own identical upfront check -- a pure I/O-count optimization for a caller
+    (`precompute_joint_frozen_caches`) that iterates thousands of images against a Drive-mounted
+    cache directory, where every avoided `os.path.exists` round trip matters. It changes no
+    computed value, and no other existing caller passes it (defaults to the original, unchanged
+    behavior). The three per-file existence guards below -- which protect a partially-populated
+    cache left by a prior interrupted run from being needlessly overwritten -- are UNCHANGED and
+    still run either way; this only skips the redundant "are all three already done" recheck.
     """
-    all_cached = (
+    all_cached = not known_not_all_cached and (
         os.path.exists(vessel_cache_path)
         and os.path.exists(lesion_cache_path)
         and os.path.exists(reliability_cache_path)
@@ -270,10 +281,11 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                                     processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
                                     progress_every=50):
     """Phase 1 of the two-phase joint training workflow (module docstring; `JOINT_TRAINING_
-    ARCHITECTURE.md` §32): populates every entry's Stage 03/04 + RACAF on-disk cache, ONE IMAGE AT
-    A TIME, with no `tf.data` pipeline involved at all -- this is the expensive, CPU/Drive-I/O-
-    bound half of joint training, deliberately separable from `load_joint_training_datasets()`
-    (Phase 2) so it can be run, interrupted, and resumed independently of the actual `.fit()` call.
+    ARCHITECTURE.md` §32/§33): populates every entry's Stage 03/04 + RACAF on-disk cache, ONE
+    IMAGE AT A TIME, with no `tf.data` pipeline involved at all -- this is the expensive, CPU/
+    Drive-I/O-bound half of joint training, deliberately separable from `load_joint_training_
+    datasets()` (Phase 2) so it can be run, interrupted, and resumed independently of the actual
+    `.fit()` call.
 
     Bounded memory: only ONE image's `(vessel_map, lesion_maps, kappa, r)` ever exists at a time
     -- each is discarded (via `_get_or_compute_joint_frozen_outputs`'s own cache-write and this
@@ -281,22 +293,43 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     into a list or returned; only small, fixed-size integer/string bookkeeping is.
 
     Resumable / cache-safe: an entry whose vessel/lesion/reliability cache files ALL already exist
-    is skipped without touching `vessel_model`/`stage4_model` at all (the same check
-    `_get_or_compute_joint_frozen_outputs` already performs) -- so interrupting this function
-    (a Colab disconnect, a manual stop) and re-running it later never recomputes or deletes a
-    valid cache entry; it only fills in whatever is still missing.
+    is skipped without touching `vessel_model`/`stage4_model` at all -- so interrupting this
+    function (a Colab disconnect, a manual stop) and re-running it later never recomputes or
+    deletes a valid cache entry; it only fills in whatever is still missing. That check happens
+    exactly ONCE per image here (not twice): `_get_or_compute_joint_frozen_outputs` is called with
+    `known_not_all_cached=True` in the "still needs computing" branch below, since this function
+    has already established that at least one of the three cache files is missing -- see that
+    parameter's docstring for why this specific redundancy (measured as a real contributor to
+    Phase 1's Drive-round-trip count -- `JOINT_TRAINING_ARCHITECTURE.md` §33) was worth removing.
 
     `EmptyFieldOfViewError` (see that class's docstring, `vessel_segmentation_inference.py`) is
     caught per-image here too, logged, and skipped -- identical to `_make_joint_dataset`'s
     generator -- so one unprocessable image never blocks precomputing every other image's cache.
 
-    Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...]}`.
+    Progress: every `progress_every` images (and once at the end), logs processed/cache-hit/
+    skipped counts alongside elapsed wall-clock time and a rolling images-per-minute rate -- so a
+    long Colab run's actual throughput is visible without guessing.
+
+    Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...],
+    "elapsed_seconds": float}`.
     """
     entries = list(entries)
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
 
     stats = {"cached": 0, "already_cached": 0, "skipped_empty_fov": []}
+    start_time = time.monotonic()
+
+    def _log_progress(count):
+        elapsed = time.monotonic() - start_time
+        images_per_minute = (count / elapsed) * 60.0 if elapsed > 0 else 0.0
+        logger.info(
+            "Cache precomputation: %d/%d images processed (%d newly cached, %d already cached, "
+            "%d skipped) -- %.1fs elapsed, %.1f images/min.",
+            count, len(entries), stats["cached"], stats["already_cached"],
+            len(stats["skipped_empty_fov"]), elapsed, images_per_minute,
+        )
+
     for i, (id_code, _diagnosis) in enumerate(entries):
         vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
         lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
@@ -311,6 +344,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 _get_or_compute_joint_frozen_outputs(
                     rgb_native, vessel_cache, lesion_cache, reliability_cache,
                     resolved_vessel_model, resolved_stage4_model, image_size=image_size,
+                    known_not_all_cached=True,
                 )
                 stats["cached"] += 1
             except EmptyFieldOfViewError:
@@ -321,12 +355,11 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 stats["skipped_empty_fov"].append(id_code)
 
         if progress_every and (i + 1) % progress_every == 0:
-            logger.info(
-                "Cache precomputation: %d/%d images processed (%d newly cached, %d already "
-                "cached, %d skipped).",
-                i + 1, len(entries), stats["cached"], stats["already_cached"],
-                len(stats["skipped_empty_fov"]),
-            )
+            _log_progress(i + 1)
+
+    if progress_every and len(entries) % progress_every != 0:
+        _log_progress(len(entries))
+    stats["elapsed_seconds"] = time.monotonic() - start_time
     return stats
 
 

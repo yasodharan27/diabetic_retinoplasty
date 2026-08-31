@@ -654,3 +654,83 @@ Regression tests: `tests/test_joint_training.py` (`ShuffleBufferBoundTests`,
 `tests/test_local_feature_extraction_dataset.py` (`ShuffleBufferBoundTests`),
 `tests/test_global_feature_extraction_dataset.py` (`ShuffleBufferBoundTests`) — all synthetic,
 tiny fixtures; no 3662-image cache generation is ever run in the test suite.
+
+---
+
+## 33. Phase 1 throughput — diagnosed and fixed (Drive-mounted cache I/O)
+
+**Symptom:** with §32's fixes in place, a real `RUN_CACHE_PRECOMPUTATION=True` T4 run processed
+only a handful of images in ~2 hours (8 empty-FOV skips observed) — impractical.
+
+**Diagnosis (measured from code, not guessed):** ruled out first —
+  - *Repeated model loading*: `precompute_joint_frozen_caches`/`precompute_authoritative_joint_caches`
+    load `vessel_model`/`stage4_model` exactly once, before the loop, confirmed by inspection —
+    not the cause.
+  - *CPU-bound inference*: Stage 03/04 forward passes on a T4 GPU for a single `512×512` image are
+    sub-second; `compute_fov_mask` (Stage 03's CPU-only FOV heuristic, unchanged/frozen — see §31)
+    was independently measured (this session, same machine class) at ~1-2s/image — real, but not
+    enough alone to explain multi-minutes-per-image.
+  - *Repeatedly reading/writing Drive* (confirmed, dominant): the notebook resolves `cache_dir=
+    config.LOCAL_FEATURE_RESULTS_DIR` and `racaf_cache_dir=config.RACAF_RESULTS_DIR` to
+    `colab_config.LOCAL_FEATURE_CACHE_DIR`/`RACAF_CACHE_DIR` — both **Google Drive** paths
+    (`drive_paths.py`'s `DRIVE.cache_dir(...)`, wired by `colab/common/setup.py`). Every
+    `os.path.exists` check and every `np.save`/`np.savez` write for these caches was therefore a
+    Google Drive FUSE round trip, which (per this project's own `dataset_staging.py` docstring)
+    is "latency-bound per file open, not bandwidth-bound." `APTOS2019_PROCESSED_DIR` (the default
+    `processed_dir` `_resolve_processed_rgb` checks) is likewise Drive-mounted, adding one more
+    per-image Drive stat. None of this touches Stage 3/4/RACAF's own computation.
+  - *Redundant work* (confirmed, minor): for every still-uncached image,
+    `precompute_joint_frozen_caches` checked all three cache paths' existence itself, then called
+    `_get_or_compute_joint_frozen_outputs`, which — unaware the caller had already checked —
+    immediately re-checked the identical three paths again before falling through to computation.
+    Python's `and` short-circuits that recheck at its first `False`, so this wasted exactly 1
+    extra Drive round trip for a fully-uncached image (the common case), up to 3 for a
+    partially-cached one left by a prior interrupted run — small next to the dominant cost above,
+    but free to remove and folded into the same fix.
+
+**Fix — three parts, no compute/architecture change:**
+
+1. **Local cache during precomputation, synced to/from Drive in bulk.** A new, generic,
+   direction-agnostic `dataset_staging.sync_missing_files(source_dir, dest_dir)` (alongside the
+   existing `stage_dataset()`, reusing its same thread-pool-concurrency `_copy_one` copy — not a
+   competing mechanism) copies only files missing at the destination, in either direction. The
+   notebook's Phase 1 cell now: (a) **pulls** any cache entries a prior session already wrote to
+   Drive down to a local cache dir (`/content/cache/...`) — resumability fully preserved, just
+   against a local mirror; (b) runs `precompute_authoritative_joint_caches()` entirely against
+   that **local** `cache_dir`/`racaf_cache_dir` (fast SSD I/O in the hot loop, zero Drive round
+   trips per image) and a local, deliberately-empty `processed_dir` (so `_resolve_processed_rgb`
+   always takes its cheap, unmodified live Stage 02 fallback rather than one more Drive lookup);
+   (c) **pushes** every newly-written local cache entry back up to Drive so it persists. A new
+   **Phase 1b** cell runs the push step alone, at any time, so a manually interrupted run's
+   progress can be flushed to Drive without waiting for the whole precomputation to finish.
+2. **Redundant existence check removed.** `_get_or_compute_joint_frozen_outputs()` gained one new,
+   opt-in parameter, `known_not_all_cached=False` (default preserves the exact original behavior
+   for every existing caller, including `_build_joint_sample`/Phase 2) — when a caller has already
+   verified at least one cache file is missing, passing `known_not_all_cached=True` skips the
+   function's own duplicate recheck of the same three paths. `precompute_joint_frozen_caches`
+   passes it; nothing else does. The three PER-FILE write guards (protecting a partially-populated
+   cache left by an interrupted run) are untouched either way.
+3. **Throughput visibility.** `precompute_joint_frozen_caches`'s progress log (every
+   `progress_every` images, and once more at the end even if the count doesn't land on that
+   boundary) now reports elapsed wall-clock time and a rolling images-per-minute rate alongside
+   the existing processed/cached/skipped counts, and the returned stats dict gains
+   `"elapsed_seconds"` — so a long run's real speed is visible without guessing.
+
+**Batching/vectorizing Stage 03/04 inference across multiple images was considered and NOT
+implemented.** Given the diagnosis above places the dominant cost in Drive I/O, not GPU compute,
+batching would add real risk (touching `racaf.tta_views`/`prepare_stage4_input`'s shared, tested
+contract, requiring new batch-shape coverage for RACAF's TTA/reliability path) for uncertain
+marginal benefit once I/O is no longer the bottleneck. `predict_vessel_mask_batch()` already
+exists in `vessel_segmentation_inference.py` for a possible future pass if Drive I/O elimination
+alone still proves insufficient on real Colab hardware — deliberately not wired in here.
+
+No Stage 3/4/RACAF/Stage 5/6/7/CORN architecture, weights, reliability equations, or TTA
+definition changed. All four RACAF TTA views remain. The canonical cache format/keys are
+unchanged — only where (local vs. Drive) and how many times (once vs. twice) each cache path is
+checked.
+
+Regression tests: `tests/test_dataset_staging.py` (`SyncMissingFilesTests` — copy-missing-only,
+resumability, both directions, no-op on a nonexistent source), `tests/test_joint_training.py`
+(`CachePrecomputationDriveRoundTripTests` — the redundant-check removal proven differentially
+[robust to incidental library `os.path.exists` calls] and by wiring, `known_not_all_cached`'s
+strictly-additive default, progress-log content, `elapsed_seconds` in the returned stats).

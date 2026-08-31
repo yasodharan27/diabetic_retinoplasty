@@ -552,12 +552,16 @@ class CachePrecomputationTests(unittest.TestCase):
 
     def test_returned_stats_are_small_fixed_size_bookkeeping_only(self):
         """Bounded-memory proof: the returned stats must never carry a per-image array -- only
-        counters and a list of (small) string ids for skipped images."""
+        counters, an elapsed-time float, and a list of (small) string ids for skipped images."""
         stats = self._precompute()
-        self.assertEqual(set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov"})
+        self.assertEqual(
+            set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov", "elapsed_seconds"},
+        )
         self.assertIsInstance(stats["cached"], int)
         self.assertIsInstance(stats["already_cached"], int)
         self.assertIsInstance(stats["skipped_empty_fov"], list)
+        self.assertIsInstance(stats["elapsed_seconds"], float)
+        self.assertGreaterEqual(stats["elapsed_seconds"], 0.0)
         for item in stats["skipped_empty_fov"]:
             self.assertIsInstance(item, str)
 
@@ -590,6 +594,119 @@ class CachePrecomputationTests(unittest.TestCase):
 
         self.assertEqual(stats["cached"], 2)
         self.assertEqual(stats["skipped_empty_fov"], ["img_b"])
+
+
+class CachePrecomputationDriveRoundTripTests(unittest.TestCase):
+    """Regression tests for the Phase 1 slowness diagnosis (`JOINT_TRAINING_ARCHITECTURE.md`
+    §33): a Drive-mounted `cache_dir`/`racaf_cache_dir` makes every `os.path.exists` call a slow
+    round trip, so `precompute_joint_frozen_caches` must never re-check the same three cache
+    paths twice for one image, and must report throughput so a long run's actual speed is
+    visible."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _exists_call_count(self, id_code, known_not_all_cached):
+        vessel_cache = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        lesion_cache = lfed._cache_path(self.tree.cache_dir, id_code, "lesion", jtd.STAGE5_IMAGE_SIZE)
+        reliability_cache = racaf.reliability_cache_path(self.tree.racaf_cache_dir, id_code)
+        raw_bgr = lfed._load_raw_bgr(self.tree.image_dir, id_code)
+        rgb_native = lfed._resolve_processed_rgb(raw_bgr, lfed.DEFAULT_PROCESSED_DIR, id_code)
+
+        with mock.patch("joint_training_dataset.os.path.exists", wraps=os.path.exists) as mocked_exists:
+            jtd._get_or_compute_joint_frozen_outputs(
+                rgb_native, vessel_cache, lesion_cache, reliability_cache,
+                self.vessel_model, self.stage4_model, known_not_all_cached=known_not_all_cached,
+            )
+        return mocked_exists.call_count
+
+    def test_known_not_all_cached_skips_the_redundant_upfront_check(self):
+        """Differential proof, robust to any incidental os.path.exists calls made by underlying
+        libraries during model inference (identical on both sides of this comparison, since both
+        runs execute the same subsequent code) -- what matters is that known_not_all_cached=True
+        skips the redundant "are all three already cached" recheck entirely. For a fully-
+        uncached image (neither img_a nor img_b has ANY cache file yet), Python's `and` short-
+        circuits that check after its first os.path.exists call returns False -- so the saving is
+        exactly 1 call here, not 3 (3 is the ceiling, reached only when the first two of the
+        three paths already exist from a prior partial run -- see the wiring test above for the
+        actual guarantee that matters: known_not_all_cached=True is always passed by the
+        precompute loop, so this check never runs redundantly regardless of partial-cache state).
+        Uses two different, independent image ids so neither run's cache files interfere with the
+        other's exists-call count."""
+        baseline_calls = self._exists_call_count("img_a", known_not_all_cached=False)
+        optimized_calls = self._exists_call_count("img_b", known_not_all_cached=True)
+        self.assertEqual(baseline_calls - optimized_calls, 1)
+
+    def test_precompute_calls_get_or_compute_with_known_not_all_cached_true(self):
+        """Wiring proof at the precompute-loop level: for an image that still needs computing,
+        `precompute_joint_frozen_caches` must pass known_not_all_cached=True (it has already
+        confirmed, via its own check, that at least one cache file is missing) -- this is what
+        actually eliminates the redundant Drive round trips in the real Colab run, verified here
+        independent of any incidental exists-call noise."""
+        with mock.patch(
+            "joint_training_dataset._get_or_compute_joint_frozen_outputs",
+            wraps=jtd._get_or_compute_joint_frozen_outputs,
+        ) as mocked_compute:
+            jtd.precompute_joint_frozen_caches(
+                [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            )
+        mocked_compute.assert_called_once()
+        _, kwargs = mocked_compute.call_args
+        self.assertTrue(kwargs.get("known_not_all_cached"))
+
+    def test_build_joint_sample_never_passes_known_not_all_cached(self):
+        """Regression: this parameter is strictly additive -- Phase 2's per-sample path
+        (`_build_joint_sample`, used by `_make_joint_dataset`/`load_joint_training_datasets`)
+        must keep performing the full, unmodified upfront check, since it has NOT already
+        verified cache state itself the way `precompute_joint_frozen_caches` has."""
+        with mock.patch(
+            "joint_training_dataset._get_or_compute_joint_frozen_outputs",
+            wraps=jtd._get_or_compute_joint_frozen_outputs,
+        ) as mocked_compute:
+            rng = np.random.default_rng(0)
+            jtd._build_joint_sample(
+                "img_a", 0, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=False, rng=rng,
+            )
+        mocked_compute.assert_called_once()
+        _, kwargs = mocked_compute.call_args
+        self.assertNotIn("known_not_all_cached", kwargs)
+
+    def test_progress_log_reports_elapsed_time_and_images_per_minute(self):
+        with self.assertLogs("joint_training_dataset", level="INFO") as captured:
+            jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model, progress_every=1,
+            )
+        progress_lines = [m for m in captured.output if "images processed" in m]
+        self.assertTrue(progress_lines)
+        for line in progress_lines:
+            self.assertIn("elapsed", line)
+            self.assertIn("images/min", line)
+
+    def test_stats_include_total_elapsed_seconds(self):
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertIn("elapsed_seconds", stats)
+        self.assertGreaterEqual(stats["elapsed_seconds"], 0.0)
+
+    def test_final_progress_line_is_always_logged_even_off_the_progress_every_boundary(self):
+        """2 entries with progress_every=50 never hits the modulo boundary mid-loop -- the final
+        summary log must still fire once at the end so a short/odd-sized run isn't silent."""
+        with self.assertLogs("joint_training_dataset", level="INFO") as captured:
+            jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model, progress_every=50,
+            )
+        progress_lines = [m for m in captured.output if "images processed" in m]
+        self.assertEqual(len(progress_lines), 1)
+        self.assertIn("2/2", progress_lines[0])
 
 
 class PrecomputeAuthoritativeCachesTests(unittest.TestCase):

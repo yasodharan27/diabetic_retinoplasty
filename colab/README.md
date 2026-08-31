@@ -71,7 +71,7 @@ notebook" below before writing training code into one of them.
 | `stage05_local_feature_extraction.ipynb` | 5. Local Feature Extraction | Template. **Locked:** trained jointly with Stages 6-8 + RACAF, not independently -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
 | `stage06_global_feature_extraction.ipynb` | 6. Global Feature Extraction | Template. **Locked:** trained jointly with Stages 5, 7, 8 + RACAF -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
 | `stage07_feature_fusion.ipynb` | 7. Feature Fusion | Template. **Locked:** trained jointly with Stages 5, 6, 8 + RACAF -- see `JOINT_TRAINING_ARCHITECTURE.md`. |
-| `stage08_corn_classifier.ipynb` | 8. CORN Classification | **Repurposed as the joint Stage 05-08+RACAF training notebook** (CORN has no standalone training path of its own) -- see `JOINT_TRAINING_ARCHITECTURE.md` §27. Infrastructure cells (Drive/environment/dataset/checkpoint verification, authoritative split, joint model construction, a synthetic-tensor smoke test) are implemented, plus an optional **Phase 1 cache-precomputation cell** (`RUN_CACHE_PRECOMPUTATION = False` by default -- populates Stage 03/04/RACAF's cache one image at a time, independent of training, safe to interrupt/resume; see §32). Dataset-loading and `Trainer` cells (**Phase 2**) are gated behind `RUN_TRAINING = False`. No real training has completed, no checkpoint exists. Checkpoint boundary: `colab_config.DRIVE.experiment_dir("FinalClassification")`. No second, competing joint-training notebook exists or should be created. |
+| `stage08_corn_classifier.ipynb` | 8. CORN Classification | **Repurposed as the joint Stage 05-08+RACAF training notebook** (CORN has no standalone training path of its own) -- see `JOINT_TRAINING_ARCHITECTURE.md` §27. Infrastructure cells (Drive/environment/dataset/checkpoint verification, authoritative split, joint model construction, a synthetic-tensor smoke test) are implemented, plus optional **Phase 1 / Phase 1b cache-precomputation cells** (`RUN_CACHE_PRECOMPUTATION = False` by default -- populates Stage 03/04/RACAF's cache one image at a time, independent of training, safe to interrupt/resume; §32). Phase 1 runs against a **local** cache directory, not Drive directly -- a real T4 run against the Drive-mounted cache directly was measured to be impractically slow (Drive's per-file-open latency on every check/write), so Phase 1 now pulls any existing Drive cache down locally first, computes locally, and pushes new entries back up to Drive (Phase 1b can flush progress to Drive at any time); see §33. Dataset-loading and `Trainer` cells (**Phase 2**) are gated behind `RUN_TRAINING = False`. No real training has completed, no checkpoint exists. Checkpoint boundary: `colab_config.DRIVE.experiment_dir("FinalClassification")`. No second, competing joint-training notebook exists or should be created. |
 | `stage09_uncertainty_estimation.ipynb` | 9. Uncertainty Estimation | Template. Inference-only against the Stage 8 model -- no new training run. |
 | `stage10_explainability.ipynb` | 10. Explainability | Template. Inference-only against the Stage 8 model -- no new training run. |
 | `stage11_evaluation.ipynb` | 11. Evaluation | Template. Runs after every upstream stage is trained -- never fill this in with placeholder numbers. |
@@ -182,11 +182,18 @@ Staging is **idempotent**: if `/content/datasets/<name>/` already exists, the co
 simply re-running the Dataset Loading cell, should not re-copy tens of thousands of files it
 already has.
 
-The Drive master copy is **read-only** from `dataset_staging.py`'s perspective -- it only ever
+The Drive master copy is **read-only** from `stage_dataset()`'s perspective -- it only ever
 reads from the Drive source and writes to the local destination, never the reverse. The staged
 local copy itself is disposable (it lives under `/content`, wiped whenever the Colab VM recycles)
 and is never treated as an output -- checkpoints, logs, evaluation results, and the exported model
 all still go to Google Drive exactly as before (see "Where outputs are saved").
+
+**`dataset_staging.sync_missing_files(source_dir, dest_dir)`** is the incremental, direction-
+agnostic sibling used where `stage_dataset()`'s all-or-nothing "already staged, skip everything"
+check doesn't fit -- a directory that grows one file at a time across many runs, like the joint
+training notebook's per-image inference cache (`JOINT_TRAINING_ARCHITECTURE.md` §33). It copies
+only whatever is missing at the destination, in either direction (Drive -> local to resume, or
+local -> Drive to persist), reusing the same latency-tolerant thread-pool copy.
 
 ### Making this reusable for a future stage
 

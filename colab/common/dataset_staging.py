@@ -20,8 +20,18 @@ dataset a given notebook stages is entirely up to that notebook (e.g.
 "the" dataset.
 
 The Drive master copy is read-only from this module's perspective:
-staging only ever copies *out of* Drive, never writes back into it, and
-nothing here modifies a single byte of the source dataset.
+`stage_dataset()` only ever copies *out of* Drive, never writes back into
+it, and nothing here modifies a single byte of the source dataset.
+
+`sync_missing_files(source_dir, dest_dir)` is the incremental, direction-
+agnostic sibling used for a *derived* directory that grows over time
+rather than a fixed dataset staged once -- e.g. a per-image inference
+cache written locally during a long Colab run (so every write is fast
+local I/O, not Drive-latency-bound) and periodically flushed back up to
+Drive. Unlike `stage_dataset()`, it copies only whatever is missing at the
+destination and can run in either direction (Drive -> local to resume an
+interrupted cache-precomputation run, or local -> Drive to persist newly
+written entries), reusing the same latency-tolerant thread-pool copy.
 
 Verifying the result of a copy is deliberately split in two:
   - `verify_staged_copy()` here is a generic, dataset-structure-agnostic
@@ -146,6 +156,51 @@ def stage_dataset(drive_source_dir, dataset_name, local_root=LOCAL_DATASETS_ROOT
         seconds_elapsed=elapsed,
         was_already_staged=was_already_staged,
     )
+
+
+def sync_missing_files(source_dir, dest_dir, max_workers=DEFAULT_MAX_WORKERS):
+    """
+    Copies every file under `source_dir` that does not already exist at the corresponding
+    relative path under `dest_dir` -- using the same latency-tolerant thread-pool-concurrency
+    copy as `stage_dataset()` (`_copy_one`, reused unchanged), but INCREMENTAL and DIRECTION-
+    AGNOSTIC rather than `stage_dataset()`'s all-or-nothing "already staged, skip everything"
+    check. That all-or-nothing check fits a dataset staged once per session; it does not fit a
+    cache directory that grows incrementally, one file at a time, across many runs and both
+    directions (pulling an existing Drive cache down to local disk before a run, and pushing
+    newly-written local cache entries back up to Drive during/after one).
+
+    A file already present at its destination path is never re-copied, re-verified, or
+    overwritten -- exactly this project's own "an existing cache entry is never recomputed"
+    resumability convention, applied to the copy step itself rather than to what generates the
+    file. Read-only with respect to `source_dir`; only ever creates new files under `dest_dir`,
+    never deletes or modifies an existing one there. A `source_dir` that does not exist (e.g. no
+    Drive cache has been written yet on a first-ever run) is treated as "nothing to copy", not an
+    error.
+
+    Returns `(copied_count, already_present_count)`.
+    """
+    if not os.path.isdir(source_dir):
+        return 0, 0
+
+    to_copy = []
+    already_present = 0
+    for dirpath, _, filenames in os.walk(source_dir):
+        rel_dir = os.path.relpath(dirpath, source_dir)
+        dest_subdir = dest_dir if rel_dir == "." else os.path.join(dest_dir, rel_dir)
+        for name in filenames:
+            dest_path = os.path.join(dest_subdir, name)
+            if os.path.exists(dest_path):
+                already_present += 1
+            else:
+                to_copy.append((os.path.join(dirpath, name), dest_path))
+
+    if to_copy:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_copy_one, src, dst) for src, dst in to_copy]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()  # re-raise immediately on any individual copy failure
+
+    return len(to_copy), already_present
 
 
 def verify_staged_copy(staged: StagedDataset):

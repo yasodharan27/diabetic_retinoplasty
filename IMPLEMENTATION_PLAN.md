@@ -288,13 +288,17 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (66 tests, `tests/test_joint_training.py`, plus 12 more in
-  `tests/test_corn.py` for the CORN-aware QWK metric below). The first real T4 training attempt
-  hit two blockers, both fixed and unit-tested (no real training or checkpoint produced by either
-  fix) — see `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a
-  real APTOS image) and §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed
-  alongside a new, optional cache-precomputation phase). Not yet trained to completion — no
-  finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
+- **Status: Implemented, unit-tested (72 tests, `tests/test_joint_training.py`, plus 12 more in
+  `tests/test_corn.py` for the CORN-aware QWK metric below, plus 9 in the new
+  `tests/test_dataset_staging.py`). The first real T4 training attempt hit three blockers, each
+  diagnosed, fixed, and unit-tested (no real training or checkpoint produced by any fix) — see
+  `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a real APTOS
+  image), §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed alongside a
+  new, optional cache-precomputation phase), and §33 (that cache-precomputation phase itself was
+  then measured to be impractically slow — root cause: its cache directories resolved to Google
+  Drive, so every cache check/write paid Drive's per-file-open latency; fixed by running it
+  against a local cache directory, synced to/from Drive in bulk). Not yet trained to completion —
+  no finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
 - **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that
   `compile_joint_model()` originally compiled with no metric at all, so `monitor="val_QWK"`
@@ -341,11 +345,14 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   notebook as committed does not start training.
 - **`joint_training_dataset.precompute_joint_frozen_caches()` / `precompute_authoritative_joint_caches()`**
   — an optional Phase 1 that streams Stage 03/04/RACAF cache population one image at a time
-  (bounded memory, resumable, reuses the existing on-disk cache check), decoupled from
-  `load_joint_training_datasets()`/`Trainer.fit()` (Phase 2). Not required for correctness — Phase
-  2 still computes-and-caches any uncached entry on the fly — but recommended for a real training
-  run so slow, Drive-I/O-bound inference doesn't happen inline with the first epoch. Wired into the
-  notebook as a new gated cell (`RUN_CACHE_PRECOMPUTATION = False` by default).
+  (bounded memory, resumable), decoupled from `load_joint_training_datasets()`/`Trainer.fit()`
+  (Phase 2). Not required for correctness — Phase 2 still computes-and-caches any uncached entry
+  on the fly — but recommended for a real training run. A real run of this phase was measured to
+  be impractically slow (§33 above) because its cache directories default to Google Drive paths;
+  the notebook's Phase 1 cell now runs it against a local cache directory instead, using the new
+  `colab/common/dataset_staging.sync_missing_files()` to pull any existing Drive cache down first
+  and push new entries back up afterward (a Phase 1b cell can push progress at any time). Gated
+  behind `RUN_CACHE_PRECOMPUTATION = False` by default.
 - **Next step:** set `RUN_TRAINING = True` (optionally after `RUN_CACHE_PRECOMPUTATION = True`) and
   actually run joint training on a real Colab T4 — not attempted by this step, per its own explicit
   no-training instruction.
