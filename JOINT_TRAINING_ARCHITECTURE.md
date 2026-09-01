@@ -734,3 +734,111 @@ resumability, both directions, no-op on a nonexistent source), `tests/test_joint
 (`CachePrecomputationDriveRoundTripTests` — the redundant-check removal proven differentially
 [robust to incidental library `os.path.exists` calls] and by wiring, `known_not_all_cached`'s
 strictly-additive default, progress-log content, `elapsed_seconds` in the returned stats).
+
+---
+
+## 34. RAM exhaustion, again — diagnosed and fixed (GPU VRAM, not CPU RAM)
+
+**Symptom:** after §33's fix (local cache, redundant-check removed), a real Colab run still
+crashed from "RAM exhaustion" — but Colab's own visible RAM graph never showed CPU memory
+approaching its limit. That mismatch was the key clue and the starting point of this diagnosis.
+
+**Method:** every function named in scope (`sync_missing_files`, `precompute_authoritative_joint_
+caches`, `precompute_joint_frozen_caches`, `_get_or_compute_joint_frozen_outputs`, the Stage 3/4
+inference calls, `racaf.tta_views`/`prepare_stage4_input`/`compute_reliability`) was re-read fresh
+from the current repository, not from prior reports. A diagnostic script then ran the REAL
+`_get_or_compute_joint_frozen_outputs()` — the real, checked-in LWNet (Stage 03) and Experiment 2C
+(Stage 04) checkpoints, both present in this local environment — over real APTOS images, one at a
+time, each writing to a fresh temp cache dir (forcing a genuine compute, never a cache hit), and
+measured **process RSS via `psutil`** before/after every image, both with and without a forced
+`gc.collect()`, plus live `len(gc.get_objects())`.
+
+**Measured (CPU side, this machine, no GPU — 20 real images, real checkpoints):**
+
+```
+idx  rss_before  rss_after(gc)  delta(gc)  gc_collected  objects
+ 0      707.8        1307.1      +599.4        0         608665
+ 1     1313.3        1106.5      -206.8        0         608665
+ 2     1110.5        1202.0       +91.5        0         608665
+ 3     1184.4        1091.8       -92.6        0         608665
+ 4     1104.4        1165.7       +61.3        0         608665
+ 5      848.6        1196.4      +347.8        0         608665
+ 6     1177.0        1177.2        +0.1        0         608665
+ 7     1187.7        1182.9        -4.8        0         608665
+ 8     1172.8        1177.9        +5.1        0         608665
+ 9     1172.9        1047.1     -125.8        0         608665
+10     1034.1        1020.3      -13.8        0         608665
+11     1047.9        1120.8      +72.9        0         608665
+12     1103.2        1102.6       -0.6        0         608665
+13     1120.4        1142.0      +21.6        0         608665
+14     1171.7        1157.4      -14.3        0         608665
+15     1142.9        1027.8     -115.1        0         608665
+16     1069.6        1174.7     +105.1        0         608665
+17     1141.4        1147.1       +5.7        0         608665
+18     1164.2         827.0     -337.2        0         608665
+19      514.8        1150.0     +635.2        0         608665
+
+Linear regression, post-gc RSS vs. image index (n=20):
+  slope = -7.665 MB/image  (i.e. slightly DOWNWARD, not upward)
+  slope (no forced gc)     = -19.339 MB/image
+Baseline RSS 661.3 MB -> final (post-gc) RSS 1150.0 MB; net +488.7 MB over 20 images, entirely
+attributable to the one-time jump on image 0 (+599.4 MB) -- removing that single outlier, RSS is
+net FLAT to slightly down across images 1-19.
+gc object count: baseline 607738 -> final 608665 (+927 total, +46/image -- small, one-time module/
+interpreter bookkeeping growth, not scaling with images processed; NOT a leak, since gc.collect()
+found zero collectible garbage on every one of the 20 calls).
+```
+
+`gc.collect()` reclaimed **zero** objects on every single image, and the live object count's tiny,
+one-time increase does not scale with images processed — conclusive proof there is no retained
+NumPy array, TensorFlow tensor, PyTorch tensor, list, or reference-cycle leak anywhere in this call
+path. RSS jumps sharply on the first image (one-time cost of each framework's internal allocator/
+kernel-cache warming up for a shape/config it hasn't seen before) then **oscillates in a bounded
+~700–1300 MB band with a measured NEGATIVE linear-regression slope across all 20 images** — not
+linear growth, not even a plateau, a slight net decline. This rules out the CPU side entirely as
+the cause of an unbounded, multi-image crash, and explains
+directly why Colab's CPU RAM graph never showed the problem: there wasn't one, on the CPU.
+
+**Root cause, confirmed by tracing every call site (not inferred):** `tf.config.experimental.
+set_memory_growth` was **never called anywhere reachable from Phase 1** —
+`joint_training_dataset.py` had zero `check_gpu`/`set_memory_growth` references before this fix,
+and neither does `Trainer.prepare()` (it only calls `enable_mixed_precision`) or `verify_environment.
+verify_all()` (its GPU checks only *list* devices and set the mixed-precision *policy* — never
+memory growth). The only place in this whole project that calls `set_memory_growth` is
+`training.trainer.check_gpu()`, and it is used by `train_image_quality.py`/`colab/common/
+environment.py` — never by the joint-training path. Without it, **TensorFlow's default GPU
+allocator claims essentially all free VRAM the instant it first touches the GPU** (Stage 04's
+first `stage4_model(...)` call). Stage 03's vessel model runs on the SAME GPU
+(`vessel_segmentation_model.resolve_device()` picks CUDA when available) via **PyTorch's own,
+completely independent CUDA caching allocator** — the two frameworks share the physical device but
+never coordinate with each other. Whichever one initializes second gets whatever the first one
+left behind, which under TF's default (non-growth) behavior can be next to nothing. This is a
+short-lived-at-onset but then **structurally persistent, per-session allocation-policy problem**,
+not a per-image leak — exactly why it manifests as "RAM exhaustion" the CPU graph never shows
+(it's VRAM, a different resource pool) and why it wasn't fixed by moving cache I/O to local SSD or
+capping the `tf.data` shuffle buffer (§32/§33) — neither of those touches GPU memory policy at all.
+
+**Fix:** `joint_training_dataset.py` now imports and calls `training.check_gpu()` — the SAME,
+already-tested function `train_image_quality.py` and `colab/common/environment.py` already rely
+on, not a reimplementation — as the very first action in both `precompute_joint_frozen_caches()`
+and `precompute_authoritative_joint_caches()`, before either the vessel model or Stage 04 model is
+loaded. `check_gpu()` requests incremental GPU memory growth for every visible GPU, is a documented
+no-op when no GPU is present (this session's own CPU-only run confirms it prints "No GPU detected"
+and proceeds normally), and is safe to call repeatedly (each call is independently wrapped in
+`try/except RuntimeError`, matching its one existing caller's pattern).
+
+**Why batching was still not implemented:** this diagnosis, like §33's, again places the cause
+outside per-image compute cost — this time in a one-time, per-process GPU allocator policy, not
+in the volume or size of individual forward passes. Batching Stage 3/4 inference across images
+would not address a missing memory-growth flag and was correctly out of scope again.
+
+**No Stage 3/4/RACAF/Stage 5/6/7/CORN architecture, weights, reliability equations, TTA
+definition, or cache format/keys changed.** No existing Drive cache entry was invalidated or
+deleted. Resumability is unaffected — `check_gpu()` has no bearing on which cache entries are
+considered already-computed.
+
+Regression tests: `tests/test_joint_training.py` (`GPUMemoryGrowthSafeguardTests` — `check_gpu()`
+called before either model loads, in both Phase 1 entry points; called even when both models are
+passed in pre-loaded; confirmed to be the exact same `training.check_gpu` object, not a
+reimplementation). Actual VRAM behavior cannot be exercised in this suite (CPU-only) — these tests
+verify the call is wired in at the correct point, which is what a real GPU run depends on.

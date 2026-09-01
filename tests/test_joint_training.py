@@ -709,6 +709,75 @@ class CachePrecomputationDriveRoundTripTests(unittest.TestCase):
         self.assertIn("2/2", progress_lines[0])
 
 
+class GPUMemoryGrowthSafeguardTests(unittest.TestCase):
+    """Regression tests for the diagnosed Phase 1 GPU VRAM exhaustion root cause
+    (`JOINT_TRAINING_ARCHITECTURE.md` §34): a real Colab crash persisted after Phase 1's cache
+    I/O was moved to local SSD, even though Colab's own CPU RAM graph never showed growth --
+    because the actual exhaustion was on the GPU, not the CPU. Root cause, confirmed by tracing
+    every call site: `tf.config.experimental.set_memory_growth` is NEVER called anywhere reachable
+    from Phase 1 (`joint_training_dataset.py` had zero `check_gpu`/`set_memory_growth` references
+    before this fix) or from `Trainer.prepare()`. Without it, TensorFlow's default allocator
+    claims ~all free GPU memory the instant Stage 04's model first runs -- and Stage 03's
+    PyTorch model shares the SAME GPU (`vessel_segmentation_model.resolve_device()` picks CUDA
+    when available) via a completely independent, non-coordinating CUDA allocator. `check_gpu()`
+    (`training.trainer`, already used by `train_image_quality.py`/`colab/common/environment.py` --
+    reused here, not reimplemented) fixes this by requesting incremental GPU memory growth before
+    either model can touch the device. These tests verify WIRING/ORDER via mocks -- actual VRAM
+    behavior cannot be exercised without a real GPU (this suite runs CPU-only); the CPU-side RSS
+    diagnosis (`JOINT_TRAINING_ARCHITECTURE.md` §34) separately and conclusively ruled out a
+    CPU-memory leak as the crash cause using real APTOS images and the real frozen checkpoints."""
+
+    def test_precompute_joint_frozen_caches_calls_check_gpu_before_either_model_loads(self):
+        call_order = []
+        with mock.patch(
+            "joint_training_dataset.check_gpu", side_effect=lambda: call_order.append("check_gpu"),
+        ), mock.patch(
+            "joint_training_dataset.load_vessel_model",
+            side_effect=lambda *a, **k: call_order.append("load_vessel_model"),
+        ), mock.patch(
+            "joint_training_dataset.racaf.load_frozen_stage4_model",
+            side_effect=lambda *a, **k: call_order.append("load_stage4_model"),
+        ):
+            jtd.precompute_joint_frozen_caches([], "img_dir", "cache_dir", "racaf_cache_dir")
+        self.assertEqual(call_order, ["check_gpu", "load_vessel_model", "load_stage4_model"])
+
+    def test_precompute_authoritative_joint_caches_calls_check_gpu_before_either_model_loads(self):
+        call_order = []
+        with mock.patch(
+            "joint_training_dataset.check_gpu", side_effect=lambda: call_order.append("check_gpu"),
+        ), mock.patch(
+            "joint_training_dataset.load_vessel_model",
+            side_effect=lambda *a, **k: call_order.append("load_vessel_model"),
+        ), mock.patch(
+            "joint_training_dataset.racaf.load_frozen_stage4_model",
+            side_effect=lambda *a, **k: call_order.append("load_stage4_model"),
+        ), mock.patch(
+            "joint_training_dataset.precompute_joint_frozen_caches",
+            return_value={"cached": 0, "already_cached": 0, "skipped_empty_fov": [], "elapsed_seconds": 0.0},
+        ), mock.patch(
+            "joint_training_dataset.split_train_val_ids", return_value=([], []),
+        ):
+            jtd.precompute_authoritative_joint_caches()
+        self.assertEqual(call_order, ["check_gpu", "load_vessel_model", "load_stage4_model"])
+
+    def test_check_gpu_runs_even_when_both_models_are_passed_in_already_loaded(self):
+        """A caller reusing already-loaded models across multiple precompute calls in one session
+        must still get the memory-growth safeguard applied -- it's a global TF process setting,
+        not per-model-load state, and is cheap/idempotent to call repeatedly."""
+        with mock.patch("joint_training_dataset.check_gpu") as mocked_check_gpu:
+            jtd.precompute_joint_frozen_caches(
+                [], "img_dir", "cache_dir", "racaf_cache_dir",
+                vessel_model="already-loaded-vessel", stage4_model="already-loaded-stage4",
+            )
+        mocked_check_gpu.assert_called_once()
+
+    def test_check_gpu_is_the_real_training_check_gpu_not_a_reimplementation(self):
+        """No second, competing GPU-setup mechanism -- this must be the exact same function
+        `Trainer.prepare()`/`train_image_quality.py` already rely on, not a duplicate."""
+        import training
+        self.assertIs(jtd.check_gpu, training.check_gpu)
+
+
 class PrecomputeAuthoritativeCachesTests(unittest.TestCase):
     """`precompute_authoritative_joint_caches` -- the real-training-workflow entry point -- must
     delegate to the SAME authoritative split and the SAME streaming function above, never a

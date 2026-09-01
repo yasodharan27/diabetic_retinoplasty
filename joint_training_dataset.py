@@ -85,6 +85,7 @@ import config
 import downstream_split
 import local_feature_extraction_dataset as lfed
 import racaf
+from training import check_gpu
 from vessel_segmentation_inference import (
     DEFAULT_MODEL_PATH as DEFAULT_VESSEL_MODEL_PATH,
     EmptyFieldOfViewError,
@@ -313,6 +314,15 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...],
     "elapsed_seconds": float}`.
     """
+    # Must run before ANY TensorFlow op touches the GPU (JOINT_TRAINING_ARCHITECTURE.md §34):
+    # without this, TF's default allocator claims ~all free VRAM the instant Stage 04's model is
+    # first called, starving Stage 03's PyTorch model (also CUDA, via
+    # vessel_segmentation_model.resolve_device()) of the memory it needs -- the two frameworks use
+    # completely independent CUDA allocators that do not coordinate. `check_gpu()` (already used
+    # by `train_image_quality.py`/`colab/common/environment.py`, reused here rather than
+    # reimplemented) is a no-op on CPU-only machines and safe to call repeatedly.
+    check_gpu()
+
     entries = list(entries)
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
@@ -372,6 +382,8 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
     the SAME authoritative split (`split_train_val_ids`) `load_joint_training_datasets()` (Phase
     2) reads, never a second one. Loads `vessel_model`/`stage4_model` at most once each, regardless
     of how many of the combined 3662 entries still need computing."""
+    check_gpu()  # before loading either model -- see precompute_joint_frozen_caches's identical call
+
     train_entries, val_entries = split_train_val_ids(csv_path, val_split=val_split, seed=seed)
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()

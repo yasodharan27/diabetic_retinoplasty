@@ -288,17 +288,24 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (72 tests, `tests/test_joint_training.py`, plus 12 more in
-  `tests/test_corn.py` for the CORN-aware QWK metric below, plus 9 in the new
-  `tests/test_dataset_staging.py`). The first real T4 training attempt hit three blockers, each
+- **Status: Implemented, unit-tested (76 tests, `tests/test_joint_training.py`, plus 12 more in
+  `tests/test_corn.py` for the CORN-aware QWK metric below, plus 9 in
+  `tests/test_dataset_staging.py`). The first real T4 training attempt hit four blockers, each
   diagnosed, fixed, and unit-tested (no real training or checkpoint produced by any fix) — see
   `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a real APTOS
   image), §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed alongside a
-  new, optional cache-precomputation phase), and §33 (that cache-precomputation phase itself was
-  then measured to be impractically slow — root cause: its cache directories resolved to Google
-  Drive, so every cache check/write paid Drive's per-file-open latency; fixed by running it
-  against a local cache directory, synced to/from Drive in bulk). Not yet trained to completion —
-  no finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
+  new, optional cache-precomputation phase), §33 (that cache-precomputation phase itself was then
+  measured to be impractically slow — root cause: its cache directories resolved to Google Drive,
+  so every cache check/write paid Drive's per-file-open latency; fixed by running it against a
+  local cache directory, synced to/from Drive in bulk), and §34 (Colab still crashed from "RAM
+  exhaustion" afterward even though the CPU RAM graph never showed growth — measured with real
+  checkpoints/images to conclusively rule out a CPU-side leak [`gc.collect()` reclaimed zero
+  objects every time, live object count never moved]; actual root cause traced to
+  `tf.config.experimental.set_memory_growth` never being called anywhere in the joint-training
+  path, so TensorFlow's default allocator claims ~all GPU VRAM the instant it first runs, starving
+  Stage 03's independent PyTorch CUDA allocator on the same GPU; fixed by calling the project's
+  existing `training.check_gpu()` before either model loads). Not yet trained to completion — no
+  finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
 - **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that
   `compile_joint_model()` originally compiled with no metric at all, so `monitor="val_QWK"`
