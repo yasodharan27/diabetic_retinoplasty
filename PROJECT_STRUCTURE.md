@@ -433,14 +433,14 @@ for the visual end-to-end flow.
 > The full joint-training design -- dataset flow, caching, gradient boundary, loss, checkpoint
 > format, and the Drive/notebook infrastructure it depends on -- is resolved in
 > `JOINT_TRAINING_ARCHITECTURE.md`, and the joint model builder/dataset loader (`joint_training_model.py`,
-> `joint_training_dataset.py`, 86 tests) are now implemented -- but no training has completed and no
+> `joint_training_dataset.py`, 98 tests) are now implemented -- but no training has completed and no
 > checkpoint exists (`colab/notebooks/stage08_corn_classifier.ipynb`'s training cells are gated
 > behind `RUN_TRAINING = False`). Checkpoint selection (`monitor="val_QWK", mode="max"`) is backed
 > by `corn.CORNQuadraticWeightedKappa` -- a CORN-aware Keras metric (12 more tests in
 > `tests/test_corn.py`) that decodes CORN's logits via `decode_logits`'s own rule rather than
 > the generic, argmax-based `training.metrics.QuadraticWeightedKappa`, which cannot be applied to
-> CORN's conditional-task logits directly. The first real T4 runs hit and fixed five blockers
-> (`JOINT_TRAINING_ARCHITECTURE.md` §31-35): an empty-Stage-03-FOV crash on one real APTOS image;
+> CORN's conditional-task logits directly. The first real T4 runs hit and fixed six blockers
+> (`JOINT_TRAINING_ARCHITECTURE.md` §31-36): an empty-Stage-03-FOV crash on one real APTOS image;
 > RAM exhaustion from an unbounded `tf.data` shuffle buffer, whose fix also added an optional
 > `precompute_authoritative_joint_caches()` phase that populates Stage 03/04/RACAF's cache
 > independently of training (`RUN_CACHE_PRECOMPUTATION`); that cache-precomputation phase then
@@ -450,14 +450,22 @@ for the visual end-to-end flow.
 > with real checkpoints/images to `tf.config.experimental.set_memory_growth` never being called
 > anywhere in the joint-training path -- TensorFlow's default GPU allocator was claiming ~all VRAM
 > on first use, starving Stage 03's independent PyTorch CUDA allocator sharing the same GPU --
-> fixed by calling the project's existing `training.check_gpu()` before either model loads; and
-> then a real crash (`OSError: [Errno 107] Transport endpoint is not connected`) from that same
-> local-caching fix's own pre-run step bulk-pulling an entire persistent Drive cache (thousands of
-> files from a prior run) down to local disk via `colab/common/dataset_staging.sync_missing_files()`
-> under heavy concurrency -- fixed by checking the persistent Drive cache's existence only (never
-> its content) instead of bulk-copying it, and hardening `dataset_staging`'s copy primitive with
+> fixed by calling the project's existing `training.check_gpu()` before either model loads; a real
+> crash (`OSError: [Errno 107] Transport endpoint is not connected`) from that same local-caching
+> fix's own pre-run step bulk-pulling an entire persistent Drive cache (thousands of files from a
+> prior run) down to local disk via `colab/common/dataset_staging.sync_missing_files()` under
+> heavy concurrency -- fixed by checking the persistent Drive cache's existence only (never its
+> content) instead of bulk-copying it, and hardening `dataset_staging`'s copy primitive with
 > atomic writes and transient-error retry (`sync_missing_files()`, now 14 tests in
-> `tests/test_dataset_staging.py`).
+> `tests/test_dataset_staging.py`); and then, once Phase 1 finally completed cleanly, a real
+> training run that ran at a sustained ~5-6s/step -- root-caused (via a local timing diagnostic
+> against real synthetic-checkpoint machinery, isolating code cost from I/O-medium cost) to the
+> training cell pointing Phase 2's cache directories AND raw-image directory at Drive-mounted
+> paths (Phase 2 had no equivalent of Phase 1's local-first/persistent-fallback cache logic at
+> all) -- fixed by extending that same mechanism (`persistent_cache_dir`/`persistent_racaf_cache_
+> dir`, a persistent-only hit read once and mirrored to local disk, never recomputed) all the way
+> through `load_joint_training_datasets()`, staging APTOS locally for training the same way Phase
+> 1 already does, and adding the `check_gpu()` call Phase 2 had also been missing.
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

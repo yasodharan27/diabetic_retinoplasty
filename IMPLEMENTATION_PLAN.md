@@ -288,9 +288,9 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (86 tests, `tests/test_joint_training.py`, plus 12 more in
+- **Status: Implemented, unit-tested (98 tests, `tests/test_joint_training.py`, plus 12 more in
   `tests/test_corn.py` for the CORN-aware QWK metric below, plus 14 in
-  `tests/test_dataset_staging.py`). The first real T4 training attempts hit five blockers, each
+  `tests/test_dataset_staging.py`). The first real T4 training attempts hit six blockers, each
   diagnosed, fixed, and unit-tested (no real training or checkpoint produced by any fix) — see
   `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a real APTOS
   image), §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed alongside a
@@ -303,15 +303,24 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   moved]; actual root cause traced to `tf.config.experimental.set_memory_growth` never being called
   anywhere in the joint-training path, so TensorFlow's default allocator claims ~all GPU VRAM the
   instant it first runs, starving Stage 03's independent PyTorch CUDA allocator on the same GPU;
-  fixed by calling the project's existing `training.check_gpu()` before either model loads), and
-  §35 (a real run then crashed with `OSError: [Errno 107] Transport endpoint is not connected`
-  while §33's fix bulk-pulled the ENTIRE persistent Drive cache — thousands of files from a prior
-  run — down to local disk before starting, immediately after another already-heavy concurrent
-  Drive copy; fixed by replacing that bulk pull with a cheap, existence-only check against the
+  fixed by calling the project's existing `training.check_gpu()` before either model loads), §35
+  (a real run then crashed with `OSError: [Errno 107] Transport endpoint is not connected` while
+  §33's fix bulk-pulled the ENTIRE persistent Drive cache — thousands of files from a prior run —
+  down to local disk before starting, immediately after another already-heavy concurrent Drive
+  copy; fixed by replacing that bulk pull with a cheap, existence-only check against the
   persistent Drive cache directory [`persistent_cache_dir`/`persistent_racaf_cache_dir`], plus
   hardening `dataset_staging`'s copy primitive with atomic writes and transient-error retry, and
   adding a `max_images`/`verbose_diagnostics` small-scale diagnostic mode with real RSS/GPU-memory
-  instrumentation for the next real run). Not yet trained to completion — no finished epoch, no
+  instrumentation), and §36 (the first real training run itself then ran at a sustained ~5-6s/step
+  — root cause: the notebook's training cell pointed Phase 2's `cache_dir`/`racaf_cache_dir` AND
+  `image_dir` at Drive-mounted paths, unlike Phase 1, so every training sample's cache-hit read
+  its 3 cache files AND its raw image directly from Drive's FUSE mount, every sample, every epoch
+  — Phase 2 had no equivalent of Phase 1's §35 local-first/persistent-fallback logic at all;
+  fixed by giving `load_joint_training_datasets()`/`_make_joint_dataset()`/`_build_joint_sample()`/
+  `_get_or_compute_joint_frozen_outputs()` the same `persistent_cache_dir`/`persistent_racaf_cache_
+  dir` mechanism [a persistent-only hit is read once and mirrored to local disk, never recomputed],
+  staging APTOS locally for training the same way Phase 1 already does, and adding the `check_gpu()`
+  call Phase 2 had also been missing). Not yet trained to completion — no finished epoch, no
   checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
 - **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that

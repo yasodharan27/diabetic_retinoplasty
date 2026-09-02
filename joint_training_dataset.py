@@ -93,6 +93,17 @@ code path (real checkpoints, real images, real cache I/O) on a small, controlled
 before committing to a full run, with per-image RSS/GPU-memory/timing visibility instead of relying
 on Colab's own resource graphs. Purely observational: it never changes which entries are computed
 or what gets written to the cache.
+
+Phase 2 (training) local-cache reads, not per-epoch Drive reads (`JOINT_TRAINING_ARCHITECTURE.md`
+§36) -- fixes a real ~5-6s/step training slowdown: `persistent_cache_dir`/`persistent_racaf_cache_
+dir` on `load_joint_training_datasets()`/`_make_joint_dataset()`/`_build_joint_sample()`/
+`_get_or_compute_joint_frozen_outputs()` give Phase 2 the SAME local-first/persistent-fallback
+cache-read logic Phase 1 already had (§35) -- a cache hit found only in the persistent (Drive)
+location is read from there ONCE and mirrored to the local `cache_dir`/`racaf_cache_dir`, so every
+later epoch for that image reads local disk, never Drive again. Also adds `check_gpu()` to
+`load_joint_training_datasets()` -- it loads the same two GPU-touching models (Stage 03 PyTorch,
+Stage 04 TensorFlow) Phase 1's two entry points already guard with this call (§34); Phase 2 had
+been missing it.
 """
 
 import logging
@@ -165,7 +176,10 @@ def _resize_rgb_01(rgb_native_uint8, image_size):
 
 def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_cache_path,
                                           reliability_cache_path, vessel_model, stage4_model,
-                                          image_size=STAGE5_IMAGE_SIZE, known_not_all_cached=False):
+                                          image_size=STAGE5_IMAGE_SIZE, known_not_all_cached=False,
+                                          persistent_vessel_cache_path=None,
+                                          persistent_lesion_cache_path=None,
+                                          persistent_reliability_cache_path=None):
     """Returns `(canonical_rgb, vessel_map, lesion_maps, kappa, r)` for one image --
     `canonical_rgb`/`vessel_map`: `(*image_size, {3,1})`, `lesion_maps`: `(*image_size, 4)`,
     `kappa`: `(4,)`, `r`: scalar float. `canonical_rgb` is always freshly resized (cheap, never
@@ -198,6 +212,21 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
     behavior). The three per-file existence guards below -- which protect a partially-populated
     cache left by a prior interrupted run from being needlessly overwritten -- are UNCHANGED and
     still run either way; this only skips the redundant "are all three already done" recheck.
+
+    `persistent_vessel_cache_path`/`persistent_lesion_cache_path`/`persistent_reliability_cache_path`
+    (all default `None`): a SECOND, read-only cache location -- typically a Drive-mounted,
+    cross-session persistent cache -- checked when the entry is missing under
+    `vessel_cache_path`/`lesion_cache_path`/`reliability_cache_path` (typically a fast local
+    directory). If found there, the arrays are loaded from the persistent location (unavoidable --
+    that is the only place the content exists) and then ALSO written to the local
+    `vessel_cache_path`/`lesion_cache_path`/`reliability_cache_path`, so every SUBSEQUENT call for
+    this same image (e.g. every later training epoch) reads local disk, never the persistent
+    location again. This is what makes it safe to point a training run's `cache_dir`/
+    `racaf_cache_dir` at a fast local directory while still transparently reusing an existing
+    Drive-persisted cache from a prior Phase 1 run, without ever recomputing Stage 03/04/RACAF for
+    an image that is already cached somewhere (`JOINT_TRAINING_ARCHITECTURE.md` §36). Only ever
+    READS from the persistent paths -- never writes to or deletes them. Leaving all three at
+    `None` (the default) reproduces the exact prior behavior for every existing caller.
     """
     all_cached = not known_not_all_cached and (
         os.path.exists(vessel_cache_path)
@@ -209,6 +238,34 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
         lesion_maps = np.load(lesion_cache_path)
         reliability_cached = np.load(reliability_cache_path)
         return vessel_map, lesion_maps, reliability_cached["kappa"], float(reliability_cached["r"])
+
+    persistent_paths_given = (
+        persistent_vessel_cache_path is not None
+        and persistent_lesion_cache_path is not None
+        and persistent_reliability_cache_path is not None
+    )
+    if persistent_paths_given and (
+        os.path.exists(persistent_vessel_cache_path)
+        and os.path.exists(persistent_lesion_cache_path)
+        and os.path.exists(persistent_reliability_cache_path)
+    ):
+        vessel_map = np.load(persistent_vessel_cache_path)
+        lesion_maps = np.load(persistent_lesion_cache_path)
+        reliability_cached = np.load(persistent_reliability_cache_path)
+        kappa = reliability_cached["kappa"]
+        r = float(reliability_cached["r"])
+        # Mirror to the local cache path (once) so every later call for this image reads local
+        # disk, never the persistent (typically Drive) location again.
+        if not os.path.exists(vessel_cache_path):
+            os.makedirs(os.path.dirname(vessel_cache_path), exist_ok=True)
+            np.save(vessel_cache_path, vessel_map)
+        if not os.path.exists(lesion_cache_path):
+            os.makedirs(os.path.dirname(lesion_cache_path), exist_ok=True)
+            np.save(lesion_cache_path, lesion_maps)
+        if not os.path.exists(reliability_cache_path):
+            os.makedirs(os.path.dirname(reliability_cache_path), exist_ok=True)
+            np.savez(reliability_cache_path, kappa=kappa, r=np.float32(r))
+        return vessel_map, lesion_maps, kappa, r
 
     native_vessel_map = predict_vessel_mask(rgb_native, model=vessel_model)["probability_map"].astype(np.float32)
 
@@ -254,7 +311,8 @@ def _augment(stage5_input, rng):
 
 def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
                          vessel_model, stage4_model, augment, rng,
-                         processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE):
+                         processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
+                         persistent_cache_dir=None, persistent_racaf_cache_dir=None):
     """Builds one joint training sample:
       `{"image_id", "stage5_input", "stage6_input", "reliability", "grade"}`.
 
@@ -266,6 +324,12 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
     computed before augmentation and never itself augmented (`JOINT_TRAINING_ARCHITECTURE.md`
     §20).
     `grade`: the plain int APTOS DR grade, from the authoritative split.
+
+    `persistent_cache_dir`/`persistent_racaf_cache_dir` (both default `None`): forwarded to
+    `_get_or_compute_joint_frozen_outputs` -- see that function's docstring and
+    `JOINT_TRAINING_ARCHITECTURE.md` §36. Lets `cache_dir`/`racaf_cache_dir` be a fast local
+    directory while still transparently reusing (never recomputing) an entry already cached in a
+    Drive-mounted persistent directory from a prior Phase 1 run.
     """
     raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
     rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
@@ -274,9 +338,18 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
     lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
     reliability_cache = racaf.reliability_cache_path(racaf_cache_dir, id_code)
 
+    persistent_vessel_cache = persistent_lesion_cache = persistent_reliability_cache = None
+    if persistent_cache_dir is not None and persistent_racaf_cache_dir is not None:
+        persistent_vessel_cache = lfed._cache_path(persistent_cache_dir, id_code, "vessel", image_size)
+        persistent_lesion_cache = lfed._cache_path(persistent_cache_dir, id_code, "lesion", image_size)
+        persistent_reliability_cache = racaf.reliability_cache_path(persistent_racaf_cache_dir, id_code)
+
     vessel_map, lesion_maps, _kappa, r = _get_or_compute_joint_frozen_outputs(
         rgb_native, vessel_cache, lesion_cache, reliability_cache, vessel_model, stage4_model,
         image_size=image_size,
+        persistent_vessel_cache_path=persistent_vessel_cache,
+        persistent_lesion_cache_path=persistent_lesion_cache,
+        persistent_reliability_cache_path=persistent_reliability_cache,
     )
 
     canonical_rgb = _resize_rgb_01(rgb_native, image_size)
@@ -534,7 +607,8 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
 # global_feature_extraction_dataset.py's own _make_dataset pattern exactly ---
 
 def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_model, stage4_model,
-                         batch_size, shuffle, augment, seed, processed_dir=DEFAULT_PROCESSED_DIR):
+                         batch_size, shuffle, augment, seed, processed_dir=DEFAULT_PROCESSED_DIR,
+                         persistent_cache_dir=None, persistent_racaf_cache_dir=None):
     entries = list(entries)
 
     def gen():
@@ -544,6 +618,8 @@ def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_m
                 sample = _build_joint_sample(
                     id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
                     vessel_model, stage4_model, augment, rng, processed_dir=processed_dir,
+                    persistent_cache_dir=persistent_cache_dir,
+                    persistent_racaf_cache_dir=persistent_racaf_cache_dir,
                 )
             except EmptyFieldOfViewError:
                 # A real but exceptional APTOS image: Stage 03's FOV circle-fit found no
@@ -596,6 +672,8 @@ def load_joint_training_datasets(
     seed=DEFAULT_SEED,
     augment_train=True,
     processed_dir=DEFAULT_PROCESSED_DIR,
+    persistent_cache_dir=None,
+    persistent_racaf_cache_dir=None,
 ):
     """Train/val `tf.data.Dataset` pipelines for the joint Stage 05-08+RACAF training run, built
     from the SAME authoritative split (`downstream_split.get_authoritative_split()`) Stage 05/06
@@ -607,7 +685,20 @@ def load_joint_training_datasets(
     loaded once here -- `stage4_model` via `racaf.load_frozen_stage4_model()` (`trainable=False`),
     never `lesion_segmentation_model.load_lesion_model()` directly, so Stage 04 stays frozen for
     every consumer of this loader.
+
+    `persistent_cache_dir`/`persistent_racaf_cache_dir` (both default `None`): forwarded to every
+    sample built by the returned datasets -- see `_get_or_compute_joint_frozen_outputs`'s
+    docstring and `JOINT_TRAINING_ARCHITECTURE.md` §36. Pass `cache_dir`/`racaf_cache_dir` as a
+    fast LOCAL directory and `persistent_cache_dir`/`persistent_racaf_cache_dir` as the real,
+    Drive-mounted persistent cache to get local-disk cache reads on every epoch after the first,
+    without ever recomputing Stage 03/04/RACAF for an entry already cached on Drive.
     """
+    # Must run before ANY TensorFlow op touches the GPU (JOINT_TRAINING_ARCHITECTURE.md §34) --
+    # this loader ALSO loads Stage 04's TensorFlow model (and Stage 03's PyTorch model, the same
+    # GPU) via `resolved_stage4_model`/`resolved_vessel_model` below, exactly like Phase 1's two
+    # entry points, which already call this. Reused, not reimplemented -- see `check_gpu`'s import.
+    check_gpu()
+
     train_entries, val_entries = split_train_val_ids(csv_path, val_split=val_split, seed=seed)
 
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
@@ -616,9 +707,11 @@ def load_joint_training_datasets(
     train_ds = _make_joint_dataset(
         train_entries, image_dir, cache_dir, racaf_cache_dir, resolved_vessel_model, resolved_stage4_model,
         batch_size, shuffle=True, augment=augment_train, seed=seed, processed_dir=processed_dir,
+        persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
     )
     val_ds = _make_joint_dataset(
         val_entries, image_dir, cache_dir, racaf_cache_dir, resolved_vessel_model, resolved_stage4_model,
         batch_size, shuffle=False, augment=False, seed=seed, processed_dir=processed_dir,
+        persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
     )
     return train_ds, val_ds

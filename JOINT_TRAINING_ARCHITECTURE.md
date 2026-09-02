@@ -953,3 +953,142 @@ dir=None` reproduces the exact prior default behavior; `precompute_authoritative
 forwards the new parameters unchanged) and (`DiagnosticModeTests` — `max_images` limits real
 processing via the real code path; diagnostic logging emits exactly one line per processed image
 with RSS/GPU fields, off by default, and never changes the returned stats' shape).
+
+---
+
+## 36. First real training run — ~5–6s/step, traced to Phase 2 reading every cache/image entry from Drive, every sample, every epoch
+
+**Symptom:** the first real joint Stage 05-08+RACAF training run on a T4 (after §35's fix; a full
+Phase 1 precomputation had already completed cleanly — 2974 already cached, 677 newly computed, 11
+skipped for empty FOV, no Drive FUSE error, caches flushed to Drive) reached Epoch 1 but ran at a
+sustained ~5–6s/step (`batch_size=2`, ~1465 steps/epoch, 50 epochs) — at that rate, one epoch alone
+would take ~2–2.5 hours. `empty Stage 03 field-of-view` warnings for the same image ids Phase 1 had
+already identified and skipped also appeared repeatedly during training. The run was stopped before
+completing an epoch.
+
+**Method:** every file in scope (`joint_training_dataset.py`, `dataset_staging.py`, the cache/path/
+config modules, Stage 03/04 inference/cache code, `stage08_corn_classifier.ipynb`,
+`training/trainer.py`) was re-read from the CURRENT repository (post-§35), plus `git log`/`git show`
+over `fc29ff1` and the prior cache-related commits, before any change. A small local diagnostic
+(`_build_joint_sample` called directly, no `Trainer.fit()`, no mocks — real synthetic-checkpoint
+machinery already established in `tests/test_joint_training.py`) measured the CACHE-HIT code path's
+own cost against a local disk, to isolate code cost from I/O-medium cost.
+
+**Root cause 1 (confirmed, structural): the notebook's training cell pointed the Phase 2 cache
+directories at Drive, not at Phase 1's local cache.** `stage08_corn_classifier.ipynb`'s "Dataset
+loading" cell called:
+
+```python
+train_ds, val_ds = jtd.load_joint_training_datasets(
+    batch_size=BATCH_SIZE,
+    cache_dir=config.LOCAL_FEATURE_RESULTS_DIR,   # Drive-mounted
+    racaf_cache_dir=config.RACAF_RESULTS_DIR,      # Drive-mounted
+)
+```
+
+`_get_or_compute_joint_frozen_outputs()`'s cache-hit branch performs THREE sequential `np.load()`
+calls (vessel `.npy`, lesion `.npy`, reliability `.npz`) directly against whatever `cache_dir`/
+`racaf_cache_dir` resolve to. Since §35 gave Phase 1 (`precompute_joint_frozen_caches`/
+`precompute_authoritative_joint_caches`) a `persistent_cache_dir` local-first/persistent-fallback
+mechanism but Phase 2 (`load_joint_training_datasets`/`_make_joint_dataset`/`_build_joint_sample`/
+`_get_or_compute_joint_frozen_outputs`) had NO equivalent, and the notebook cell explicitly passed
+the Drive paths as Phase 2's ONLY cache location, every training sample's cache-hit read three files
+directly from Google Drive's FUSE mount — this project's own already-documented "latency-bound per
+file open, not bandwidth-bound" characteristic (`dataset_staging.py`'s module docstring; the exact
+same class of cost §33 fixed for Phase 1) — and did so on EVERY sample, EVERY epoch, since this
+project's `tf.data` pipelines deliberately never `.cache()` decoded samples.
+
+**Root cause 2 (confirmed, structural): the SAME cell never staged APTOS locally for training, so
+the raw image read was ALSO unconditionally against Drive.** `_build_joint_sample()` calls
+`lfed._load_raw_bgr(image_dir, id_code)` UNCONDITIONALLY, before any cache-hit check — even on a
+full cache hit, the raw image is still read (to build `canonical_rgb`, deliberately never cached,
+see §9's design). The training cell never passed `image_dir` at all, so it defaulted to
+`DEFAULT_TRAIN_IMAGE_DIR`, which resolves via the `APTOS2019_RAW_DIR` environment variable to the
+Drive-mounted raw directory — unlike the Phase 1 cell, which explicitly stages APTOS to local disk
+first (`dataset_staging.stage_dataset(...)`) and passes the staged local directory as `image_dir`.
+So every sample paid a FOURTH Drive-FUSE file-open cost (the raw PNG) on top of the three cache
+files, every sample, every epoch.
+
+**Measured (local, CPU-only dev machine, no GPU, real synthetic-checkpoint architectures — NOT a
+substitute for real Drive latency, but isolates the code path's own cost):** `_build_joint_sample`
+against a LOCAL cache/image directory, N=8 synthetic images, cache-HIT path (Phase 1 had already
+populated the cache) —
+
+```
+Per-sample times (s): [0.4339, 0.3266, 0.3165, 0.3591, 0.5788, 0.5258, 0.4987, 0.5535]
+mean=0.4491s  max=0.5788s  min=0.3165s
+Simulated batch_size=2 step cost (2 samples, sequential, local disk): ~0.90s
+```
+
+Even on this unoptimized, CPU-only, non-Colab machine, a purely local-disk cache-hit sample costs
+under 0.6s — a `batch_size=2` step reading local disk should cost under ~1s, not 5–6s. The observed
+real-Colab number (~2.5–3s/sample) is 5–9× slower than this already-conservative local baseline,
+which is exactly the signature expected from adding Drive FUSE's per-file-open latency on top of
+(not instead of) the code path's own cost — not a signature of the code path itself being slow, and
+not a signature of Stage 03/04 being recomputed (a genuine recompute, per this project's own
+measurements elsewhere, costs whole seconds of GPU/CPU forward-pass time per image, not a roughly
+constant ~2.5–3s regardless of step number across a 378-step window, which is instead the signature
+of a per-sample I/O tax that neither grows nor shrinks with progress).
+
+**Root cause 3 (confirmed, structural): empty-FOV images have no cache anywhere, so they are
+re-attempted every epoch.** `_get_or_compute_joint_frozen_outputs()` raises `EmptyFieldOfViewError`
+BEFORE any `np.save`/`np.savez` call for such an image — by design, there is no project-sanctioned
+fallback value to cache (§9). This means an image that fails FOV detection has NO cache entry in
+EITHER the local or persistent directory, so every subsequent access — including every training
+epoch, not just Phase 1 — finds no cache hit anywhere, re-attempts Stage 03's (relatively cheap, but
+not free) FOV-detection pipeline, hits the same failure again, and correctly excludes the image
+again. This is EXPECTED given the current design (already documented: `_make_joint_dataset`'s
+generator "excluded from this epoch" — per-epoch language, not "excluded forever"), not a
+correctness bug — the image is neither fabricated nor allowed to crash the run, on any epoch — but
+it is a real, small, bounded inefficiency (≤11 of 2929 images, i.e. ≤0.8% of steps affected) that is
+NOT the cause of the dominant per-step slowdown (which affects essentially every step, not ~1 in
+133). No change was made for this: adding a negative/"known-unprocessable" cache would introduce a
+new cache concept not requested and not necessary to fix the reported slowness, so it was left as a
+documented, minor, optional future optimization rather than a speculative change made now.
+
+**Fix.** `_get_or_compute_joint_frozen_outputs()` gained `persistent_vessel_cache_path`/
+`persistent_lesion_cache_path`/`persistent_reliability_cache_path` (all default `None`, fully
+backward compatible): on a LOCAL cache miss, these (if given) are checked next; a hit there is
+loaded from the persistent location and MIRRORED to the local path (once), so every later call for
+that same image — every subsequent epoch — reads local disk only, never the persistent location
+again. This exact mechanism is threaded through `_build_joint_sample()` → `_make_joint_dataset()` →
+`load_joint_training_datasets()` as `persistent_cache_dir`/`persistent_racaf_cache_dir`, mirroring
+§35's Phase 1 parameter naming and semantics exactly. `load_joint_training_datasets()` also gained a
+`check_gpu()` call before either model loads — it loads the same two GPU-touching models (Stage 03
+PyTorch, Stage 04 TensorFlow) Phase 1's two entry points already guard with this call (§34); Phase 2
+had been missing it, a real (if not yet observed as crashing) gap.
+
+The notebook's "Dataset loading" cell now stages APTOS locally (idempotent — a no-op if Phase 1
+already staged it this session) and passes `image_dir` at the staged local directory,
+`cache_dir`/`racaf_cache_dir` at the SAME local cache directories the Phase 1 cell uses,
+`persistent_cache_dir`/`persistent_racaf_cache_dir` at the real Drive-mounted persistent cache, and
+`processed_dir` at the same deliberately-empty local directory Phase 1 uses (forcing the cheap live
+Stage 02 fallback rather than one more Drive lookup). The cell works correctly whether or not Phase 1
+was run first: if it was, every sample is already a local cache hit; if not, the first epoch pays a
+one-time, naturally-paced (never a concurrent burst, so no §35-class FUSE risk) Drive read per
+uncached image, mirrored locally, so only that first epoch is I/O-bound and every later one is not.
+
+**No Stage 3/4/RACAF/Stage 5/6/7/CORN architecture, weights, reliability equations, TTA definition,
+or cache format/keys changed. No batch size, hyperparameter, loss, optimizer, or QWK change.** No
+existing Drive cache entry deleted, invalidated, or duplicated. Resumability, the authoritative
+2929/733 split, and validation determinism are all unaffected — none of this touches which entries
+are considered cached, only where their content is read from.
+
+Regression tests: `tests/test_joint_training.py` — `Phase2PersistentCacheDirTests` (a persistent-
+only entry is wastefully recomputed WITHOUT this fix, confirmed as the baseline; WITH it, never
+recomputed; mirrored to local disk; a second call reads purely local even if the persistent
+location becomes unavailable; `persistent_cache_dir=None` preserves the exact prior default
+behavior; `_make_joint_dataset` forwards the parameter to every sample), `LoadJointTrainingDatasets
+Tests` (`load_joint_training_datasets` — previously untested directly — calls `check_gpu()` before
+either model loads; forwards `persistent_cache_dir`/`persistent_racaf_cache_dir` to both train and
+val datasets; defaults to `None`; an end-to-end real-synthetic-data run against a persistent-only
+cache never recomputes), and `RepeatedEmptyFovAcrossEpochsTests` (a permanently-empty-FOV image is
+excluded and warned identically across two independent dataset iterations — deterministic, not a
+bug; confirms no cache file is ever written for it).
+
+**Still required before declaring the pipeline training-ready:** a real Colab T4 run, since Drive
+FUSE's actual latency (and therefore the actual steps/second improvement) cannot be measured
+outside Colab. Recommended: run Phase 1 first (already proven safe and complete, §35), then start
+training and observe whether steps/second increases substantially in epoch 1 once local mirroring
+completes, and whether steady-state steps/second in epoch 2+ (fully local) is now compute-bound
+rather than I/O-bound.
