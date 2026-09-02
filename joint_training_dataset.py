@@ -71,6 +71,28 @@ exhaustion:
     Phase 2 still works correctly on its own even if Phase 1 was never run (any still-uncached
     entry is computed on the fly, exactly as before) -- Phase 1 is a recommended optimization to
     decouple slow cache-building from the training loop, not a new requirement for correctness.
+
+Persistent-cache existence check, not bulk copy (`JOINT_TRAINING_ARCHITECTURE.md` §35) -- fixes a
+real Colab crash (`OSError: [Errno 107] Transport endpoint is not connected`) that persisted after
+the fixes above: `precompute_joint_frozen_caches()`'s `persistent_cache_dir`/
+`persistent_racaf_cache_dir` parameters let a caller point at a Drive-mounted, already-populated
+cache directory from a PRIOR run -- an entry found there (via a cheap `os.path.exists` stat, the
+same check already used for `cache_dir`/`racaf_cache_dir`) is treated as a cache hit, WITHOUT ever
+copying its content anywhere. This is what makes it safe for a caller to write newly computed
+entries only to a fast local `cache_dir` (never recomputing anything already cached on Drive)
+instead of first bulk-pulling the entire existing Drive cache down to local disk "just in case" --
+a real run with ~8900 already-cached files hit exactly this crash when a prior version of this
+workflow did that bulk pull, immediately after another already-heavy concurrent Drive copy (dataset
+staging). Nothing about the cache CONTENT, format, or write path changes: a miss is still computed
+and written to `cache_dir`/`racaf_cache_dir` exactly as before; only the caller decides how (and
+whether) to sync the local cache_dir back up to `persistent_cache_dir` afterward
+(`dataset_staging.sync_missing_files`, unchanged, bounded to newly written files only).
+
+Diagnostic mode (`max_images`, `verbose_diagnostics`) -- lets a caller run Phase 1 against the REAL
+code path (real checkpoints, real images, real cache I/O) on a small, controlled number of entries
+before committing to a full run, with per-image RSS/GPU-memory/timing visibility instead of relying
+on Colab's own resource graphs. Purely observational: it never changes which entries are computed
+or what gets written to the cache.
 """
 
 import logging
@@ -276,11 +298,64 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
 
 # --- Phase 1: cache precomputation, decoupled from Phase 2 (tf.data construction / training) ---
 
+def _cache_entry_paths(id_code, cache_dir, racaf_cache_dir, image_size):
+    vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
+    lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
+    reliability_cache = racaf.reliability_cache_path(racaf_cache_dir, id_code)
+    return vessel_cache, lesion_cache, reliability_cache
+
+
+def _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
+    """True iff ALL THREE of `id_code`'s cache files already exist under `cache_dir`/
+    `racaf_cache_dir` -- an existence-only check (`os.path.exists`, a stat call), never reading
+    or copying any file's content. Shared by `precompute_joint_frozen_caches`'s own `cache_dir`
+    check and its `persistent_cache_dir` check (see that parameter's docstring) so both use
+    identically-defined "is this cached" logic."""
+    vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
+        id_code, cache_dir, racaf_cache_dir, image_size,
+    )
+    return (
+        os.path.exists(vessel_cache)
+        and os.path.exists(lesion_cache)
+        and os.path.exists(reliability_cache)
+    )
+
+
+def _current_process_rss_mb():
+    """Current process RSS in MB via `psutil`, or `None` if `psutil` is unavailable -- never
+    raises. Diagnostic-only: never called on the real (non-diagnostic) Phase 1 path."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024.0 * 1024.0)
+    except Exception:  # noqa: BLE001 -- diagnostic reporting must never crash a real run
+        return None
+
+
+def _current_gpu_memory_used_mb():
+    """Current TensorFlow-reported GPU memory usage in MB (`tf.config.experimental.get_memory_info`),
+    or `None` if no GPU is visible or the query is unsupported -- never raises. Reports only
+    TensorFlow's own view (Stage 04); PyTorch's independent CUDA allocator (Stage 03) is not
+    visible through this call, so a `None`/low value here does not by itself mean total GPU usage
+    is low. Diagnostic-only: never called on the real (non-diagnostic) Phase 1 path."""
+    try:
+        if not tf.config.list_physical_devices("GPU"):
+            return None
+        info = tf.config.experimental.get_memory_info("GPU:0")
+        return info["current"] / (1024.0 * 1024.0)
+    except Exception:  # noqa: BLE001 -- diagnostic reporting must never crash a real run
+        return None
+
+
 def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, cache_dir=DEFAULT_CACHE_DIR,
-                                    racaf_cache_dir=DEFAULT_RACAF_CACHE_DIR, vessel_model=None,
+                                    racaf_cache_dir=DEFAULT_RACAF_CACHE_DIR,
+                                    persistent_cache_dir=None, persistent_racaf_cache_dir=None,
+                                    vessel_model=None,
                                     vessel_model_path=DEFAULT_VESSEL_MODEL_PATH, stage4_model=None,
                                     processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
-                                    progress_every=50):
+                                    progress_every=50, max_images=None, verbose_diagnostics=False):
     """Phase 1 of the two-phase joint training workflow (module docstring; `JOINT_TRAINING_
     ARCHITECTURE.md` §32/§33): populates every entry's Stage 03/04 + RACAF on-disk cache, ONE
     IMAGE AT A TIME, with no `tf.data` pipeline involved at all -- this is the expensive, CPU/
@@ -311,6 +386,35 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     skipped counts alongside elapsed wall-clock time and a rolling images-per-minute rate -- so a
     long Colab run's actual throughput is visible without guessing.
 
+    `persistent_cache_dir`/`persistent_racaf_cache_dir` (both default `None`): an ADDITIONAL cache
+    location checked for an existing entry -- via the SAME `os.path.exists`-only check used for
+    `cache_dir`/`racaf_cache_dir`, never a content read or copy -- when the entry is not found
+    under `cache_dir`/`racaf_cache_dir` itself. Intended use: `cache_dir`/`racaf_cache_dir` point
+    at a fast local directory this run writes NEW entries to, while `persistent_cache_dir`/
+    `persistent_racaf_cache_dir` point at the real, Drive-mounted, cross-session persistent cache
+    -- so an image already cached from a PRIOR run is correctly skipped (never recomputed) WITHOUT
+    first bulk-copying the entire persistent cache down to local disk (`JOINT_TRAINING_
+    ARCHITECTURE.md` §35 -- that bulk-copy pattern is what caused a real Colab run to crash with
+    `OSError: [Errno 107] Transport endpoint is not connected`, from thousands of concurrent Drive
+    file opens). A miss (not found in either location) is always computed and written to
+    `cache_dir`/`racaf_cache_dir` only -- `persistent_cache_dir`/`persistent_racaf_cache_dir` are
+    never written to by this function. Leaving both at `None` (the default) reproduces the exact
+    prior behavior: only `cache_dir`/`racaf_cache_dir` are ever checked or written.
+
+    `max_images` (default `None`): if given, only the first `max_images` of `entries` are
+    processed -- lets a caller run this function's REAL code path (real models, real images, real
+    cache I/O) against a small, controlled number of images before committing to a full run,
+    without altering which entries would be computed in a full run or what gets written to the
+    cache for them.
+
+    `verbose_diagnostics` (default `False`): if `True`, logs one line per image (in addition to
+    the periodic `progress_every` summary) reporting its cache status, this image's own elapsed
+    time, the running images/minute rate, current process RSS (via `psutil`, if installed), and
+    current TensorFlow-reported GPU memory usage (if a GPU is visible) -- exactly the per-image
+    visibility needed to tell a genuine memory-growth trend apart from normal one-time model-load
+    overhead on a real run, without accumulating any of that data into `stats` (each line is
+    logged and discarded; the returned `stats` dict's shape is unaffected either way).
+
     Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...],
     "elapsed_seconds": float}`.
     """
@@ -324,6 +428,8 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     check_gpu()
 
     entries = list(entries)
+    if max_images is not None:
+        entries = entries[:max_images]
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
 
@@ -340,14 +446,36 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
             len(stats["skipped_empty_fov"]), elapsed, images_per_minute,
         )
 
-    for i, (id_code, _diagnosis) in enumerate(entries):
-        vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
-        lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
-        reliability_cache = racaf.reliability_cache_path(racaf_cache_dir, id_code)
+    def _log_diagnostic(i, id_code, status, image_elapsed):
+        if not verbose_diagnostics:
+            return
+        elapsed = time.monotonic() - start_time
+        images_per_minute = ((i + 1) / elapsed) * 60.0 if elapsed > 0 else 0.0
+        rss_mb = _current_process_rss_mb()
+        gpu_mb = _current_gpu_memory_used_mb()
+        logger.info(
+            "[diagnostic] %d/%d id=%s status=%s image_elapsed=%.2fs total_elapsed=%.1fs "
+            "images/min=%.1f rss_mb=%s gpu_used_mb=%s",
+            i + 1, len(entries), id_code, status, image_elapsed, elapsed, images_per_minute,
+            f"{rss_mb:.1f}" if rss_mb is not None else "n/a",
+            f"{gpu_mb:.1f}" if gpu_mb is not None else "n/a",
+        )
 
-        if os.path.exists(vessel_cache) and os.path.exists(lesion_cache) and os.path.exists(reliability_cache):
+    for i, (id_code, _diagnosis) in enumerate(entries):
+        image_start = time.monotonic()
+        already_cached = _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size)
+        if not already_cached and persistent_cache_dir is not None:
+            already_cached = _cache_entry_exists(
+                id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size,
+            )
+
+        if already_cached:
             stats["already_cached"] += 1
+            _log_diagnostic(i, id_code, "already_cached", time.monotonic() - image_start)
         else:
+            vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
+                id_code, cache_dir, racaf_cache_dir, image_size,
+            )
             raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
             rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
             try:
@@ -357,12 +485,14 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                     known_not_all_cached=True,
                 )
                 stats["cached"] += 1
+                _log_diagnostic(i, id_code, "cached", time.monotonic() - image_start)
             except EmptyFieldOfViewError:
                 logger.warning(
                     "Skipping image_id=%s during cache precomputation: empty Stage 03 "
                     "field-of-view (no fundus disk detected).", id_code,
                 )
                 stats["skipped_empty_fov"].append(id_code)
+                _log_diagnostic(i, id_code, "skipped_empty_fov", time.monotonic() - image_start)
 
         if progress_every and (i + 1) % progress_every == 0:
             _log_progress(i + 1)
@@ -375,13 +505,17 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
 
 def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=DEFAULT_TRAIN_IMAGE_DIR,
                                            cache_dir=DEFAULT_CACHE_DIR, racaf_cache_dir=DEFAULT_RACAF_CACHE_DIR,
+                                           persistent_cache_dir=None, persistent_racaf_cache_dir=None,
                                            vessel_model=None, vessel_model_path=DEFAULT_VESSEL_MODEL_PATH,
                                            stage4_model=None, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED,
-                                           processed_dir=DEFAULT_PROCESSED_DIR, progress_every=50):
+                                           processed_dir=DEFAULT_PROCESSED_DIR, progress_every=50,
+                                           max_images=None, verbose_diagnostics=False):
     """Phase 1 entry point for the real training workflow -- precomputes caches for BOTH halves of
     the SAME authoritative split (`split_train_val_ids`) `load_joint_training_datasets()` (Phase
     2) reads, never a second one. Loads `vessel_model`/`stage4_model` at most once each, regardless
-    of how many of the combined 3662 entries still need computing."""
+    of how many of the combined 3662 entries still need computing. `persistent_cache_dir`/
+    `persistent_racaf_cache_dir`/`max_images`/`verbose_diagnostics` are forwarded unchanged to
+    `precompute_joint_frozen_caches` -- see that function's docstring."""
     check_gpu()  # before loading either model -- see precompute_joint_frozen_caches's identical call
 
     train_entries, val_entries = split_train_val_ids(csv_path, val_split=val_split, seed=seed)
@@ -389,8 +523,10 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
     return precompute_joint_frozen_caches(
         train_entries + val_entries, image_dir=image_dir, cache_dir=cache_dir, racaf_cache_dir=racaf_cache_dir,
+        persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
         vessel_model=resolved_vessel_model, stage4_model=resolved_stage4_model,
         processed_dir=processed_dir, progress_every=progress_every,
+        max_images=max_images, verbose_diagnostics=verbose_diagnostics,
     )
 
 

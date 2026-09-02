@@ -33,6 +33,25 @@ destination and can run in either direction (Drive -> local to resume an
 interrupted cache-precomputation run, or local -> Drive to persist newly
 written entries), reusing the same latency-tolerant thread-pool copy.
 
+IMPORTANT -- do not use `sync_missing_files()` to bulk-pull an entire persistent Drive cache
+down to local disk "just in case" before deciding what to compute (`JOINT_TRAINING_ARCHITECTURE.md`
+Sec 35): a Drive-persisted cache can grow to thousands of small files across repeated runs, and
+copying all of them at once -- especially stacked immediately after another already-heavy
+concurrent copy (e.g. dataset staging) -- is exactly the kind of sustained, high-concurrency burst
+against Drive's FUSE mount that has caused a real Colab run to fail with
+`OSError: [Errno 107] Transport endpoint is not connected` (the FUSE daemon disconnecting under
+load). Determining whether a given cache entry already exists needs only a cheap `os.path.exists`
+stat against its known path -- never its content -- so a caller that only needs to know "is this
+already cached" should check directly against the persistent Drive directory instead of pulling
+it down first; use `sync_missing_files()` for the (much smaller, session-bounded) push of newly
+computed entries back up to Drive afterward.
+
+Every individual copy (`_copy_one`, shared by `stage_dataset()` and `sync_missing_files()`) is
+atomic -- written to a temp file, size-verified, then renamed into place -- and retries transient
+Drive/FUSE errors (ENOTCONN and similar) with backoff, so a mid-copy Drive hiccup can never leave
+a corrupt/partial file mistaken for a valid cache entry, and does not need to abort an entire
+staging/sync run on its own.
+
 Verifying the result of a copy is deliberately split in two:
   - `verify_staged_copy()` here is a generic, dataset-structure-agnostic
     check (file count + total bytes match between Drive source and local
@@ -47,14 +66,30 @@ Verifying the result of a copy is deliberately split in two:
 """
 
 import concurrent.futures
+import errno
 import os
 import posixpath
+import random
 import shutil
 import time
 from dataclasses import dataclass
 
 LOCAL_DATASETS_ROOT = "/content/datasets"
 DEFAULT_MAX_WORKERS = 16
+
+# Errno values characteristic of a Google Drive FUSE hiccup under load (mount temporarily
+# disconnected/stale), as opposed to a real, non-retryable failure (permission denied, disk
+# full, file not found) -- retrying those would never help and would only hide a real problem.
+# ENOTCONN ("Transport endpoint is not connected") is the specific error this project has hit in
+# a real Colab run (JOINT_TRAINING_ARCHITECTURE.md Sec 35), caused by too many concurrent Drive
+# file opens; ESTALE/ETIMEDOUT/EIO are the other well-documented FUSE-instability symptoms.
+_TRANSIENT_ERRNOS = {errno.ENOTCONN, errno.ESTALE, errno.ETIMEDOUT, errno.EIO}
+DEFAULT_RETRY_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+def _is_transient_os_error(exc):
+    return isinstance(exc, OSError) and exc.errno in _TRANSIENT_ERRNOS
 
 
 @dataclass(frozen=True)
@@ -80,9 +115,42 @@ def _dir_stats(root):
     return file_count, total_bytes
 
 
-def _copy_one(src, dst):
+def _copy_one(src, dst, retry_attempts=DEFAULT_RETRY_ATTEMPTS,
+              retry_base_delay=DEFAULT_RETRY_BASE_DELAY_SECONDS):
+    """Copies `src` to `dst` atomically: written to a same-directory temp file first, then
+    `os.replace()`d into place, so a mid-copy failure (a Drive FUSE disconnect, a killed
+    runtime) never leaves a partial/corrupt file at `dst` -- a half-written cache entry would
+    otherwise be silently treated as a valid cache hit by every `os.path.exists` check in this
+    project. The copied size is verified against the source before the rename as a cheap extra
+    guard against a truncated read/write going undetected.
+
+    Retries up to `retry_attempts` times, with exponential backoff, but ONLY for the errno
+    values in `_TRANSIENT_ERRNOS` -- a Drive FUSE hiccup, not a real failure (wrong permissions,
+    disk full, source missing), which is left to raise immediately since retrying it cannot
+    help. This is what makes both `stage_dataset()` and `sync_missing_files()` tolerant of the
+    same transient Drive instability that previously crashed a real Colab run with
+    `OSError: [Errno 107] Transport endpoint is not connected` mid-copy."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    shutil.copy2(src, dst)
+    tmp_dst = f"{dst}.tmp-{os.getpid()}-{random.randint(0, 1_000_000)}"
+    last_error = None
+    for attempt in range(retry_attempts):
+        try:
+            shutil.copy2(src, tmp_dst)
+            if os.path.getsize(tmp_dst) != os.path.getsize(src):
+                raise OSError(errno.EIO, f"Copied size mismatch for {src!r} -> {tmp_dst!r}")
+            os.replace(tmp_dst, dst)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                if os.path.exists(tmp_dst):
+                    os.remove(tmp_dst)
+            except OSError:
+                pass
+            if not _is_transient_os_error(exc) or attempt == retry_attempts - 1:
+                raise
+            time.sleep(retry_base_delay * (2 ** attempt))
+    raise last_error  # pragma: no cover -- loop always returns or raises above
 
 
 def stage_dataset(drive_source_dir, dataset_name, local_root=LOCAL_DATASETS_ROOT,
@@ -177,10 +245,20 @@ def sync_missing_files(source_dir, dest_dir, max_workers=DEFAULT_MAX_WORKERS):
     Drive cache has been written yet on a first-ever run) is treated as "nothing to copy", not an
     error.
 
-    Returns `(copied_count, already_present_count)`.
+    Each copy (`_copy_one`) is atomic (temp file + rename) and retries transient Drive/FUSE
+    errors (ENOTCONN/"Transport endpoint is not connected" and similar) with backoff on its own
+    -- see `_copy_one`'s docstring. If a file's copy still fails after those retries (a real,
+    non-transient error), it is recorded in the returned `failures` list rather than aborting the
+    whole call: every other independent file still gets copied, and a failed file is simply still
+    missing from `dest_dir` afterward, so a later re-run of this same function will retry exactly
+    that file again (the existing resumability guarantee already covers this -- nothing special
+    has to be done to "resume" a partial sync).
+
+    Returns `(copied_count, already_present_count, failures)`, where `failures` is a list of
+    `(source_path, dest_path, error_message)` tuples (empty on full success).
     """
     if not os.path.isdir(source_dir):
-        return 0, 0
+        return 0, 0, []
 
     to_copy = []
     already_present = 0
@@ -194,13 +272,25 @@ def sync_missing_files(source_dir, dest_dir, max_workers=DEFAULT_MAX_WORKERS):
             else:
                 to_copy.append((os.path.join(dirpath, name), dest_path))
 
+    failures = []
     if to_copy:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_copy_one, src, dst) for src, dst in to_copy]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()  # re-raise immediately on any individual copy failure
+            future_to_pair = {pool.submit(_copy_one, src, dst): (src, dst) for src, dst in to_copy}
+            for future in concurrent.futures.as_completed(future_to_pair):
+                src, dst = future_to_pair[future]
+                try:
+                    future.result()
+                except OSError as exc:
+                    failures.append((src, dst, str(exc)))
 
-    return len(to_copy), already_present
+    if failures:
+        print(f"sync_missing_files: {len(failures)} of {len(to_copy)} file(s) failed to copy "
+              f"(non-transient, or exhausted retries) -- they remain missing at the destination "
+              f"and will be retried on the next call:")
+        for src, dst, error in failures:
+            print(f"  FAILED: {src} -> {dst}: {error}")
+
+    return len(to_copy) - len(failures), already_present, failures
 
 
 def verify_staged_copy(staged: StagedDataset):

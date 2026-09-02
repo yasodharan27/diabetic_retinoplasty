@@ -433,26 +433,31 @@ for the visual end-to-end flow.
 > The full joint-training design -- dataset flow, caching, gradient boundary, loss, checkpoint
 > format, and the Drive/notebook infrastructure it depends on -- is resolved in
 > `JOINT_TRAINING_ARCHITECTURE.md`, and the joint model builder/dataset loader (`joint_training_model.py`,
-> `joint_training_dataset.py`, 76 tests) are now implemented -- but no training has completed and no
+> `joint_training_dataset.py`, 86 tests) are now implemented -- but no training has completed and no
 > checkpoint exists (`colab/notebooks/stage08_corn_classifier.ipynb`'s training cells are gated
 > behind `RUN_TRAINING = False`). Checkpoint selection (`monitor="val_QWK", mode="max"`) is backed
 > by `corn.CORNQuadraticWeightedKappa` -- a CORN-aware Keras metric (12 more tests in
 > `tests/test_corn.py`) that decodes CORN's logits via `decode_logits`'s own rule rather than
 > the generic, argmax-based `training.metrics.QuadraticWeightedKappa`, which cannot be applied to
-> CORN's conditional-task logits directly. The first real T4 run hit and fixed four blockers
-> (`JOINT_TRAINING_ARCHITECTURE.md` §31-34): an empty-Stage-03-FOV crash on one real APTOS image;
+> CORN's conditional-task logits directly. The first real T4 runs hit and fixed five blockers
+> (`JOINT_TRAINING_ARCHITECTURE.md` §31-35): an empty-Stage-03-FOV crash on one real APTOS image;
 > RAM exhaustion from an unbounded `tf.data` shuffle buffer, whose fix also added an optional
 > `precompute_authoritative_joint_caches()` phase that populates Stage 03/04/RACAF's cache
 > independently of training (`RUN_CACHE_PRECOMPUTATION`); that cache-precomputation phase then
 > measured as impractically slow on a real T4 run (its cache directories default to Google Drive,
 > so every check/write paid Drive's per-file-open latency) -- fixed by running it against a local
-> cache directory synced to/from Drive in bulk (`colab/common/dataset_staging.sync_missing_files()`,
-> 9 tests in `tests/test_dataset_staging.py`); and a further RAM exhaustion that persisted even
-> with local caching, root-caused with real checkpoints/images to `tf.config.experimental.
-> set_memory_growth` never being called anywhere in the joint-training path -- TensorFlow's default
-> GPU allocator was claiming ~all VRAM on first use, starving Stage 03's independent PyTorch CUDA
-> allocator sharing the same GPU -- fixed by calling the project's existing `training.check_gpu()`
-> before either model loads.
+> cache directory; a further RAM exhaustion that persisted even with local caching, root-caused
+> with real checkpoints/images to `tf.config.experimental.set_memory_growth` never being called
+> anywhere in the joint-training path -- TensorFlow's default GPU allocator was claiming ~all VRAM
+> on first use, starving Stage 03's independent PyTorch CUDA allocator sharing the same GPU --
+> fixed by calling the project's existing `training.check_gpu()` before either model loads; and
+> then a real crash (`OSError: [Errno 107] Transport endpoint is not connected`) from that same
+> local-caching fix's own pre-run step bulk-pulling an entire persistent Drive cache (thousands of
+> files from a prior run) down to local disk via `colab/common/dataset_staging.sync_missing_files()`
+> under heavy concurrency -- fixed by checking the persistent Drive cache's existence only (never
+> its content) instead of bulk-copying it, and hardening `dataset_staging`'s copy primitive with
+> atomic writes and transient-error retry (`sync_missing_files()`, now 14 tests in
+> `tests/test_dataset_staging.py`).
 
 ### 9. Uncertainty Estimation
 - **Purpose:** Quantify prediction confidence via Monte Carlo Dropout.

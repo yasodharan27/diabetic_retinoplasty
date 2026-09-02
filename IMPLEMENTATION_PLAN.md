@@ -288,24 +288,31 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   see `JOINT_TRAINING_ARCHITECTURE.md` §27 and Step 8.5 below.
 
 ### Step 8.5 — Joint Training Pipeline (Stage 05-08 + RACAF)
-- **Status: Implemented, unit-tested (76 tests, `tests/test_joint_training.py`, plus 12 more in
-  `tests/test_corn.py` for the CORN-aware QWK metric below, plus 9 in
-  `tests/test_dataset_staging.py`). The first real T4 training attempt hit four blockers, each
+- **Status: Implemented, unit-tested (86 tests, `tests/test_joint_training.py`, plus 12 more in
+  `tests/test_corn.py` for the CORN-aware QWK metric below, plus 14 in
+  `tests/test_dataset_staging.py`). The first real T4 training attempts hit five blockers, each
   diagnosed, fixed, and unit-tested (no real training or checkpoint produced by any fix) — see
   `JOINT_TRAINING_ARCHITECTURE.md` §31 (an empty-Stage-03-FOV `IndexError` crash on a real APTOS
   image), §32 (RAM exhaustion caused by an unbounded `tf.data` shuffle buffer, fixed alongside a
   new, optional cache-precomputation phase), §33 (that cache-precomputation phase itself was then
   measured to be impractically slow — root cause: its cache directories resolved to Google Drive,
   so every cache check/write paid Drive's per-file-open latency; fixed by running it against a
-  local cache directory, synced to/from Drive in bulk), and §34 (Colab still crashed from "RAM
-  exhaustion" afterward even though the CPU RAM graph never showed growth — measured with real
-  checkpoints/images to conclusively rule out a CPU-side leak [`gc.collect()` reclaimed zero
-  objects every time, live object count never moved]; actual root cause traced to
-  `tf.config.experimental.set_memory_growth` never being called anywhere in the joint-training
-  path, so TensorFlow's default allocator claims ~all GPU VRAM the instant it first runs, starving
-  Stage 03's independent PyTorch CUDA allocator on the same GPU; fixed by calling the project's
-  existing `training.check_gpu()` before either model loads). Not yet trained to completion — no
-  finished epoch, no checkpoint exists anywhere in this repository or on Drive.**
+  local cache directory), §34 (Colab still crashed from "RAM exhaustion" afterward even though the
+  CPU RAM graph never showed growth — measured with real checkpoints/images to conclusively rule
+  out a CPU-side leak [`gc.collect()` reclaimed zero objects every time, live object count never
+  moved]; actual root cause traced to `tf.config.experimental.set_memory_growth` never being called
+  anywhere in the joint-training path, so TensorFlow's default allocator claims ~all GPU VRAM the
+  instant it first runs, starving Stage 03's independent PyTorch CUDA allocator on the same GPU;
+  fixed by calling the project's existing `training.check_gpu()` before either model loads), and
+  §35 (a real run then crashed with `OSError: [Errno 107] Transport endpoint is not connected`
+  while §33's fix bulk-pulled the ENTIRE persistent Drive cache — thousands of files from a prior
+  run — down to local disk before starting, immediately after another already-heavy concurrent
+  Drive copy; fixed by replacing that bulk pull with a cheap, existence-only check against the
+  persistent Drive cache directory [`persistent_cache_dir`/`persistent_racaf_cache_dir`], plus
+  hardening `dataset_staging`'s copy primitive with atomic writes and transient-error retry, and
+  adding a `max_images`/`verbose_diagnostics` small-scale diagnostic mode with real RSS/GPU-memory
+  instrumentation for the next real run). Not yet trained to completion — no finished epoch, no
+  checkpoint exists anywhere in this repository or on Drive.**
   Full design: `JOINT_TRAINING_ARCHITECTURE.md`.
 - **`corn.CORNQuadraticWeightedKappa`** — a post-implementation audit found that
   `compile_joint_model()` originally compiled with no metric at all, so `monitor="val_QWK"`
@@ -356,10 +363,14 @@ Stage 10, Step 10 to Stage 11, and Step 11 to Stage 12.)*
   (Phase 2). Not required for correctness — Phase 2 still computes-and-caches any uncached entry
   on the fly — but recommended for a real training run. A real run of this phase was measured to
   be impractically slow (§33 above) because its cache directories default to Google Drive paths;
-  the notebook's Phase 1 cell now runs it against a local cache directory instead, using the new
-  `colab/common/dataset_staging.sync_missing_files()` to pull any existing Drive cache down first
-  and push new entries back up afterward (a Phase 1b cell can push progress at any time). Gated
-  behind `RUN_CACHE_PRECOMPUTATION = False` by default.
+  the notebook's Phase 1 cell now runs it against a local cache directory instead. Cache hits
+  against a PRIOR run's persistent Drive cache are detected via a cheap existence-only check
+  (`persistent_cache_dir`/`persistent_racaf_cache_dir` — never a bulk content pull, which
+  previously crashed a real run's Drive FUSE mount, §35); newly computed entries are pushed to
+  Drive via `colab/common/dataset_staging.sync_missing_files()` (a Phase 1b cell can push progress
+  at any time). Gated behind `RUN_CACHE_PRECOMPUTATION = False` by default; a
+  `CACHE_DIAGNOSTIC_MAX_IMAGES` control (`max_images`/`verbose_diagnostics` under the hood) lets a
+  small, real-code-path run be tried first, with per-image RSS/GPU-memory logging.
 - **Next step:** set `RUN_TRAINING = True` (optionally after `RUN_CACHE_PRECOMPUTATION = True`) and
   actually run joint training on a real Colab T4 — not attempted by this step, per its own explicit
   no-training instruction.

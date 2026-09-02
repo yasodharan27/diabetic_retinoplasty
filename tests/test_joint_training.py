@@ -709,6 +709,182 @@ class CachePrecomputationDriveRoundTripTests(unittest.TestCase):
         self.assertIn("2/2", progress_lines[0])
 
 
+class PersistentCacheDirTests(unittest.TestCase):
+    """Regression tests for `JOINT_TRAINING_ARCHITECTURE.md` §35: a real Colab run crashed with
+    `OSError: [Errno 107] Transport endpoint is not connected` when Phase 1 bulk-pulled an entire
+    persistent Drive cache down to local disk before starting. `persistent_cache_dir`/
+    `persistent_racaf_cache_dir` replace that bulk pull with a cheap, existence-only check against
+    the persistent location -- never a content copy."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1)])
+        self.addCleanup(self.tree.cleanup)
+        self.persistent_root = tempfile.mkdtemp(prefix="persistent_cache_")
+        self.addCleanup(shutil.rmtree, self.persistent_root, True)
+        self.persistent_cache_dir = os.path.join(self.persistent_root, "local_feature_extraction")
+        self.persistent_racaf_cache_dir = os.path.join(self.persistent_root, "racaf")
+
+    def test_entry_cached_only_in_persistent_dir_is_a_hit_without_recomputing_or_copying(self):
+        # Populate the "persistent Drive" cache directly (simulating a prior run) -- NOT cache_dir.
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir,
+            self.persistent_cache_dir, self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertTrue(os.path.isdir(self.persistent_cache_dir))
+        self.assertFalse(os.path.exists(self.tree.cache_dir))
+
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            stats = jtd.precompute_joint_frozen_caches(
+                [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                persistent_cache_dir=self.persistent_cache_dir,
+                persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            )
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["cached"], 0)
+        self.assertEqual(mocked_vessel.call_count, 0)
+        # No bulk copy: the entry must NOT have been duplicated into the local cache_dir either.
+        self.assertFalse(os.path.exists(self.tree.cache_dir))
+
+    def test_entry_missing_from_both_dirs_is_computed_and_written_only_locally(self):
+        stats = jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertEqual(stats["cached"], 1)
+        id_code = self.tree.pairs[0][0]
+        vessel_cache_local = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        vessel_cache_persistent = lfed._cache_path(
+            self.persistent_cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE,
+        )
+        self.assertTrue(os.path.exists(vessel_cache_local))
+        self.assertFalse(os.path.exists(vessel_cache_persistent))
+
+    def test_local_cache_dir_hit_is_checked_first_persistent_dir_need_not_even_exist(self):
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        stats = jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir="/nonexistent/persistent",
+            persistent_racaf_cache_dir="/nonexistent/persistent_racaf",
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["cached"], 0)
+
+    def test_persistent_cache_dir_none_preserves_prior_default_behavior(self):
+        """Regression safety: every existing caller that never passes persistent_cache_dir must
+        behave identically to before this parameter existed."""
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertEqual(stats["cached"], 2)
+        self.assertEqual(stats["already_cached"], 0)
+
+    def test_precompute_authoritative_forwards_persistent_cache_dir_params(self):
+        with mock.patch(
+            "joint_training_dataset.split_train_val_ids", return_value=([("a", 0)], [("b", 1)]),
+        ), mock.patch(
+            "joint_training_dataset.load_vessel_model", return_value="VESSEL_MODEL",
+        ), mock.patch(
+            "joint_training_dataset.racaf.load_frozen_stage4_model", return_value="STAGE4_MODEL",
+        ), mock.patch(
+            "joint_training_dataset.precompute_joint_frozen_caches",
+            return_value={"cached": 0, "already_cached": 0, "skipped_empty_fov": [], "elapsed_seconds": 0.0},
+        ) as mocked_precompute:
+            jtd.precompute_authoritative_joint_caches(
+                persistent_cache_dir="/drive/local_feature_extraction",
+                persistent_racaf_cache_dir="/drive/racaf",
+                max_images=5, verbose_diagnostics=True,
+            )
+        _, kwargs = mocked_precompute.call_args
+        self.assertEqual(kwargs["persistent_cache_dir"], "/drive/local_feature_extraction")
+        self.assertEqual(kwargs["persistent_racaf_cache_dir"], "/drive/racaf")
+        self.assertEqual(kwargs["max_images"], 5)
+        self.assertTrue(kwargs["verbose_diagnostics"])
+
+
+class DiagnosticModeTests(unittest.TestCase):
+    """Regression tests for the small-scale diagnostic mode required by `JOINT_TRAINING_
+    ARCHITECTURE.md` §35: must exercise the REAL Phase 1 code path (real checkpoints, real images,
+    real cache I/O -- no mocked inference) on a small, controlled number of images, with per-image
+    resource visibility, and must never accumulate that per-image data into the returned stats."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1), ("img_c", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def test_max_images_limits_real_entries_processed_via_the_real_code_path(self):
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model, max_images=2,
+        )
+        self.assertEqual(
+            stats["cached"] + stats["already_cached"] + len(stats["skipped_empty_fov"]), 2,
+        )
+        for id_code, _ in self.tree.pairs[:2]:
+            vessel_cache = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+            self.assertTrue(os.path.exists(vessel_cache))
+        third_id = self.tree.pairs[2][0]
+        vessel_cache_third = lfed._cache_path(self.tree.cache_dir, third_id, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        self.assertFalse(os.path.exists(vessel_cache_third))
+
+    def test_max_images_none_processes_every_entry_unchanged(self):
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model, max_images=None,
+        )
+        self.assertEqual(stats["cached"], 3)
+
+    def test_verbose_diagnostics_logs_exactly_one_line_per_processed_image(self):
+        with self.assertLogs("joint_training_dataset", level="INFO") as captured:
+            jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+                max_images=2, verbose_diagnostics=True,
+            )
+        diagnostic_lines = [m for m in captured.output if "[diagnostic]" in m]
+        self.assertEqual(len(diagnostic_lines), 2)
+        for line in diagnostic_lines:
+            self.assertIn("rss_mb=", line)
+            self.assertIn("gpu_used_mb=", line)
+            self.assertIn("images/min=", line)
+
+    def test_verbose_diagnostics_false_by_default_emits_no_diagnostic_lines(self):
+        with self.assertLogs("joint_training_dataset", level="INFO") as captured:
+            jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model, progress_every=1,
+            )
+        diagnostic_lines = [m for m in captured.output if "[diagnostic]" in m]
+        self.assertEqual(diagnostic_lines, [])
+
+    def test_diagnostic_mode_does_not_change_the_returned_stats_shape(self):
+        """Bounded-memory proof extended to diagnostic mode: verbose_diagnostics must never add a
+        per-image list/array to the returned stats -- each log line is discarded immediately."""
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            max_images=2, verbose_diagnostics=True,
+        )
+        self.assertEqual(
+            set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov", "elapsed_seconds"},
+        )
+
+
 class GPUMemoryGrowthSafeguardTests(unittest.TestCase):
     """Regression tests for the diagnosed Phase 1 GPU VRAM exhaustion root cause
     (`JOINT_TRAINING_ARCHITECTURE.md` §34): a real Colab crash persisted after Phase 1's cache

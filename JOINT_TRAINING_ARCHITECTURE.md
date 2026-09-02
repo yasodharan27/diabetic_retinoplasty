@@ -842,3 +842,114 @@ called before either model loads, in both Phase 1 entry points; called even when
 passed in pre-loaded; confirmed to be the exact same `training.check_gpu` object, not a
 reimplementation). Actual VRAM behavior cannot be exercised in this suite (CPU-only) — these tests
 verify the call is wired in at the correct point, which is what a real GPU run depends on.
+
+---
+
+## 35. Full Phase 1 / Drive-staging audit — bulk cache pull crashed Drive's FUSE mount
+
+**Symptom (real Colab T4 run, after §32/§33/§34's fixes):** APTOS staging (5593 files, 153s)
+completed cleanly. The very next step —
+`dataset_staging.sync_missing_files(config.LOCAL_FEATURE_RESULTS_DIR, LOCAL_CACHE_DIR)`, pulling
+the existing Drive cache down to local disk before Phase 1 started — failed with
+`OSError: [Errno 107] Transport endpoint is not connected` while copying one of the cache files.
+The user also observed GPU memory rising within the first few minutes, before any real per-image
+processing had run.
+
+**Audit method (per the explicit "do not patch blindly" instruction):** every file in scope —
+`stage08_corn_classifier.ipynb`, `dataset_staging.py`, `drive_paths.py`, `colab_config.py`,
+`setup.py`, `verify_dataset.py`, `verify_environment.py`, `environment.py`,
+`joint_training_dataset.py`, `local_feature_extraction_dataset.py`, `racaf.py`,
+`vessel_segmentation_inference.py`, `training/trainer.py` — was re-read from the current
+repository, plus `git log` over the last several infrastructure commits, before any change.
+
+**Root cause 1 (confirmed, structural): the Drive-cache pull was a blind bulk copy.** The prior
+Phase 1 cell called `sync_missing_files(Drive cache dir, fresh local dir)` before starting —
+walking the ENTIRE persistent Drive cache (a real prior run had left ~5948 Stage03/04 files and
+~2974 RACAF files there) and copying every one of them, concurrently (16 workers), via
+`shutil.copy2()` straight against the Drive FUSE mount. This ran immediately after the APTOS
+staging copy had just finished the same 16-worker pattern over 5593 files — a sustained,
+back-to-back burst of thousands of concurrent small-file Drive opens, which is the documented way
+to destabilize/crash `drivefs` (ENOTCONN = the FUSE daemon disconnected under load). This is
+exactly the design smell the audit request itself named: Phase 1 never needed the CONTENT of an
+already-cached entry to know it should be skipped — only its existence.
+
+**Root cause 1 fix — existence check, not bulk copy.** `precompute_joint_frozen_caches()` /
+`precompute_authoritative_joint_caches()` (`joint_training_dataset.py`) gained two new parameters,
+`persistent_cache_dir`/`persistent_racaf_cache_dir` (default `None`, fully backward compatible). If
+an entry is not found under the fast local `cache_dir`/`racaf_cache_dir`, it is next checked
+against `persistent_cache_dir`/`persistent_racaf_cache_dir` — via `_cache_entry_exists()`, the SAME
+`os.path.exists`-only check already used for `cache_dir`, never a content read. A hit in either
+location is skipped (never recomputed); a miss is computed and written ONLY to the local
+`cache_dir`/`racaf_cache_dir`, never to the persistent one. The notebook's Phase 1 cell no longer
+pulls the Drive cache down at all — it passes `config.LOCAL_FEATURE_RESULTS_DIR`/
+`config.RACAF_RESULTS_DIR` directly as `persistent_cache_dir`/`persistent_racaf_cache_dir`. The
+existing "Phase 1b -- Manual flush to Drive" cell (unchanged in purpose) still pushes newly
+computed local entries up afterward — bounded by however many images this session actually
+computed, never the full prior-run backlog.
+
+**Root cause 1, defense in depth — `sync_missing_files()`/`stage_dataset()` hardened.** Even with
+the bulk pull removed, the PUSH direction (and `stage_dataset()`'s initial dataset copy) still use
+the same concurrent-Drive-copy pattern, so `dataset_staging._copy_one()` (shared by both) was made:
+  - **Atomic**: copies to a same-directory temp file, verifies its size against the source, then
+    `os.replace()`s it into place — a mid-copy failure can never leave a partial/corrupt file that
+    every `os.path.exists` cache-hit check in this project would otherwise silently trust.
+  - **Retrying, but only for transient errors**: ENOTCONN/ESTALE/ETIMEDOUT/EIO (the FUSE-instability
+    family) are retried up to 4 times with exponential backoff; anything else (permission, disk
+    full) still fails immediately, since retrying it cannot help.
+  - **Non-aborting at the batch level**: `sync_missing_files()` no longer re-raises and aborts the
+    whole call on the first file's failure — every other independent file still gets copied, and a
+    failed file is simply reported in a new `failures` return value (its return signature is now
+    `(copied_count, already_present_count, failures)`) and remains missing at the destination, so
+    the existing resumability convention (a later call retries whatever is still missing) already
+    covers "resuming" a partial sync with no special handling needed.
+
+**Root cause 2 (GPU memory observation) — investigated, no defect found.** `check_gpu()`'s ordering
+(§34's fix) was re-verified structurally against the CURRENT notebook: every cell before Phase 1
+(`import setup` → `setup.setup()` → `verify_environment.verify_all(require_gpu=True)` → checkpoint-
+path prints) was traced line by line. `verify_all()`'s GPU-related checks (`list_physical_devices`,
+`get_device_details`, setting the mixed-precision policy string) are device-LISTING/metadata calls,
+not device-initializing ones — none of them claims VRAM. `check_gpu()` is still the first action
+inside both Phase 1 entry points, before either model loads, exactly as §34 fixed it. Stage 03's
+PyTorch forward passes are also confirmed wrapped in `torch.no_grad()`
+(`vessel_segmentation_inference._predict_probability_map`), so no autograd-graph accumulation is
+possible there either. No code defect was found that would explain unbounded GPU growth. Given the
+failure this run actually hit (`Errno 107`) occurred during `sync_missing_files` — before either
+model had loaded at all, since that pull ran ahead of `precompute_authoritative_joint_caches()` in
+the old cell order — the observed GPU growth cannot be causally tied to this crash; it is most
+consistent with expected one-time CUDA-context + dual-framework model-load overhead. Rather than
+make a second speculative GPU change, the new diagnostic mode below adds real RSS + TensorFlow GPU
+memory instrumentation, so the next real run measures this instead of relying on Colab's own graph.
+
+**New: small-scale diagnostic mode.** `precompute_joint_frozen_caches()`/
+`precompute_authoritative_joint_caches()` gained `max_images` (process only the first N entries)
+and `verbose_diagnostics` (log one line per image: cache status, this image's elapsed time, running
+images/minute, process RSS via `psutil` if installed, and TensorFlow-reported GPU memory via
+`tf.config.experimental.get_memory_info` if a GPU is visible). Both exercise the REAL code path —
+real models, real images, real cache I/O — never a mock, and neither changes which entries are
+computed or what gets written to the cache; the diagnostic lines are logged and discarded per
+image, never accumulated into the returned `stats`. The notebook's Phase 1 cell exposes this as
+`CACHE_DIAGNOSTIC_MAX_IMAGES` (`None` by default; set to 5/10/25/50 to try a small run first).
+
+**Which prior fixes remain correct vs. were insufficient:** empty-FOV handling (§31), the fixed
+shuffle-buffer cap (§32), and `check_gpu()`'s ordering (§34) are all still correct and were NOT
+modified by this audit. The local-cache-I/O fix (§33) was insufficient: it correctly moved cache
+*writes* to local SSD, but its own pre-pull step still performed the same kind of bulk,
+high-concurrency Drive hammering that fix was meant to eliminate — just against the cache directory
+instead of the raw dataset. This audit removes that remaining bulk-copy pattern entirely.
+
+**No Stage 3/4/RACAF/Stage 5/6/7/CORN architecture, weights, reliability equations, TTA definition,
+or cache format/keys changed.** No existing Drive cache entry is deleted, invalidated, or
+duplicated — `persistent_cache_dir`/`persistent_racaf_cache_dir` are read-only from this module's
+perspective, exactly like `stage_dataset()`'s existing Drive-source convention. The authoritative
+2929/733 split is untouched.
+
+Regression tests: `tests/test_dataset_staging.py` (`SyncMissingFilesTests` — atomic writes, no
+partial file survives a failure, ENOTCONN retried and eventually succeeds, a non-transient error
+fails without retrying, one file's failure does not block or abort others, a failed file is picked
+up by a later resumed call). `tests/test_joint_training.py` (`PersistentCacheDirTests` — an entry
+cached only in the persistent dir is a hit with zero inference calls and zero local duplication; a
+genuine miss is computed and written locally only; a local hit is checked first; `persistent_cache_
+dir=None` reproduces the exact prior default behavior; `precompute_authoritative_joint_caches`
+forwards the new parameters unchanged) and (`DiagnosticModeTests` — `max_images` limits real
+processing via the real code path; diagnostic logging emits exactly one line per processed image
+with RSS/GPU fields, off by default, and never changes the returned stats' shape).
