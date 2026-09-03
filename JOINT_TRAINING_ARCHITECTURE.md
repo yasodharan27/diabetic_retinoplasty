@@ -1092,3 +1092,89 @@ outside Colab. Recommended: run Phase 1 first (already proven safe and complete,
 training and observe whether steps/second increases substantially in epoch 1 once local mirroring
 completes, and whether steady-state steps/second in epoch 2+ (fully local) is now compute-bound
 rather than I/O-bound.
+
+---
+
+## 37. §36's fix was correct but incomplete — Phase 1 never mirrored its own "already_cached" bucket, so training's first epoch was still Drive-bound
+
+**Symptom:** after §36 (Phase 2 given local-first/persistent-fallback cache reads, matching the
+training cell's arguments exactly — `image_dir=staged_train_image_dir`, `cache_dir`/
+`racaf_cache_dir` local, `persistent_cache_dir`/`persistent_racaf_cache_dir` set to Drive), a real
+Colab T4 run — after a full, clean Phase 1 precomputation (`already_cached: 2974`, `cached: 677`,
+`skipped_empty_fov: 11`, no Errno 107, caches flushed to Drive) — still ran at a sustained
+~5–6s/step through step 95/1465 of epoch 1. The run was stopped.
+
+**Method:** re-read the CURRENT (post-§36) code fresh, not assuming §36's diagnosis still held.
+Traced `load_joint_training_datasets()` → `_make_joint_dataset()` → `_build_joint_sample()` →
+`_get_or_compute_joint_frozen_outputs()` line by line and confirmed the wiring was correct at every
+layer (a local hit short-circuits before the persistent branch; a persistent hit is read once and
+mirrored). Since the consumption path was proven correct, the audit moved one level up, to what
+Phase 1 actually leaves on local disk.
+
+**Root cause, confirmed both structurally and empirically:** `precompute_joint_frozen_caches()`'s
+loop treated a `persistent_cache_dir` existence hit identically to a true local hit — both simply
+incremented `stats["already_cached"]` and moved on, WITHOUT reading or copying anything (§35's own
+design goal: existence-only, no bulk copy). This means Phase 1's `already_cached` bucket — found on
+Drive from a prior run — was never written to the local `cache_dir` Phase 1 itself uses. A local
+diagnostic (real synthetic-checkpoint machinery, reproducing the real run's ~81%-already_cached /
+~19%-newly-computed profile at a smaller scale) confirmed this directly:
+
+```
+Phase 1 stats: {'cached': 2, 'already_cached': 8, ...}   (8/10 = 80%, matching 2974/3662 = 81.2%)
+LOCAL cache dir after Phase 1 contains 4 files.
+Of the 8 'already_cached' (persistent-only) entries, 0 were mirrored to LOCAL disk by Phase 1.
+```
+
+So after a real Phase 1 run, only the 677 genuinely-new entries existed locally; the other 2974
+(81% of the whole dataset) existed only on Drive. §36's Phase 2 self-healing mirror is correct and
+does eventually fix this — but only the FIRST time each such image is touched, which (since nothing
+in Phase 1 had already warmed the local cache for 81% of the dataset) meant essentially the WHOLE
+of training's first epoch remained Drive-read-bound, indistinguishable in practice from the
+pre-§35/§36 slowdown. The run being stopped at step 95/1465 (6.5% into epoch 1) meant the
+improvement §36 does provide (every access AFTER the first) was never reached.
+
+**Fix:** `precompute_joint_frozen_caches()`'s loop now distinguishes a true local hit from a
+persistent-only hit. A persistent-only hit calls `_get_or_compute_joint_frozen_outputs()` (reusing
+its already-existing, already-tested persistent-hit-and-mirror branch unchanged, `rgb_native=None`
+since that branch never touches it) to read the entry from Drive exactly once and mirror it to the
+local `cache_dir`/`racaf_cache_dir` — during Phase 1 itself, one entry at a time, inside the SAME
+sequential per-image loop Phase 1 already runs (never a bulk/concurrent copy — not `dataset_
+staging.sync_missing_files()`'s separate walk-and-copy-everything pattern — so no §35-class Drive
+FUSE risk). Stage 03/04 are never invoked for this case (confirmed: `predict_vessel_mask`'s call
+count is 0 for a persistent-hit entry in every regression test). By the time Phase 1 finishes, every
+entry it processed — whether newly computed or found on Drive — is a genuine local cache hit, so
+training's first epoch is no longer different from any later one.
+
+`stats` gained one new key, `"mirrored_from_persistent"` (int, counts entries handled this way).
+`"cached"` (genuine Stage 03/04/RACAF computation) and `"already_cached"` (a true local hit, zero
+I/O beyond the existence check) keep their EXACT prior meaning and values for every existing caller
+that never sets `persistent_cache_dir` — this is the only stats-shape change, and it is additive.
+
+**Not changed:** Stage 03/04 architecture or weights, RACAF or CORN mathematics, Stage 5/6/7
+architecture, loss, QWK, optimizer, batch size, epochs, `Trainer`/`TrainingConfig`. No existing
+Drive cache entry is deleted, overwritten, or invalidated — `persistent_cache_dir`/`persistent_
+racaf_cache_dir` remain read-only from this module's perspective (mirrors `stage_dataset()`'s own
+Drive-source convention). The cache format, keys, and image sizes are unchanged — a mirrored local
+file is byte-for-byte the same array as its persistent source (verified: `np.testing.assert_array_
+equal` between the mirrored local copy and the original persistent-cache array). Resumability is
+preserved and extended: a mirrored entry is never re-touched (local disk or Drive) by a later Phase
+1 call, verified alongside a mixed-entry-kind (already-local / persistent-only / genuine-miss)
+interrupted-and-resumed scenario. No bulk copy of the persistent cache happens at any point — each
+mirror is one small entry, driven by this loop's own existing one-image-at-a-time iteration.
+
+Regression tests: `tests/test_joint_training.py` — `PersistentCacheDirTests` (a persistent-only
+entry is mirrored locally without recomputing, counted under the new `mirrored_from_persistent`
+counter, never under `already_cached`/`cached`; the mirrored local array is numerically identical
+to its persistent source; the mirrored entry is directly usable by `_build_joint_sample` with NO
+`persistent_cache_dir` passed at all, matching how training consumes it; a true local hit never
+touches an invalid/nonexistent persistent dir; a mirrored entry is never re-touched by a later run;
+a mixed-entry-kind interrupted/resumed run ends with all three kinds correctly and permanently
+local), `CachePrecomputationTests`/`DiagnosticModeTests` (the new stats key updated in the existing
+exact-key-set assertions; `mirrored_from_persistent` stays `0` for every caller that never passes
+`persistent_cache_dir`, preserving `cached`/`already_cached`'s exact prior values).
+
+**Still required before declaring the pipeline training-ready:** a real Colab T4 run. Recommended:
+re-run Phase 1 first (safe and resumable — it will now report `mirrored_from_persistent` for the
+2974 previously-Drive-only entries, each mirrored to local disk during this pass), THEN start
+training and confirm epoch 1 itself is now close to the local-cache-hit baseline measured in §36
+(~0.9s/step-equivalent on an unoptimized dev machine), not just epoch 2 onward.

@@ -104,6 +104,18 @@ later epoch for that image reads local disk, never Drive again. Also adds `check
 `load_joint_training_datasets()` -- it loads the same two GPU-touching models (Stage 03 PyTorch,
 Stage 04 TensorFlow) Phase 1's two entry points already guard with this call (§34); Phase 2 had
 been missing it.
+
+Phase 1 also mirrors a persistent-only hit to local disk, not just Phase 2 (`JOINT_TRAINING_
+ARCHITECTURE.md` §37) -- §36's Phase 2 mirror-on-first-access logic was correct but incomplete:
+Phase 1's OWN "already_cached" bucket (an entry found via `persistent_cache_dir`) was still only
+an existence check, never copied locally, silently deferring that image's one-time Drive-read cost
+onto whichever training epoch touched it first. On a real run where the persistent cache already
+held ~81% of the dataset, that meant essentially the WHOLE of training's first epoch remained
+Drive-read-bound, indistinguishable in practice from the pre-§35 slowdown. `precompute_joint_
+frozen_caches()`'s loop now mirrors a persistent-only hit to local disk during Phase 1 itself --
+one entry at a time, inside the same sequential loop (never a bulk/concurrent copy, so no
+§35-class Drive FUSE risk) -- so by the time training starts, every entry Phase 1 processed is
+already a local cache hit, including epoch 1.
 """
 
 import logging
@@ -460,19 +472,26 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     long Colab run's actual throughput is visible without guessing.
 
     `persistent_cache_dir`/`persistent_racaf_cache_dir` (both default `None`): an ADDITIONAL cache
-    location checked for an existing entry -- via the SAME `os.path.exists`-only check used for
-    `cache_dir`/`racaf_cache_dir`, never a content read or copy -- when the entry is not found
-    under `cache_dir`/`racaf_cache_dir` itself. Intended use: `cache_dir`/`racaf_cache_dir` point
-    at a fast local directory this run writes NEW entries to, while `persistent_cache_dir`/
-    `persistent_racaf_cache_dir` point at the real, Drive-mounted, cross-session persistent cache
-    -- so an image already cached from a PRIOR run is correctly skipped (never recomputed) WITHOUT
-    first bulk-copying the entire persistent cache down to local disk (`JOINT_TRAINING_
-    ARCHITECTURE.md` §35 -- that bulk-copy pattern is what caused a real Colab run to crash with
-    `OSError: [Errno 107] Transport endpoint is not connected`, from thousands of concurrent Drive
-    file opens). A miss (not found in either location) is always computed and written to
-    `cache_dir`/`racaf_cache_dir` only -- `persistent_cache_dir`/`persistent_racaf_cache_dir` are
-    never written to by this function. Leaving both at `None` (the default) reproduces the exact
-    prior behavior: only `cache_dir`/`racaf_cache_dir` are ever checked or written.
+    location checked for an existing entry -- via the SAME `os.path.exists`-only EXISTENCE check
+    used for `cache_dir`/`racaf_cache_dir` -- when the entry is not found under `cache_dir`/
+    `racaf_cache_dir` itself. Intended use: `cache_dir`/`racaf_cache_dir` point at a fast local
+    directory, while `persistent_cache_dir`/`persistent_racaf_cache_dir` point at the real,
+    Drive-mounted, cross-session persistent cache. An entry found ONLY at the persistent location
+    is never recomputed (Stage 03/04 are never invoked for it) and is READ from there exactly
+    once, then MIRRORED to the local `cache_dir`/`racaf_cache_dir` -- via `_get_or_compute_joint_
+    frozen_outputs`'s own persistent-hit-and-mirror branch, reused unchanged -- so it is a genuine
+    local cache hit for every subsequent access (a later Phase 1 re-run, or Phase 2/training)
+    without ever touching the persistent location again (`JOINT_TRAINING_ARCHITECTURE.md` §37).
+    This per-image mirror is NEVER a bulk copy: it happens one entry at a time, inside this same
+    sequential per-image loop, driven by this function's own existing iteration -- not
+    `dataset_staging.sync_missing_files()`'s separate, concurrent, walk-the-whole-directory copy
+    (the pattern §35 fixed after it crashed a real run with `OSError: [Errno 107] Transport
+    endpoint is not connected` from thousands of simultaneous Drive file opens). A miss (not found
+    in either location) is computed fresh and written to `cache_dir`/`racaf_cache_dir` only.
+    `persistent_cache_dir`/`persistent_racaf_cache_dir` are NEVER written to, modified, or deleted
+    by this function -- purely a read-only source, exactly like `stage_dataset()`'s Drive-source
+    convention. Leaving both at `None` (the default) reproduces the exact prior behavior: only
+    `cache_dir`/`racaf_cache_dir` are ever checked, and no persistent-mirroring branch runs at all.
 
     `max_images` (default `None`): if given, only the first `max_images` of `entries` are
     processed -- lets a caller run this function's REAL code path (real models, real images, real
@@ -488,8 +507,14 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     overhead on a real run, without accumulating any of that data into `stats` (each line is
     logged and discarded; the returned `stats` dict's shape is unaffected either way).
 
-    Returns `{"cached": int, "already_cached": int, "skipped_empty_fov": [image_id, ...],
-    "elapsed_seconds": float}`.
+    Returns `{"cached": int, "already_cached": int, "mirrored_from_persistent": int,
+    "skipped_empty_fov": [image_id, ...], "elapsed_seconds": float}`. `"cached"` counts only
+    entries that genuinely ran Stage 03/04/RACAF this call; `"already_cached"` counts only entries
+    that were ALREADY a local `cache_dir`/`racaf_cache_dir` hit (zero I/O beyond the existence
+    check); `"mirrored_from_persistent"` counts entries found only at `persistent_cache_dir`/
+    `persistent_racaf_cache_dir` and copied to local disk this call -- kept as its own counter
+    (rather than folded into either of the other two) since it is neither: no computation ran, but
+    it also was not already a free local hit.
     """
     # Must run before ANY TensorFlow op touches the GPU (JOINT_TRAINING_ARCHITECTURE.md §34):
     # without this, TF's default allocator claims ~all free VRAM the instant Stage 04's model is
@@ -506,7 +531,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     resolved_vessel_model = vessel_model if vessel_model is not None else load_vessel_model(vessel_model_path)
     resolved_stage4_model = stage4_model if stage4_model is not None else racaf.load_frozen_stage4_model()
 
-    stats = {"cached": 0, "already_cached": 0, "skipped_empty_fov": []}
+    stats = {"cached": 0, "already_cached": 0, "mirrored_from_persistent": 0, "skipped_empty_fov": []}
     start_time = time.monotonic()
 
     def _log_progress(count):
@@ -514,9 +539,9 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
         images_per_minute = (count / elapsed) * 60.0 if elapsed > 0 else 0.0
         logger.info(
             "Cache precomputation: %d/%d images processed (%d newly cached, %d already cached, "
-            "%d skipped) -- %.1fs elapsed, %.1f images/min.",
+            "%d mirrored from persistent cache, %d skipped) -- %.1fs elapsed, %.1f images/min.",
             count, len(entries), stats["cached"], stats["already_cached"],
-            len(stats["skipped_empty_fov"]), elapsed, images_per_minute,
+            stats["mirrored_from_persistent"], len(stats["skipped_empty_fov"]), elapsed, images_per_minute,
         )
 
     def _log_diagnostic(i, id_code, status, image_elapsed):
@@ -536,19 +561,51 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
 
     for i, (id_code, _diagnosis) in enumerate(entries):
         image_start = time.monotonic()
-        already_cached = _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size)
-        if not already_cached and persistent_cache_dir is not None:
-            already_cached = _cache_entry_exists(
-                id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size,
-            )
+        vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
+            id_code, cache_dir, racaf_cache_dir, image_size,
+        )
 
-        if already_cached:
+        if _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
             stats["already_cached"] += 1
             _log_diagnostic(i, id_code, "already_cached", time.monotonic() - image_start)
-        else:
-            vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
-                id_code, cache_dir, racaf_cache_dir, image_size,
+        elif persistent_cache_dir is not None and _cache_entry_exists(
+            id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size,
+        ):
+            # Not locally cached, but the complete entry already exists at the persistent (Drive)
+            # location from a prior run. Read it from there ONCE and mirror it to local disk now,
+            # during this SAME per-image Phase 1 loop -- one entry at a time, exactly like the
+            # "genuine miss" branch below, never a bulk/concurrent copy (no §35-class Drive FUSE
+            # risk: this is not `sync_missing_files()`'s bulk multi-threaded walk-and-copy-
+            # everything, just this loop's own existing sequential iteration touching one more
+            # file set per already-visited entry). This moves the one-time Drive-read cost into
+            # Phase 1 -- deliberately the separable, resumable, run-once-before-training phase --
+            # instead of leaving it to be paid piecemeal by whichever training epoch first touches
+            # each such image (`JOINT_TRAINING_ARCHITECTURE.md` §37; a real run showed this
+            # mattered: Phase 1's own "already_cached" bucket, found via persistent_cache_dir, was
+            # never mirrored locally, so it silently deferred ~81% of the dataset's Drive-read cost
+            # onto training's first epoch).
+            #
+            # Reuses `_get_or_compute_joint_frozen_outputs`'s own persistent-hit-and-mirror branch
+            # completely unchanged -- `rgb_native=None` is safe: that branch returns before ever
+            # touching its `rgb_native` argument (only the final "compute fresh" branch, provably
+            # unreachable here since the persistent existence check just above already succeeded,
+            # reads it), so no raw-image read (local or Drive) happens for this case, and Stage
+            # 03/04 are never invoked -- this is a pure cache-to-cache copy of already-computed,
+            # frozen-stage output, never a recomputation of it.
+            persistent_vessel, persistent_lesion, persistent_reliability = _cache_entry_paths(
+                id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size,
             )
+            _get_or_compute_joint_frozen_outputs(
+                None, vessel_cache, lesion_cache, reliability_cache,
+                resolved_vessel_model, resolved_stage4_model, image_size=image_size,
+                known_not_all_cached=True,
+                persistent_vessel_cache_path=persistent_vessel,
+                persistent_lesion_cache_path=persistent_lesion,
+                persistent_reliability_cache_path=persistent_reliability,
+            )
+            stats["mirrored_from_persistent"] += 1
+            _log_diagnostic(i, id_code, "mirrored_from_persistent", time.monotonic() - image_start)
+        else:
             raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
             rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
             try:

@@ -555,15 +555,25 @@ class CachePrecomputationTests(unittest.TestCase):
         counters, an elapsed-time float, and a list of (small) string ids for skipped images."""
         stats = self._precompute()
         self.assertEqual(
-            set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov", "elapsed_seconds"},
+            set(stats.keys()),
+            {"cached", "already_cached", "mirrored_from_persistent", "skipped_empty_fov", "elapsed_seconds"},
         )
         self.assertIsInstance(stats["cached"], int)
         self.assertIsInstance(stats["already_cached"], int)
+        self.assertIsInstance(stats["mirrored_from_persistent"], int)
         self.assertIsInstance(stats["skipped_empty_fov"], list)
         self.assertIsInstance(stats["elapsed_seconds"], float)
         self.assertGreaterEqual(stats["elapsed_seconds"], 0.0)
         for item in stats["skipped_empty_fov"]:
             self.assertIsInstance(item, str)
+
+    def test_mirrored_from_persistent_is_zero_when_no_persistent_dir_is_involved(self):
+        """Backward-compatibility proof: every existing caller (this whole class) never passes
+        persistent_cache_dir, so the new counter must stay at its zero default -- 'cached' and
+        'already_cached' keep their exact prior meaning and prior values (see the other tests in
+        this class, all unmodified)."""
+        stats = self._precompute()
+        self.assertEqual(stats["mirrored_from_persistent"], 0)
 
     def test_precomputation_processes_one_image_at_a_time_not_in_bulk(self):
         """Streaming proof: the per-image cache-populating function is called exactly once per
@@ -710,11 +720,16 @@ class CachePrecomputationDriveRoundTripTests(unittest.TestCase):
 
 
 class PersistentCacheDirTests(unittest.TestCase):
-    """Regression tests for `JOINT_TRAINING_ARCHITECTURE.md` §35: a real Colab run crashed with
-    `OSError: [Errno 107] Transport endpoint is not connected` when Phase 1 bulk-pulled an entire
-    persistent Drive cache down to local disk before starting. `persistent_cache_dir`/
-    `persistent_racaf_cache_dir` replace that bulk pull with a cheap, existence-only check against
-    the persistent location -- never a content copy."""
+    """Regression tests for `JOINT_TRAINING_ARCHITECTURE.md` §35/§37. §35: a real Colab run
+    crashed with `OSError: [Errno 107] Transport endpoint is not connected` when Phase 1
+    bulk-pulled an entire persistent Drive cache down to local disk before starting --
+    `persistent_cache_dir`/`persistent_racaf_cache_dir` replace that bulk pull with a per-image
+    existence check, never a bulk/concurrent copy. §37: an entry found ONLY at the persistent
+    location IS mirrored to local disk -- one entry at a time, inside Phase 1's own existing
+    per-image loop (never a bulk copy, so no §35-class Drive FUSE risk) -- so training's first
+    epoch is not left to pay that one-time Drive-read cost for the entries Phase 1 already
+    confirmed exist (a real run showed this mattered when persistent hits were ~81% of the
+    dataset)."""
 
     def setUp(self):
         self.vessel_model = _build_synthetic_vessel_model()
@@ -726,7 +741,12 @@ class PersistentCacheDirTests(unittest.TestCase):
         self.persistent_cache_dir = os.path.join(self.persistent_root, "local_feature_extraction")
         self.persistent_racaf_cache_dir = os.path.join(self.persistent_root, "racaf")
 
-    def test_entry_cached_only_in_persistent_dir_is_a_hit_without_recomputing_or_copying(self):
+    def test_entry_cached_only_in_persistent_dir_is_mirrored_locally_without_recomputing(self):
+        """§37: unlike a true local hit, a persistent-only hit is NOT free -- it costs exactly one
+        read from the persistent location, counted under its own 'mirrored_from_persistent'
+        counter (never folded into 'already_cached', which stays reserved for a true local hit,
+        or 'cached', reserved for a genuine Stage 03/04/RACAF computation) -- but Stage 03/04 are
+        never invoked, and the local cache_dir DOES end up with a usable copy afterward."""
         # Populate the "persistent Drive" cache directly (simulating a prior run) -- NOT cache_dir.
         jtd.precompute_joint_frozen_caches(
             [self.tree.pairs[0]], self.tree.image_dir,
@@ -746,11 +766,172 @@ class PersistentCacheDirTests(unittest.TestCase):
                 vessel_model=self.vessel_model, stage4_model=self.stage4_model,
             )
 
-        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 1)
+        self.assertEqual(stats["already_cached"], 0)
         self.assertEqual(stats["cached"], 0)
         self.assertEqual(mocked_vessel.call_count, 0)
-        # No bulk copy: the entry must NOT have been duplicated into the local cache_dir either.
-        self.assertFalse(os.path.exists(self.tree.cache_dir))
+        # The entry now DOES exist locally too -- exactly the fix: a per-image mirror during
+        # Phase 1 itself, not deferred to training's first epoch.
+        id_code = self.tree.pairs[0][0]
+        vessel_cache_local = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        lesion_cache_local = lfed._cache_path(self.tree.cache_dir, id_code, "lesion", jtd.STAGE5_IMAGE_SIZE)
+        reliability_cache_local = racaf.reliability_cache_path(self.tree.racaf_cache_dir, id_code)
+        self.assertTrue(os.path.exists(vessel_cache_local))
+        self.assertTrue(os.path.exists(lesion_cache_local))
+        self.assertTrue(os.path.exists(reliability_cache_local))
+
+    def test_mirrored_local_entry_is_numerically_identical_to_the_persistent_source(self):
+        """The mirror must be a faithful copy, not a re-derivation -- same cache format/keys, same
+        values, so a value computed once by Stage 03/04/RACAF is never silently altered by being
+        copied."""
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir,
+            self.persistent_cache_dir, self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        id_code = self.tree.pairs[0][0]
+        vessel_cache_persistent = lfed._cache_path(
+            self.persistent_cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE,
+        )
+        reliability_cache_persistent = racaf.reliability_cache_path(self.persistent_racaf_cache_dir, id_code)
+        persistent_vessel_map = np.load(vessel_cache_persistent)
+        persistent_reliability = np.load(reliability_cache_persistent)
+
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        vessel_cache_local = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        reliability_cache_local = racaf.reliability_cache_path(self.tree.racaf_cache_dir, id_code)
+        local_vessel_map = np.load(vessel_cache_local)
+        local_reliability = np.load(reliability_cache_local)
+
+        np.testing.assert_array_equal(local_vessel_map, persistent_vessel_map)
+        np.testing.assert_array_equal(local_reliability["kappa"], persistent_reliability["kappa"])
+        self.assertEqual(float(local_reliability["r"]), float(persistent_reliability["r"]))
+
+    def test_mirrored_local_entry_is_directly_usable_by_training(self):
+        """The whole point of the fix: after Phase 1 mirrors a persistent-only entry, Phase 2
+        (_build_joint_sample, as load_joint_training_datasets() calls it) must be able to build a
+        full training sample from the LOCAL cache alone -- no persistent_cache_dir needed, no
+        Stage 03/04 recompute."""
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir,
+            self.persistent_cache_dir, self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        id_code, diagnosis = self.tree.pairs[0]
+        rng = np.random.default_rng(0)
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            sample = jtd._build_joint_sample(
+                id_code, diagnosis, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=False, rng=rng,
+                # Deliberately NOT passing persistent_cache_dir -- proves the local mirror alone
+                # is sufficient, matching exactly how the notebook's training cell calls this
+                # (once Phase 1 has already run).
+            )
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertEqual(sample["stage5_input"].shape, (512, 512, 8))
+        self.assertEqual(sample["grade"], diagnosis)
+
+    def test_local_hit_never_reads_persistent_dir_even_when_it_is_invalid(self):
+        """A true local hit must short-circuit before the persistent branch runs at all --
+        confirmed by pointing persistent_cache_dir somewhere nonexistent and seeing no error and
+        no change in behavior."""
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        stats = jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir="/nonexistent/persistent",
+            persistent_racaf_cache_dir="/nonexistent/persistent_racaf",
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 0)
+        self.assertEqual(stats["cached"], 0)
+
+    def test_resumability_a_mirrored_entry_is_not_re_touched_by_a_later_run(self):
+        """The core resumability guarantee, extended to the new mirror case: once an entry has
+        been mirrored locally, a later Phase 1 call over the same entries must find it as a plain
+        local hit and never touch it (or the persistent location) again."""
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir,
+            self.persistent_cache_dir, self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        id_code = self.tree.pairs[0][0]
+        vessel_cache_local = lfed._cache_path(self.tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE)
+        mtime_after_mirror = os.path.getmtime(vessel_cache_local)
+
+        stats = jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 0)
+        self.assertEqual(os.path.getmtime(vessel_cache_local), mtime_after_mirror)
+
+    def test_interrupted_run_with_mixed_entry_kinds_resumes_correctly(self):
+        """A more realistic resumability scenario: one entry already local, one persistent-only,
+        one a genuine miss -- an interrupted-then-resumed run must end with all three correctly
+        and permanently local, without ever recomputing the persistent-only or already-local ones
+        on the resume pass."""
+        tree = _SyntheticAPTOSTree([("already_local", 0), ("persistent_only", 1), ("brand_new", 2)])
+        self.addCleanup(tree.cleanup)
+
+        # "already_local" -- computed directly into cache_dir, as if a prior interrupted run of
+        # THIS SAME session had already finished it.
+        jtd.precompute_joint_frozen_caches(
+            [tree.pairs[0]], tree.image_dir, tree.cache_dir, tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        # "persistent_only" -- computed into the simulated Drive cache from a PRIOR session.
+        jtd.precompute_joint_frozen_caches(
+            [tree.pairs[1]], tree.image_dir, self.persistent_cache_dir, self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        vessel_cache_already_local = lfed._cache_path(
+            tree.cache_dir, tree.pairs[0][0], "vessel", jtd.STAGE5_IMAGE_SIZE,
+        )
+        mtime_before = os.path.getmtime(vessel_cache_already_local)
+
+        stats = jtd.precompute_joint_frozen_caches(
+            tree.pairs, tree.image_dir, tree.cache_dir, tree.racaf_cache_dir,
+            persistent_cache_dir=self.persistent_cache_dir,
+            persistent_racaf_cache_dir=self.persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 1)
+        self.assertEqual(stats["cached"], 1)
+        self.assertEqual(os.path.getmtime(vessel_cache_already_local), mtime_before)
+        for id_code, _ in tree.pairs:
+            self.assertTrue(os.path.exists(
+                lfed._cache_path(tree.cache_dir, id_code, "vessel", jtd.STAGE5_IMAGE_SIZE),
+            ))
 
     def test_entry_missing_from_both_dirs_is_computed_and_written_only_locally(self):
         stats = jtd.precompute_joint_frozen_caches(
@@ -881,7 +1062,8 @@ class DiagnosticModeTests(unittest.TestCase):
             max_images=2, verbose_diagnostics=True,
         )
         self.assertEqual(
-            set(stats.keys()), {"cached", "already_cached", "skipped_empty_fov", "elapsed_seconds"},
+            set(stats.keys()),
+            {"cached", "already_cached", "mirrored_from_persistent", "skipped_empty_fov", "elapsed_seconds"},
         )
 
 
