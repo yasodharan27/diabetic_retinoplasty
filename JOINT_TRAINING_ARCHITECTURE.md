@@ -1178,3 +1178,160 @@ re-run Phase 1 first (safe and resumable — it will now report `mirrored_from_p
 2974 previously-Drive-only entries, each mirrored to local disk during this pass), THEN start
 training and confirm epoch 1 itself is now close to the local-cache-hit baseline measured in §36
 (~0.9s/step-equivalent on an unoptimized dev machine), not just epoch 2 onward.
+
+## 38. Full end-to-end audit at 164aead: proved the "ran out of data" warning harmless, found and fixed the real remaining ~2s/step cause (canonical RGB was never cached), confirmed everything else in the pipeline correct-by-design
+
+**Symptom:** after §35-§37, a real Colab T4 run's steady-state step time improved from ~5-6s/step
+to ~2s/step, and Epoch 1 completed cleanly (1461/1461, val_QWK computed, `best.weights.h5` saved).
+But Keras then printed `"Your input ran out of data; interrupting training... You may need to use
+the .repeat() function..."`, and the run was stopped after Epoch 1. Requested: an independent,
+full-pipeline audit (correctness, performance, memory, I/O, reproducibility) — not a reflexive
+`.repeat()` fix, and not an assumption that any earlier diagnosis still held.
+
+**Method:** re-read `joint_training_dataset.py`, `training/trainer.py`, `training/callbacks.py`,
+`joint_training_model.py`, `local_feature_extraction_dataset.py`, `vessel_segmentation_inference.py`,
+`config.py`, `colab/common/dataset_staging.py`, `colab/common/experiment_manager.py`, and every
+notebook cell that wires Phase 1/Phase 2/`Trainer.fit()`, fresh at HEAD (164aead) — confirmed the
+installed stack is **Keras 3.15.1 / TF 2.21.0** (the standalone multi-backend `keras` package, not
+legacy `tf.keras`), so no conclusion was drawn from memory of Keras-2-era `data_adapter.py`
+internals. Every claim below was independently proven, not assumed:
+
+- **Cardinality math**: computed directly from the real, committed manifest (`dataset_splits/
+  aptos2019_train_val_split.csv`, 3662 rows, 2929 train/733 val, 0 duplicates) that 8 of the 11
+  known empty-FOV ids fall in the train split and 3 in val — giving an effective train count of
+  2929-8=2921, `ceil(2921/2)=1461` batches. This exactly matches Keras's reported "1461/1461" for
+  Epoch 1, with no other unexplained sample loss.
+- **The "ran out of data" mechanism**: read `keras/src/trainers/epoch_iterator.py` (the installed
+  package) directly. For an unknown-cardinality dataset (`from_generator`, no `.repeat()`, no
+  explicit `steps_per_epoch` — exactly `_make_joint_dataset`'s construction, confirmed nowhere
+  overridden in the notebook) `EpochIterator.catch_stop_iteration()` **unconditionally** calls
+  `self._interrupted_warning()` the first time `self._num_batches` is `None` and a `StopIteration`
+  is caught — i.e. on whichever epoch first reaches the natural, correct, fully-expected end of a
+  real, non-repeated data source. This is a one-time self-calibration step, not an error signal.
+  Reproduced empirically on the exact installed versions with a minimal `from_generator` dataset
+  (built identically: `from_generator → shuffle → batch → prefetch`, no `.repeat()`) fed to
+  `model.fit(ds, epochs=4)`: the warning fired on epoch 1 exactly once, the generator was invoked
+  fresh every epoch with the full element count every time, and all 4 epochs completed with real,
+  decreasing loss — proving the warning is emitted even when nothing is actually wrong. `.repeat()`
+  is therefore NOT required (and was not added) — it would remove Keras's own ability to
+  self-calibrate `steps_per_epoch` from real data and would need a manually-computed, duplicated
+  effective-sample-count instead, reintroducing exactly the fragility this audit was asked to avoid.
+  Category: **C — harmless, one-time, expected warning.** Training was not actually interrupted by
+  Keras itself; the real run being stopped after Epoch 1 is consistent with the same pattern of a
+  manual stop already used in every earlier task in this project's history, prompted by the alarming
+  wording, not an actual `fit()`-internal halt.
+- **The real, still-present performance cause**: a local, real-code-path diagnostic (real `cv2`/
+  `skimage`/`image_preprocessing` calls, synthetic checkpoints/images, no GPU) measured
+  `_build_joint_sample`'s steady-state cost (every Stage 03/04/RACAF cache file already local) at
+  ~137ms/sample on an 800×800 synthetic image, of which the vessel/lesion/reliability `np.load`
+  portion was ~3ms (98% of cost was elsewhere) — because `stage5_input`'s RGB channels were
+  **never cached at all**: `canonical_rgb = _resize_rgb_01(rgb_native, image_size)` ran on every
+  single `_build_joint_sample` call, cache hit or not, requiring a raw-image disk read plus (since
+  the real notebook's Phase 2 cell always points `processed_dir` at an intentionally empty
+  directory) a live Gamma+CLAHE Stage 02 pass every time. At a more realistic 2000×1848 raw
+  resolution the same measurement was ~503ms/sample (`_resize_rgb_01`'s anti-aliased `skimage`
+  resize alone: ~421ms). This is paid for the ENTIRE dataset (not just the small empty-FOV set),
+  every single epoch. Confirmed this is genuinely a fresh-per-call cost by grep of
+  `_build_joint_sample`'s prior form: the raw-image load was unconditional, before any cache check.
+- **Everything else** was independently re-verified at HEAD rather than assumed: the real joint
+  model was built and compiled locally (CPU, no training) and matched the previously-documented
+  smoke test exactly (43,296,810 total / 43,292,970 trainable / 3,840 non-trainable / 393 trainable
+  variables, `joint_corn_loss`) — `joint_training_model.py`/`corn.py`/`racaf.py`/`swin_transformer.py`
+  have not changed since commit 335ae59, well before §35-§37. A 6-epoch, real-code-path RSS
+  measurement across repeated dataset passes showed no growth (−2.5MB/epoch average — noise, not a
+  leak) and independently reconfirmed the generator is invoked fresh every epoch with a stable
+  element count. `_augment_spatial`/`_augment_intensity_rgb` apply one synchronized spatial
+  transform to all 8 channels and RGB-only intensity jitter, confirmed by direct code read; `r` is
+  computed pre-augmentation; validation uses `augment=False`. `experiment_manager.create_experiment`
+  is timestamped and collision-protected (never overwrites); `resume` is opt-in via
+  `RESUME_EXPERIMENT_DIR` (defaults to a fresh run, matching the notebook's default). Checkpoints
+  are weights-only (`save_weights`/`load_weights`), so optimizer (Adam) momentum is NOT preserved
+  across a resume — a real but already-documented, deliberate tradeoff (`joint_training_model.py`'s
+  own docstring: Stage 06's Swin layers have no `get_config()`, so a full-model save was never an
+  option). The `"Model failed to serialize as JSON"` / `PatchEmbed` warning was traced to `keras/
+  src/callbacks/tensorboard.py`'s `keras_model_summary()`, which wraps `model.to_json()` in its own
+  `try/except` specifically because this is expected — it affects ONLY the TensorBoard Graphs-tab
+  visualization, never training, checkpointing, resume, or model loading (all weights-only, unrelated
+  code path). Category: **C — harmless, already-anticipated warning.**
+
+**Root cause (the one fixed):** canonical RGB was the only per-image artifact in the whole joint
+pipeline that was never cached — vessel, lesion, and reliability all were (§9-§13, extended to
+Drive/local tiers by §35-§37), but the RGB resize was always recomputed live, because it depends
+only on `rgb_native`, not on `vessel_model`/`stage4_model`, so it was never routed through `_get_or_
+compute_joint_frozen_outputs`'s existing cache machinery at all.
+
+**Fix:** `_get_or_compute_canonical_rgb()` (new) caches the resized, [0,1] float32 RGB array using
+the exact same local/persistent/compute-fresh-and-mirror pattern already proven for vessel/lesion/
+reliability, under a new `kind="rgb"` cache file (`_canonical_rgb_cache_path`, reusing `lfed.
+_cache_path`'s existing filename convention — no new scheme). `_build_joint_sample` now loads the
+raw image at all only when at least one of the two independent things it can produce (frozen Stage
+03/04/RACAF outputs, or canonical RGB) is not already cached, locally or at `persistent_cache_dir`
+— a full cache hit never touches the raw file. `precompute_joint_frozen_caches()` mirrors this in
+Phase 1 (same one-image-at-a-time loop, additive after the existing branch, never a bulk copy), so
+Phase 1 — not training's first epoch — pays the one-time cost, matching §37's pattern exactly. A
+persistent cache populated by an earlier run (before this cache kind existed) has vessel/lesion/
+reliability but no `rgb` file; Phase 1's existing "is this cached" decision (`_cache_entry_exists`)
+is deliberately UNCHANGED (still vessel/lesion/reliability only), so such an entry is still
+correctly recognized as a full frozen-outputs hit — never recomputing Stage 03/04/RACAF — while the
+missing `rgb` file is independently backfilled. The cached array is numerically identical to what
+`_resize_rgb_01` always computed live (same function, same inputs) — this is a pure caching change,
+not a resize/preprocessing algorithm change.
+
+**This cache is deliberately LOCAL-ONLY**, via its own `rgb_cache_dir` parameter (default `None` →
+`cache_dir`, so every existing caller and test is unaffected; the notebook points it at
+`/content/cache/canonical_rgb`). The reason is a storage/benefit asymmetry that only became visible
+once the array size was computed exactly:
+
+| | per image | × 3662 images |
+|---|---|---|
+| vessel (512×512×1 f32) | 1.0 MiB | |
+| lesion (512×512×4 f32) | 4.0 MiB | |
+| **existing Drive cache** | **~5.0 MiB** | **17.9 GiB** |
+| **new canonical RGB (512×512×3 f32)** | **3.0 MiB** | **10.7 GiB** |
+
+The notebook's Phase 1b flush cell syncs a whole directory (`sync_missing_files(LOCAL_CACHE_DIR,
+…)`), so leaving the rgb entries in `cache_dir` would have silently grown the Drive cache ~60%, from
+17.9 GiB to 28.6 GiB — plus the corresponding bulk-write FUSE exposure this project has already been
+burned by twice (§33, §35). That cost buys almost nothing: unlike vessel/lesion/reliability (a
+frozen Stage 03/04 forward pass, seconds per image, genuinely worth persisting across sessions),
+canonical RGB is regenerable from the already-locally-staged raw image in ~90–500ms — roughly what
+reading the same 3 MiB back over Drive FUSE costs anyway. So it is rebuilt locally, once per
+session, by Phase 1 (the phase explicitly designed to be the slow, resumable, run-once-before-
+training one), and never written to Drive. `persistent_cache_dir` is still consulted for an rgb
+entry if one happens to exist there — harmless, and correct if a caller ever does choose to persist
+it.
+
+**Not changed:** Stage 03/04 architecture or weights, RACAF or CORN mathematics, Stage 5/6/7
+architecture, loss, QWK, optimizer, batch size, epochs, `Trainer`/`TrainingConfig`, the resize
+algorithm itself, `.repeat()` (deliberately not added — see above), the authoritative split
+manifest, and no existing Drive cache entry was deleted, overwritten, or invalidated. Drive cache
+SIZE is also unchanged: the one new cache kind is local-only by construction (above), so Phase 1b
+still flushes exactly the same vessel/lesion/reliability files it did before.
+
+**Regression tests:** `tests/test_joint_training.py` — `CanonicalRGBCachingTests` (rgb cache file
+written on first build; cached value numerically identical to the sample it was derived from; a
+full cache hit never calls `lfed._load_raw_bgr`; a full cache hit reproduces the exact same
+`stage5_input` as a fresh computation; a persistent-only rgb entry is mirrored locally without
+recomputing OR re-reading the raw image; an entry missing only its rgb cache backfills by reading
+the raw image exactly once, without recomputing Stage 03/04), `Phase1CanonicalRGBCachingTests`
+(Phase 1 writes an rgb cache for every processed entry; a second Phase 1 run never re-reads raw
+images; a legacy persistent hit with vessel/lesion/reliability but no rgb file is still recognized
+as a full frozen-outputs hit, never recomputing Stage 03/04, while backfilling rgb; an empty-FOV
+entry — whose vessel/lesion/reliability cache never gets written — still gets its rgb cached; Phase
+1 honors a separate local-only `rgb_cache_dir`, leaving `cache_dir` — the directory that IS flushed
+to Drive — with no `_rgb_` files at all; Phase 1 → Phase 2 end-to-end through that same separate
+dir needs neither a raw image nor Stage 03/04), one added test in the existing
+`Phase2UsesExistingCachesTests` (a second epoch-like dataset iteration never reads the raw image
+either), and two in `LoadJointTrainingDatasetsTests` (`rgb_cache_dir` forwarded to both train and
+val datasets; defaults to `None`). All existing tests re-run and pass unchanged, confirming this
+restructuring is behavior-preserving everywhere except the newly-proven-wasteful raw-image reload.
+
+**Still required before declaring the pipeline training-ready:** a real Colab T4 run. Recommended:
+re-run Phase 1 first (safe, resumable, self-healing — it will backfill an `rgb` cache entry for
+every one of the 3651 already-cached entries from the prior run, without recomputing Stage 03/04/
+RACAF for any of them), then start training and confirm steady-state step time drops meaningfully
+below the ~2s/step measured after §35-§37 (the local diagnostic here suggests the RGB fix should
+remove close to all of the remaining non-GPU-compute cost, though the actual T4 forward/backward
+step time itself was not and could not be measured on this dev machine, which has no GPU) — and
+confirm the "ran out of data" warning still appears exactly once, on Epoch 1, with training then
+continuing normally through all 50 epochs without being stopped by Keras itself.

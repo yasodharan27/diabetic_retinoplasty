@@ -116,6 +116,43 @@ frozen_caches()`'s loop now mirrors a persistent-only hit to local disk during P
 one entry at a time, inside the same sequential loop (never a bulk/concurrent copy, so no
 §35-class Drive FUSE risk) -- so by the time training starts, every entry Phase 1 processed is
 already a local cache hit, including epoch 1.
+
+Canonical RGB is now cached too, not just vessel/lesion/reliability (`JOINT_TRAINING_ARCHITECTURE.
+md` §38) -- fixes a real, still-present ~2s/step steady-state slowdown that survived §35-§37:
+`stage5_input`'s RGB channels (0-2) come from `_resize_rgb_01(rgb_native, image_size)`, computed
+fresh on EVERY `_build_joint_sample` call, regardless of vessel/lesion/reliability cache status,
+because the canonical RGB itself was never cached (`rgb_native` requires a raw-image disk read
+PLUS, whenever no precomputed Stage 02 output exists for that id -- the real notebook's Phase 2
+cell always sets `processed_dir` to an intentionally empty directory -- a live Gamma+CLAHE pass).
+A local, real-code diagnostic (synthetic images/checkpoints, no GPU) measured this at ~90ms-500ms
+per sample depending on raw image resolution -- ~98% of steady-state per-sample cost once vessel/
+lesion/reliability are already local `np.load` hits (~3ms). This is paid for EVERY image, not just
+the small empty-FOV set, every single epoch. Fixed the same way vessel/lesion/reliability already
+are: `_get_or_compute_canonical_rgb()` caches the resized, [0,1] float32 RGB array under the SAME
+`cache_dir`/`persistent_cache_dir` (via `lfed._cache_path(..., kind="rgb", ...)`, reusing the
+existing filename convention, never a new one) -- written once, read thereafter via a plain
+`np.load`. `_build_joint_sample` now loads the raw image at all only when at least one of the two
+independent things it can produce (frozen Stage 03/04/RACAF outputs, or canonical RGB) is not
+already cached (locally or, if given, at `persistent_cache_dir`); `precompute_joint_frozen_caches`
+mirrors this so Phase 1 -- not training's first epoch -- pays the one-time cost, exactly like §37
+did for the frozen outputs. A persistent cache populated by an EARLIER run (before this cache kind
+existed) has no `rgb` file yet; Phase 1 backfills it in-place on first encounter without ever
+recomputing Stage 03/04/RACAF (that decision is still made purely from the existing vessel/lesion/
+reliability check, unchanged) -- self-healing, no manifest or existing-cache-entry rewrite. The
+cached array is numerically IDENTICAL to what `_resize_rgb_01` already computed live -- this is
+a pure caching change, not a resize/preprocessing algorithm change.
+
+This RGB cache is deliberately LOCAL-ONLY in the real Colab workflow, via its own `rgb_cache_dir`
+(default `None` -> `cache_dir`, so every existing caller and test is unaffected). At `(512,512,3)`
+float32 it is ~3 MiB/image -- ~10.7 GiB across APTOS2019's 3662 images, which would grow the
+existing ~17.9 GiB Drive cache by ~60% if the notebook's Phase 1b flush cell
+(`sync_missing_files(LOCAL_CACHE_DIR, ...)`, which syncs a whole directory) picked it up. That
+cost buys almost nothing: unlike vessel/lesion/reliability (a frozen Stage 03/04 forward pass,
+seconds per image), canonical RGB is regenerable from the already-locally-staged raw image in
+~90-500ms -- roughly what reading the same 3 MiB back over Drive FUSE costs anyway. So the
+notebook points `rgb_cache_dir` at a local directory that flush cell does not sync, keeping the
+volume (and the §35-class FUSE risk of writing it) off Drive entirely, while Phase 1 still
+rebuilds it once per session before training starts.
 """
 
 import logging
@@ -182,6 +219,42 @@ def _resize_rgb_01(rgb_native_uint8, image_size):
         rgb, (*image_size, 3), order=1, mode="reflect", anti_aliasing=True, preserve_range=True,
     )
     return np.clip(resized, 0.0, 1.0).astype(np.float32)
+
+
+# --- Canonical RGB caching -- independent of Stage 03/04/RACAF, but was never cached at all
+# before (module docstring, §38): every `_build_joint_sample` call paid `_resize_rgb_01`'s cost
+# fresh, regardless of vessel/lesion/reliability cache status. ---
+
+def _canonical_rgb_cache_path(id_code, cache_dir, image_size):
+    """Reuses `lfed._cache_path`'s existing filename convention with a new `kind="rgb"` -- no new
+    cache-path scheme, just one more entry alongside the existing `"vessel"`/`"lesion"` kinds."""
+    return lfed._cache_path(cache_dir, id_code, "rgb", image_size)
+
+
+def _get_or_compute_canonical_rgb(rgb_native, rgb_cache_path, image_size, persistent_rgb_cache_path=None):
+    """Returns `stage5_input`'s channels 0-2 -- the canonical (Stage 02-processed, resized to
+    `image_size`, [0,1] float32) RGB for one image. Cached exactly like `_get_or_compute_joint_
+    frozen_outputs` caches vessel/lesion/reliability: a local hit is a plain `np.load`; a miss
+    found only at `persistent_rgb_cache_path` (if given) is read from there once and mirrored to
+    `rgb_cache_path`; otherwise it is computed fresh via `_resize_rgb_01(rgb_native, image_size)`
+    -- the exact same call this value was always computed with, so a cached value is numerically
+    identical to what live computation already produced; this only avoids repeating that
+    computation every subsequent access. `rgb_native` may be `None` when the caller has already
+    confirmed (via its own existence check) that one of the two cache paths already holds this
+    image's entry -- mirrors `_get_or_compute_joint_frozen_outputs`'s identical convention."""
+    if os.path.exists(rgb_cache_path):
+        return np.load(rgb_cache_path)
+
+    if persistent_rgb_cache_path is not None and os.path.exists(persistent_rgb_cache_path):
+        canonical_rgb = np.load(persistent_rgb_cache_path)
+        os.makedirs(os.path.dirname(rgb_cache_path), exist_ok=True)
+        np.save(rgb_cache_path, canonical_rgb)
+        return canonical_rgb
+
+    canonical_rgb = _resize_rgb_01(rgb_native, image_size)
+    os.makedirs(os.path.dirname(rgb_cache_path), exist_ok=True)
+    np.save(rgb_cache_path, canonical_rgb)
+    return canonical_rgb
 
 
 # --- Shared, per-image, cache-populating computation -- Step 4/5 redundancy fix ---
@@ -324,7 +397,8 @@ def _augment(stage5_input, rng):
 def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
                          vessel_model, stage4_model, augment, rng,
                          processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
-                         persistent_cache_dir=None, persistent_racaf_cache_dir=None):
+                         persistent_cache_dir=None, persistent_racaf_cache_dir=None,
+                         rgb_cache_dir=None):
     """Builds one joint training sample:
       `{"image_id", "stage5_input", "stage6_input", "reliability", "grade"}`.
 
@@ -341,20 +415,55 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
     `_get_or_compute_joint_frozen_outputs` -- see that function's docstring and
     `JOINT_TRAINING_ARCHITECTURE.md` §36. Lets `cache_dir`/`racaf_cache_dir` be a fast local
     directory while still transparently reusing (never recomputing) an entry already cached in a
-    Drive-mounted persistent directory from a prior Phase 1 run.
-    """
-    raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
-    rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
+    Drive-mounted persistent directory from a prior Phase 1 run. `persistent_cache_dir` also gates
+    the same persistent lookup for the canonical RGB cache (§38) -- both are independent, cached
+    artifacts checked from the same `persistent_cache_dir`.
 
+    The raw image is now loaded at most once (or not at all): both the frozen Stage 03/04/RACAF
+    outputs and the canonical RGB are independently cacheable, so `_load_raw_bgr`/`_resolve_
+    processed_rgb` only run when at least one of the two is not already available locally or at
+    `persistent_cache_dir` (`JOINT_TRAINING_ARCHITECTURE.md` §38) -- a full cache hit (the normal
+    case from epoch 2 onward, or any Phase-1-precomputed entry) never touches the raw image file
+    at all.
+
+    `rgb_cache_dir` (default `None` -> `cache_dir`): where the canonical RGB cache lives. Kept
+    separable because that cache, unlike vessel/lesion/reliability, is deliberately LOCAL-ONLY in
+    the real Colab workflow (§38): at `(512,512,3)` float32 it is ~3 MiB/image (~10.7 GiB across
+    APTOS2019's 3662), which would grow the Drive cache ~60%, while being fully regenerable from
+    the already-locally-staged raw image at roughly the same cost as reading it back from Drive.
+    Pointing this at a directory the notebook's Phase 1b flush cell does not sync keeps that
+    volume off Drive entirely.
+    """
+    rgb_cache_dir = rgb_cache_dir if rgb_cache_dir is not None else cache_dir
     vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
     lesion_cache = lfed._cache_path(cache_dir, id_code, "lesion", image_size)
     reliability_cache = racaf.reliability_cache_path(racaf_cache_dir, id_code)
+    rgb_cache = _canonical_rgb_cache_path(id_code, rgb_cache_dir, image_size)
 
     persistent_vessel_cache = persistent_lesion_cache = persistent_reliability_cache = None
+    persistent_rgb_cache = None
     if persistent_cache_dir is not None and persistent_racaf_cache_dir is not None:
         persistent_vessel_cache = lfed._cache_path(persistent_cache_dir, id_code, "vessel", image_size)
         persistent_lesion_cache = lfed._cache_path(persistent_cache_dir, id_code, "lesion", image_size)
         persistent_reliability_cache = racaf.reliability_cache_path(persistent_racaf_cache_dir, id_code)
+        persistent_rgb_cache = _canonical_rgb_cache_path(id_code, persistent_cache_dir, image_size)
+
+    frozen_outputs_cached = (
+        os.path.exists(vessel_cache) and os.path.exists(lesion_cache) and os.path.exists(reliability_cache)
+    ) or (
+        persistent_vessel_cache is not None
+        and os.path.exists(persistent_vessel_cache)
+        and os.path.exists(persistent_lesion_cache)
+        and os.path.exists(persistent_reliability_cache)
+    )
+    rgb_cached = os.path.exists(rgb_cache) or (
+        persistent_rgb_cache is not None and os.path.exists(persistent_rgb_cache)
+    )
+
+    rgb_native = None
+    if not (frozen_outputs_cached and rgb_cached):
+        raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
+        rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
 
     vessel_map, lesion_maps, _kappa, r = _get_or_compute_joint_frozen_outputs(
         rgb_native, vessel_cache, lesion_cache, reliability_cache, vessel_model, stage4_model,
@@ -363,8 +472,9 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
         persistent_lesion_cache_path=persistent_lesion_cache,
         persistent_reliability_cache_path=persistent_reliability_cache,
     )
-
-    canonical_rgb = _resize_rgb_01(rgb_native, image_size)
+    canonical_rgb = _get_or_compute_canonical_rgb(
+        rgb_native, rgb_cache, image_size, persistent_rgb_cache_path=persistent_rgb_cache,
+    )
     stage5_input = np.concatenate([canonical_rgb, vessel_map, lesion_maps], axis=-1)
 
     if augment:
@@ -391,11 +501,17 @@ def _cache_entry_paths(id_code, cache_dir, racaf_cache_dir, image_size):
 
 
 def _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
-    """True iff ALL THREE of `id_code`'s cache files already exist under `cache_dir`/
-    `racaf_cache_dir` -- an existence-only check (`os.path.exists`, a stat call), never reading
-    or copying any file's content. Shared by `precompute_joint_frozen_caches`'s own `cache_dir`
-    check and its `persistent_cache_dir` check (see that parameter's docstring) so both use
-    identically-defined "is this cached" logic."""
+    """True iff ALL THREE of `id_code`'s FROZEN STAGE 03/04/RACAF cache files already exist under
+    `cache_dir`/`racaf_cache_dir` -- an existence-only check (`os.path.exists`, a stat call), never
+    reading or copying any file's content. Shared by `precompute_joint_frozen_caches`'s own
+    `cache_dir` check and its `persistent_cache_dir` check (see that parameter's docstring) so both
+    use identically-defined "is this cached" logic.
+
+    Deliberately does NOT include the canonical RGB cache (`_canonical_rgb_cache_path`, module
+    docstring §38): that cache is independent of Stage 03/04/RACAF and checked/backfilled
+    separately, so a persistent cache populated before the RGB cache kind existed is still
+    correctly recognized as a full frozen-outputs hit here (never recomputing Stage 03/04/RACAF
+    just because the newer, unrelated RGB cache entry happens to be missing)."""
     vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
         id_code, cache_dir, racaf_cache_dir, image_size,
     )
@@ -440,7 +556,8 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                                     vessel_model=None,
                                     vessel_model_path=DEFAULT_VESSEL_MODEL_PATH, stage4_model=None,
                                     processed_dir=DEFAULT_PROCESSED_DIR, image_size=STAGE5_IMAGE_SIZE,
-                                    progress_every=50, max_images=None, verbose_diagnostics=False):
+                                    progress_every=50, max_images=None, verbose_diagnostics=False,
+                                    rgb_cache_dir=None):
     """Phase 1 of the two-phase joint training workflow (module docstring; `JOINT_TRAINING_
     ARCHITECTURE.md` §32/§33): populates every entry's Stage 03/04 + RACAF on-disk cache, ONE
     IMAGE AT A TIME, with no `tf.data` pipeline involved at all -- this is the expensive, CPU/
@@ -499,6 +616,15 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     without altering which entries would be computed in a full run or what gets written to the
     cache for them.
 
+    `rgb_cache_dir` (default `None` -> `cache_dir`): where the canonical RGB cache (§38) is
+    written. Deliberately separable from `cache_dir` because that cache is LOCAL-ONLY in the real
+    Colab workflow: at ~3 MiB/image (~10.7 GiB across APTOS2019's 3662 images) it would grow the
+    Drive cache ~60% if the notebook's Phase 1b flush cell picked it up, while being fully
+    regenerable from the already-locally-staged raw image at roughly the same cost as reading it
+    back from Drive. Pointing this at a directory that flush cell does not sync keeps it off
+    Drive. `persistent_cache_dir` is still consulted for an RGB entry if one happens to exist
+    there (harmless, and correct if a caller ever does choose to persist it).
+
     `verbose_diagnostics` (default `False`): if `True`, logs one line per image (in addition to
     the periodic `progress_every` summary) reporting its cache status, this image's own elapsed
     time, the running images/minute rate, current process RSS (via `psutil`, if installed), and
@@ -525,6 +651,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     # reimplemented) is a no-op on CPU-only machines and safe to call repeatedly.
     check_gpu()
 
+    rgb_cache_dir = rgb_cache_dir if rgb_cache_dir is not None else cache_dir
     entries = list(entries)
     if max_images is not None:
         entries = entries[:max_images]
@@ -564,6 +691,9 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
         vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
             id_code, cache_dir, racaf_cache_dir, image_size,
         )
+        rgb_native = None  # set by the "genuine miss" branch below if it loads the raw image;
+                            # reused by the canonical-RGB caching step afterward instead of
+                            # reloading it, when the raw image was already needed for that branch.
 
         if _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
             stats["already_cached"] += 1
@@ -624,6 +754,30 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 stats["skipped_empty_fov"].append(id_code)
                 _log_diagnostic(i, id_code, "skipped_empty_fov", time.monotonic() - image_start)
 
+        # Canonical RGB (stage5_input's channels 0-2) is independent of Stage 03/04/RACAF -- cache
+        # it too, one image at a time in this same loop, so it is never recomputed from the raw
+        # file every training epoch either (module docstring §38: proven to dominate steady-state
+        # per-sample cost, since it was previously the only thing never cached at all). This is
+        # unconditional -- it runs even after a `skipped_empty_fov` outcome above, since canonical
+        # RGB computation does not depend on Stage 03's FOV detection succeeding. Reuses
+        # `rgb_native` if the branch above already loaded it (the "genuine miss"/empty-FOV case);
+        # loads it only if truly needed -- e.g. an "already_cached"/"mirrored_from_persistent"
+        # entry from a persistent cache populated before this cache kind existed, which this
+        # backfills in place without ever recomputing Stage 03/04/RACAF (that decision above is
+        # still made purely from the existing vessel/lesion/reliability check, unchanged).
+        rgb_cache = _canonical_rgb_cache_path(id_code, rgb_cache_dir, image_size)
+        if not os.path.exists(rgb_cache):
+            persistent_rgb_cache = (
+                _canonical_rgb_cache_path(id_code, persistent_cache_dir, image_size)
+                if persistent_cache_dir is not None else None
+            )
+            if rgb_native is None and not (persistent_rgb_cache and os.path.exists(persistent_rgb_cache)):
+                raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
+                rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
+            _get_or_compute_canonical_rgb(
+                rgb_native, rgb_cache, image_size, persistent_rgb_cache_path=persistent_rgb_cache,
+            )
+
         if progress_every and (i + 1) % progress_every == 0:
             _log_progress(i + 1)
 
@@ -639,13 +793,14 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
                                            vessel_model=None, vessel_model_path=DEFAULT_VESSEL_MODEL_PATH,
                                            stage4_model=None, val_split=DEFAULT_VAL_SPLIT, seed=DEFAULT_SEED,
                                            processed_dir=DEFAULT_PROCESSED_DIR, progress_every=50,
-                                           max_images=None, verbose_diagnostics=False):
+                                           max_images=None, verbose_diagnostics=False,
+                                           rgb_cache_dir=None):
     """Phase 1 entry point for the real training workflow -- precomputes caches for BOTH halves of
     the SAME authoritative split (`split_train_val_ids`) `load_joint_training_datasets()` (Phase
     2) reads, never a second one. Loads `vessel_model`/`stage4_model` at most once each, regardless
     of how many of the combined 3662 entries still need computing. `persistent_cache_dir`/
-    `persistent_racaf_cache_dir`/`max_images`/`verbose_diagnostics` are forwarded unchanged to
-    `precompute_joint_frozen_caches` -- see that function's docstring."""
+    `persistent_racaf_cache_dir`/`max_images`/`verbose_diagnostics`/`rgb_cache_dir` are forwarded
+    unchanged to `precompute_joint_frozen_caches` -- see that function's docstring."""
     check_gpu()  # before loading either model -- see precompute_joint_frozen_caches's identical call
 
     train_entries, val_entries = split_train_val_ids(csv_path, val_split=val_split, seed=seed)
@@ -657,6 +812,7 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
         vessel_model=resolved_vessel_model, stage4_model=resolved_stage4_model,
         processed_dir=processed_dir, progress_every=progress_every,
         max_images=max_images, verbose_diagnostics=verbose_diagnostics,
+        rgb_cache_dir=rgb_cache_dir,
     )
 
 
@@ -665,7 +821,8 @@ def precompute_authoritative_joint_caches(csv_path=DEFAULT_TRAIN_CSV, image_dir=
 
 def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_model, stage4_model,
                          batch_size, shuffle, augment, seed, processed_dir=DEFAULT_PROCESSED_DIR,
-                         persistent_cache_dir=None, persistent_racaf_cache_dir=None):
+                         persistent_cache_dir=None, persistent_racaf_cache_dir=None,
+                         rgb_cache_dir=None):
     entries = list(entries)
 
     def gen():
@@ -677,6 +834,7 @@ def _make_joint_dataset(entries, image_dir, cache_dir, racaf_cache_dir, vessel_m
                     vessel_model, stage4_model, augment, rng, processed_dir=processed_dir,
                     persistent_cache_dir=persistent_cache_dir,
                     persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+                    rgb_cache_dir=rgb_cache_dir,
                 )
             except EmptyFieldOfViewError:
                 # A real but exceptional APTOS image: Stage 03's FOV circle-fit found no
@@ -731,6 +889,7 @@ def load_joint_training_datasets(
     processed_dir=DEFAULT_PROCESSED_DIR,
     persistent_cache_dir=None,
     persistent_racaf_cache_dir=None,
+    rgb_cache_dir=None,
 ):
     """Train/val `tf.data.Dataset` pipelines for the joint Stage 05-08+RACAF training run, built
     from the SAME authoritative split (`downstream_split.get_authoritative_split()`) Stage 05/06
@@ -749,6 +908,11 @@ def load_joint_training_datasets(
     fast LOCAL directory and `persistent_cache_dir`/`persistent_racaf_cache_dir` as the real,
     Drive-mounted persistent cache to get local-disk cache reads on every epoch after the first,
     without ever recomputing Stage 03/04/RACAF for an entry already cached on Drive.
+
+    `rgb_cache_dir` (default `None` -> `cache_dir`): forwarded to every sample -- see
+    `_build_joint_sample`'s docstring. Point it at a local-only directory (one the notebook's
+    Phase 1b Drive-flush cell does not sync) to keep the ~10.7 GiB canonical-RGB cache off Drive
+    (`JOINT_TRAINING_ARCHITECTURE.md` §38).
     """
     # Must run before ANY TensorFlow op touches the GPU (JOINT_TRAINING_ARCHITECTURE.md §34) --
     # this loader ALSO loads Stage 04's TensorFlow model (and Stage 03's PyTorch model, the same
@@ -765,10 +929,12 @@ def load_joint_training_datasets(
         train_entries, image_dir, cache_dir, racaf_cache_dir, resolved_vessel_model, resolved_stage4_model,
         batch_size, shuffle=True, augment=augment_train, seed=seed, processed_dir=processed_dir,
         persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+        rgb_cache_dir=rgb_cache_dir,
     )
     val_ds = _make_joint_dataset(
         val_entries, image_dir, cache_dir, racaf_cache_dir, resolved_vessel_model, resolved_stage4_model,
         batch_size, shuffle=False, augment=False, seed=seed, processed_dir=processed_dir,
         persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+        rgb_cache_dir=rgb_cache_dir,
     )
     return train_ds, val_ds

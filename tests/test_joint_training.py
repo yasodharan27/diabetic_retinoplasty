@@ -1225,6 +1225,33 @@ class LoadJointTrainingDatasetsTests(unittest.TestCase):
             self.assertEqual(kwargs["persistent_cache_dir"], "/drive/local_feature_extraction")
             self.assertEqual(kwargs["persistent_racaf_cache_dir"], "/drive/racaf")
 
+    def test_forwards_rgb_cache_dir_to_both_train_and_val_datasets(self):
+        """§38: the notebook passes a local-only rgb cache dir; both datasets must receive it."""
+        captured_calls = []
+
+        def fake_make_joint_dataset(*args, **kwargs):
+            captured_calls.append(kwargs)
+            return "DATASET"
+
+        with mock.patch("joint_training_dataset.check_gpu"), mock.patch(
+            "joint_training_dataset.split_train_val_ids", return_value=([("a", 0)], [("b", 1)]),
+        ), mock.patch(
+            "joint_training_dataset.load_vessel_model", return_value="VESSEL_MODEL",
+        ), mock.patch(
+            "joint_training_dataset.racaf.load_frozen_stage4_model", return_value="STAGE4_MODEL",
+        ), mock.patch(
+            "joint_training_dataset._make_joint_dataset", side_effect=fake_make_joint_dataset,
+        ):
+            jtd.load_joint_training_datasets(rgb_cache_dir="/content/cache/canonical_rgb")
+
+        self.assertEqual(len(captured_calls), 2)
+        for kwargs in captured_calls:
+            self.assertEqual(kwargs["rgb_cache_dir"], "/content/cache/canonical_rgb")
+
+    def test_rgb_cache_dir_defaults_to_none(self):
+        signature = inspect.signature(jtd.load_joint_training_datasets)
+        self.assertIsNone(signature.parameters["rgb_cache_dir"].default)
+
     def test_persistent_cache_dir_defaults_to_none(self):
         captured_calls = []
 
@@ -1454,6 +1481,276 @@ class Phase2UsesExistingCachesTests(unittest.TestCase):
             list(ds)
         self.assertEqual(mocked_vessel.call_count, 0)
         self.assertEqual(mocked_tta.call_count, 0)
+
+    def test_second_epoch_like_iteration_never_reads_the_raw_image_either(self):
+        """§38: a full cache hit (vessel/lesion/reliability -- already proven above -- AND the
+        canonical RGB) must not touch the raw image file at all. This is the direct proof of the
+        real ~2s/step steady-state slowdown's fix: before §38, EVERY sample access re-read the raw
+        file and re-applied Stage 02 regardless of vessel/lesion/reliability cache status."""
+
+        def build_ds():
+            return jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+
+        list(build_ds())  # "epoch 1": populates every cache, including the new rgb cache
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load:
+            list(build_ds())  # "epoch 2": must be a pure, raw-file-free cache hit
+        self.assertEqual(mocked_load.call_count, 0)
+
+
+# =====================================================================
+# Canonical RGB caching (§38) -- stage5_input's RGB channels were never cached at all before this,
+# unlike vessel/lesion/reliability: every _build_joint_sample call re-read the raw image and
+# re-applied Stage 02 regardless of cache status, proven (via a local, real-code-path diagnostic)
+# to dominate steady-state per-sample cost once vessel/lesion/reliability were already np.load
+# hits. This is a pure caching change -- the cached value is numerically identical to what
+# _resize_rgb_01 already computed live; no resize/preprocessing algorithm changed.
+# =====================================================================
+
+class CanonicalRGBCachingTests(unittest.TestCase):
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_01", 2)])
+        self.addCleanup(self.tree.cleanup)
+
+    def _build(self):
+        rng = np.random.default_rng(0)
+        return jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng,
+        )
+
+    def _rgb_cache_path(self, cache_dir=None):
+        return jtd._canonical_rgb_cache_path("img_01", cache_dir or self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+
+    def test_rgb_cache_file_is_written_on_first_build(self):
+        self._build()
+        self.assertTrue(os.path.exists(self._rgb_cache_path()))
+
+    def test_cached_rgb_is_numerically_identical_to_the_sample_it_was_derived_from(self):
+        sample = self._build()
+        cached_rgb = np.load(self._rgb_cache_path())
+        np.testing.assert_array_equal(sample["stage5_input"][..., :3], cached_rgb)
+
+    def test_full_cache_hit_never_reads_the_raw_image(self):
+        self._build()  # populates vessel/lesion/reliability/rgb caches
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load:
+            self._build()
+        self.assertEqual(mocked_load.call_count, 0)
+
+    def test_full_cache_hit_produces_the_same_stage5_input_as_a_fresh_computation(self):
+        first = self._build()
+        second = self._build()
+        np.testing.assert_array_equal(first["stage5_input"], second["stage5_input"])
+
+    def test_rgb_only_missing_backfills_by_reading_the_raw_image_exactly_once(self):
+        """The one legitimate remaining reason to read the raw file on an otherwise-cached entry:
+        migrating a vessel/lesion/reliability cache populated before the rgb cache kind existed."""
+        self._build()
+        os.remove(self._rgb_cache_path())
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load:
+            self._build()
+        self.assertEqual(mocked_load.call_count, 1)
+
+    def test_rgb_only_missing_backfill_never_recomputes_stage3_or_stage4(self):
+        self._build()
+        os.remove(self._rgb_cache_path())
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel, mock.patch(
+            "joint_training_dataset.racaf.tta_views", wraps=racaf.tta_views,
+        ) as mocked_tta:
+            self._build()
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertEqual(mocked_tta.call_count, 0)
+        self.assertTrue(os.path.exists(self._rgb_cache_path()))
+
+    def test_persistent_only_rgb_is_mirrored_locally_without_recomputing_or_rereading_raw(self):
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+        rng = np.random.default_rng(0)
+        jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng,
+        )
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load, mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            jtd._build_joint_sample(
+                "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=False, rng=rng,
+                persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            )
+        self.assertEqual(mocked_load.call_count, 0)
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertTrue(os.path.exists(self._rgb_cache_path()))
+
+    def test_persistent_cache_dir_none_preserves_prior_default_behavior(self):
+        """Regression safety: every existing caller that never passes persistent_cache_dir must
+        behave exactly as before -- rgb still gets cached locally, just with no persistent tier."""
+        sample = self._build()
+        self.assertTrue(os.path.exists(self._rgb_cache_path()))
+        self.assertEqual(sample["stage5_input"].shape, (*jtd.STAGE5_IMAGE_SIZE, lfed.NUM_CHANNELS))
+
+    def test_rgb_cache_dir_defaults_to_cache_dir(self):
+        """`rgb_cache_dir=None` (every existing caller) must keep writing the rgb entry into
+        `cache_dir` itself -- the separable directory is opt-in, not a relocation."""
+        self._build()
+        self.assertTrue(os.path.exists(jtd._canonical_rgb_cache_path(
+            "img_01", self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE,
+        )))
+
+    def test_separate_rgb_cache_dir_keeps_the_rgb_entry_out_of_cache_dir(self):
+        """§38's local-only design: with a separate `rgb_cache_dir`, the ~3 MiB/image rgb array
+        must land ONLY there -- so the notebook's Phase 1b flush cell (which syncs all of
+        `cache_dir` to Drive) never picks up ~10.7 GiB of regenerable arrays."""
+        rgb_dir = os.path.join(self.tree.root, "rgb_only")
+        rng = np.random.default_rng(0)
+        jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng, rgb_cache_dir=rgb_dir,
+        )
+        self.assertTrue(os.path.exists(jtd._canonical_rgb_cache_path("img_01", rgb_dir, jtd.STAGE5_IMAGE_SIZE)))
+        self.assertFalse(os.path.exists(self._rgb_cache_path()))
+        cache_dir_files = os.listdir(self.tree.cache_dir)
+        self.assertEqual([f for f in cache_dir_files if "_rgb_" in f], [])
+
+    def test_separate_rgb_cache_dir_still_gives_a_full_raw_free_cache_hit(self):
+        rgb_dir = os.path.join(self.tree.root, "rgb_only")
+
+        def build():
+            rng = np.random.default_rng(0)
+            return jtd._build_joint_sample(
+                "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=False, rng=rng, rgb_cache_dir=rgb_dir,
+            )
+
+        first = build()
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load:
+            second = build()
+        self.assertEqual(mocked_load.call_count, 0)
+        np.testing.assert_array_equal(first["stage5_input"], second["stage5_input"])
+
+
+class Phase1CanonicalRGBCachingTests(unittest.TestCase):
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1)])
+        self.addCleanup(self.tree.cleanup)
+
+    def test_phase1_writes_rgb_cache_for_every_processed_entry(self):
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        for id_code, _diagnosis in self.tree.pairs:
+            rgb_cache = jtd._canonical_rgb_cache_path(id_code, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+            self.assertTrue(os.path.exists(rgb_cache), f"missing rgb cache for {id_code}")
+
+    def test_phase1_honors_a_separate_local_only_rgb_cache_dir(self):
+        """Phase 1 must write the rgb entries to `rgb_cache_dir`, leaving `cache_dir` (the
+        directory the notebook flushes to Drive) with only the frozen Stage 03/04/RACAF files."""
+        rgb_dir = os.path.join(self.tree.root, "rgb_only")
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model, rgb_cache_dir=rgb_dir,
+        )
+        for id_code, _diagnosis in self.tree.pairs:
+            self.assertTrue(os.path.exists(jtd._canonical_rgb_cache_path(id_code, rgb_dir, jtd.STAGE5_IMAGE_SIZE)))
+        self.assertEqual([f for f in os.listdir(self.tree.cache_dir) if "_rgb_" in f], [])
+
+    def test_phase1_then_phase2_share_the_separate_rgb_cache_dir(self):
+        """End-to-end §38 wiring, matching the real notebook: Phase 1 precomputes into a separate
+        local-only rgb dir, and Phase 2 reading from that same dir needs no raw image at all."""
+        rgb_dir = os.path.join(self.tree.root, "rgb_only")
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model, rgb_cache_dir=rgb_dir,
+        )
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load, mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False,
+                seed=0, rgb_cache_dir=rgb_dir,
+            )
+            samples = list(ds)
+        self.assertEqual(len(samples), len(self.tree.pairs))
+        self.assertEqual(mocked_load.call_count, 0)
+        self.assertEqual(mocked_vessel.call_count, 0)
+
+    def test_second_phase1_run_never_rereads_raw_images(self):
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        with mock.patch.object(lfed, "_load_raw_bgr", wraps=lfed._load_raw_bgr) as mocked_load:
+            jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            )
+        self.assertEqual(mocked_load.call_count, 0)
+
+    def test_legacy_persistent_hit_missing_only_rgb_is_still_a_full_frozen_outputs_hit(self):
+        """A persistent cache with vessel/lesion/reliability already populated by an EARLIER run
+        -- before the rgb cache kind existed -- has no rgb file. Phase 1 must still recognize it
+        as a complete frozen-outputs hit (never recomputing Stage 3/4/RACAF), backfilling only the
+        missing rgb entry."""
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        for id_code, _diagnosis in self.tree.pairs:
+            rgb_cache = jtd._canonical_rgb_cache_path(id_code, persistent_cache_dir, jtd.STAGE5_IMAGE_SIZE)
+            os.remove(rgb_cache)
+
+        with mock.patch(
+            "joint_training_dataset.predict_vessel_mask", wraps=jtd.predict_vessel_mask,
+        ) as mocked_vessel:
+            stats = jtd.precompute_joint_frozen_caches(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            )
+
+        self.assertEqual(mocked_vessel.call_count, 0)
+        self.assertEqual(stats["mirrored_from_persistent"], len(self.tree.pairs))
+        self.assertEqual(stats["cached"], 0)
+        for id_code, _diagnosis in self.tree.pairs:
+            local_rgb_cache = jtd._canonical_rgb_cache_path(id_code, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+            self.assertTrue(os.path.exists(local_rgb_cache))
+
+    def test_empty_fov_entry_still_gets_its_rgb_cached(self):
+        """Canonical RGB does not depend on Stage 03's FOV detection succeeding -- an empty-FOV
+        entry (whose vessel/lesion/reliability cache never gets written) should still have its rgb
+        cached, so at least that portion of its per-epoch cost is eliminated too."""
+        tree = _SyntheticAPTOSTree([("img_good", 0), ("img_empty_fov", 1)])
+        self.addCleanup(tree.cleanup)
+        real_fn = jtd._get_or_compute_joint_frozen_outputs
+
+        def flaky(rgb_native, vessel_cache_path, *args, **kwargs):
+            if "img_empty_fov" in vessel_cache_path:
+                raise jtd.EmptyFieldOfViewError("no fundus disk detected")
+            return real_fn(rgb_native, vessel_cache_path, *args, **kwargs)
+
+        with mock.patch("joint_training_dataset._get_or_compute_joint_frozen_outputs", side_effect=flaky):
+            stats = jtd.precompute_joint_frozen_caches(
+                tree.pairs, tree.image_dir, tree.cache_dir, tree.racaf_cache_dir,
+                vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+            )
+
+        self.assertEqual(stats["skipped_empty_fov"], ["img_empty_fov"])
+        rgb_cache = jtd._canonical_rgb_cache_path("img_empty_fov", tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+        self.assertTrue(os.path.exists(rgb_cache))
+        vessel_cache = lfed._cache_path(tree.cache_dir, "img_empty_fov", "vessel", jtd.STAGE5_IMAGE_SIZE)
+        self.assertFalse(os.path.exists(vessel_cache))
 
 
 # =====================================================================
