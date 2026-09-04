@@ -142,17 +142,25 @@ reliability check, unchanged) -- self-healing, no manifest or existing-cache-ent
 cached array is numerically IDENTICAL to what `_resize_rgb_01` already computed live -- this is
 a pure caching change, not a resize/preprocessing algorithm change.
 
-This RGB cache is deliberately LOCAL-ONLY in the real Colab workflow, via its own `rgb_cache_dir`
-(default `None` -> `cache_dir`, so every existing caller and test is unaffected). At `(512,512,3)`
-float32 it is ~3 MiB/image -- ~10.7 GiB across APTOS2019's 3662 images, which would grow the
-existing ~17.9 GiB Drive cache by ~60% if the notebook's Phase 1b flush cell
-(`sync_missing_files(LOCAL_CACHE_DIR, ...)`, which syncs a whole directory) picked it up. That
-cost buys almost nothing: unlike vessel/lesion/reliability (a frozen Stage 03/04 forward pass,
-seconds per image), canonical RGB is regenerable from the already-locally-staged raw image in
-~90-500ms -- roughly what reading the same 3 MiB back over Drive FUSE costs anyway. So the
-notebook points `rgb_cache_dir` at a local directory that flush cell does not sync, keeping the
-volume (and the §35-class FUSE risk of writing it) off Drive entirely, while Phase 1 still
-rebuilds it once per session before training starts.
+Persisted to the SAME authoritative Drive cache as vessel/lesion/reliability, not kept local-only
+(revised after a real Colab run -- see the next paragraph). `_build_joint_sample`/`_make_joint_
+dataset`/`load_joint_training_datasets`/`precompute_joint_frozen_caches` all accept an optional
+`rgb_cache_dir` (default `None` -> `cache_dir`) purely as a caller-level escape hatch for a test or
+a future caller that genuinely wants RGB kept separate -- the real notebook does not set it, so RGB
+entries live in the exact same `LOCAL_CACHE_DIR`/`persistent_cache_dir` pair as everything else, and
+Phase 1b's existing, unmodified `sync_missing_files(LOCAL_CACHE_DIR, config.LOCAL_FEATURE_RESULTS_
+DIR)` flushes newly-written RGB entries to Drive automatically, with no new plumbing.
+
+An earlier version of this cache WAS local-only, reasoned narrowly about Drive storage growth
+(~10.7 GiB, ~60% over the existing ~17.9 GiB) without pricing in that a Colab runtime's `/content`
+is wiped on every disconnect/reset. A real run exposed the actual cost of that: local-only meant
+regenerating all 3662 entries' Stage 02 + resize from scratch on EVERY fresh runtime, measured (real
+code, no GPU) at several hundred milliseconds to over a second per image depending on machine load --
+tens of minutes to well over an hour for the full dataset, closely matching a real ~90-minute, still-
+incomplete Phase 1 run. Once priced correctly, that recurring CPU cost is far more expensive than the
+one-time ~10.7 GiB Drive write plus the same small per-image existence-check-and-mirror cost already
+proven safe for vessel/lesion/reliability across §35-§37 -- so RGB now follows that identical,
+already-tested pattern instead of a bespoke local-only one.
 """
 
 import logging
@@ -426,13 +434,11 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
     case from epoch 2 onward, or any Phase-1-precomputed entry) never touches the raw image file
     at all.
 
-    `rgb_cache_dir` (default `None` -> `cache_dir`): where the canonical RGB cache lives. Kept
-    separable because that cache, unlike vessel/lesion/reliability, is deliberately LOCAL-ONLY in
-    the real Colab workflow (§38): at `(512,512,3)` float32 it is ~3 MiB/image (~10.7 GiB across
-    APTOS2019's 3662), which would grow the Drive cache ~60%, while being fully regenerable from
-    the already-locally-staged raw image at roughly the same cost as reading it back from Drive.
-    Pointing this at a directory the notebook's Phase 1b flush cell does not sync keeps that
-    volume off Drive entirely.
+    `rgb_cache_dir` (default `None` -> `cache_dir`): where the canonical RGB cache lives. An
+    optional escape hatch for a caller that wants it kept separate from `cache_dir`; the real
+    notebook does not set it, so RGB entries share `cache_dir`/`persistent_cache_dir` with
+    vessel/lesion/reliability -- the same existence-check-and-mirror pattern, the same Phase 1b
+    Drive flush, no separate handling (`JOINT_TRAINING_ARCHITECTURE.md` §38).
     """
     rgb_cache_dir = rgb_cache_dir if rgb_cache_dir is not None else cache_dir
     vessel_cache = lfed._cache_path(cache_dir, id_code, "vessel", image_size)
@@ -617,13 +623,13 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
     cache for them.
 
     `rgb_cache_dir` (default `None` -> `cache_dir`): where the canonical RGB cache (§38) is
-    written. Deliberately separable from `cache_dir` because that cache is LOCAL-ONLY in the real
-    Colab workflow: at ~3 MiB/image (~10.7 GiB across APTOS2019's 3662 images) it would grow the
-    Drive cache ~60% if the notebook's Phase 1b flush cell picked it up, while being fully
-    regenerable from the already-locally-staged raw image at roughly the same cost as reading it
-    back from Drive. Pointing this at a directory that flush cell does not sync keeps it off
-    Drive. `persistent_cache_dir` is still consulted for an RGB entry if one happens to exist
-    there (harmless, and correct if a caller ever does choose to persist it).
+    written. An optional escape hatch for a caller that wants it kept separate; the real notebook
+    does not set it, so RGB shares `cache_dir` with vessel/lesion/reliability and is flushed to
+    Drive by the SAME, unmodified Phase 1b `sync_missing_files()` call as everything else --
+    revised after a real Colab run showed keeping it local-only meant regenerating all 3662
+    entries' Stage 02 + resize from scratch on every fresh runtime (`/content` is wiped on
+    disconnect), costing tens of minutes to over an hour -- far more than the one-time ~10.7 GiB
+    Drive write this now costs instead.
 
     `verbose_diagnostics` (default `False`): if `True`, logs one line per image (in addition to
     the periodic `progress_every` summary) reporting its cache status, this image's own elapsed
@@ -910,9 +916,9 @@ def load_joint_training_datasets(
     without ever recomputing Stage 03/04/RACAF for an entry already cached on Drive.
 
     `rgb_cache_dir` (default `None` -> `cache_dir`): forwarded to every sample -- see
-    `_build_joint_sample`'s docstring. Point it at a local-only directory (one the notebook's
-    Phase 1b Drive-flush cell does not sync) to keep the ~10.7 GiB canonical-RGB cache off Drive
-    (`JOINT_TRAINING_ARCHITECTURE.md` §38).
+    `_build_joint_sample`'s docstring. The real notebook leaves this at its default, so canonical
+    RGB shares `cache_dir`/`persistent_cache_dir` with vessel/lesion/reliability and is persisted
+    to Drive the same way (`JOINT_TRAINING_ARCHITECTURE.md` §38).
     """
     # Must run before ANY TensorFlow op touches the GPU (JOINT_TRAINING_ARCHITECTURE.md §34) --
     # this loader ALSO loads Stage 04's TensorFlow model (and Stage 03's PyTorch model, the same

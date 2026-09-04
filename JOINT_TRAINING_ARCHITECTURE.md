@@ -1277,36 +1277,15 @@ missing `rgb` file is independently backfilled. The cached array is numerically 
 `_resize_rgb_01` always computed live (same function, same inputs) — this is a pure caching change,
 not a resize/preprocessing algorithm change.
 
-**This cache is deliberately LOCAL-ONLY**, via its own `rgb_cache_dir` parameter (default `None` →
-`cache_dir`, so every existing caller and test is unaffected; the notebook points it at
-`/content/cache/canonical_rgb`). The reason is a storage/benefit asymmetry that only became visible
-once the array size was computed exactly:
-
-| | per image | × 3662 images |
-|---|---|---|
-| vessel (512×512×1 f32) | 1.0 MiB | |
-| lesion (512×512×4 f32) | 4.0 MiB | |
-| **existing Drive cache** | **~5.0 MiB** | **17.9 GiB** |
-| **new canonical RGB (512×512×3 f32)** | **3.0 MiB** | **10.7 GiB** |
-
-The notebook's Phase 1b flush cell syncs a whole directory (`sync_missing_files(LOCAL_CACHE_DIR,
-…)`), so leaving the rgb entries in `cache_dir` would have silently grown the Drive cache ~60%, from
-17.9 GiB to 28.6 GiB — plus the corresponding bulk-write FUSE exposure this project has already been
-burned by twice (§33, §35). That cost buys almost nothing: unlike vessel/lesion/reliability (a
-frozen Stage 03/04 forward pass, seconds per image, genuinely worth persisting across sessions),
-canonical RGB is regenerable from the already-locally-staged raw image in ~90–500ms — roughly what
-reading the same 3 MiB back over Drive FUSE costs anyway. So it is rebuilt locally, once per
-session, by Phase 1 (the phase explicitly designed to be the slow, resumable, run-once-before-
-training one), and never written to Drive. `persistent_cache_dir` is still consulted for an rgb
-entry if one happens to exist there — harmless, and correct if a caller ever does choose to persist
-it.
+**This cache was originally made LOCAL-ONLY** here, via its own `rgb_cache_dir` parameter — a
+decision §39 found wrong and reversed after a real Colab run. See §39 for the corrected design;
+`rgb_cache_dir` remains available as a caller-level escape hatch (default `None` → `cache_dir`),
+but the real notebook no longer sets it.
 
 **Not changed:** Stage 03/04 architecture or weights, RACAF or CORN mathematics, Stage 5/6/7
 architecture, loss, QWK, optimizer, batch size, epochs, `Trainer`/`TrainingConfig`, the resize
 algorithm itself, `.repeat()` (deliberately not added — see above), the authoritative split
-manifest, and no existing Drive cache entry was deleted, overwritten, or invalidated. Drive cache
-SIZE is also unchanged: the one new cache kind is local-only by construction (above), so Phase 1b
-still flushes exactly the same vessel/lesion/reliability files it did before.
+manifest, and no existing Drive cache entry was deleted, overwritten, or invalidated.
 
 **Regression tests:** `tests/test_joint_training.py` — `CanonicalRGBCachingTests` (rgb cache file
 written on first build; cached value numerically identical to the sample it was derived from; a
@@ -1317,10 +1296,10 @@ the raw image exactly once, without recomputing Stage 03/04), `Phase1CanonicalRG
 (Phase 1 writes an rgb cache for every processed entry; a second Phase 1 run never re-reads raw
 images; a legacy persistent hit with vessel/lesion/reliability but no rgb file is still recognized
 as a full frozen-outputs hit, never recomputing Stage 03/04, while backfilling rgb; an empty-FOV
-entry — whose vessel/lesion/reliability cache never gets written — still gets its rgb cached; Phase
-1 honors a separate local-only `rgb_cache_dir`, leaving `cache_dir` — the directory that IS flushed
-to Drive — with no `_rgb_` files at all; Phase 1 → Phase 2 end-to-end through that same separate
-dir needs neither a raw image nor Stage 03/04), one added test in the existing
+entry — whose vessel/lesion/reliability cache never gets written — still gets its rgb cached; a
+caller that opts into a separate `rgb_cache_dir` still gets a clean separation and a working
+Phase-1-then-Phase-2 hand-off through it, though §39 revised the real notebook to not opt in), one
+added test in the existing
 `Phase2UsesExistingCachesTests` (a second epoch-like dataset iteration never reads the raw image
 either), and two in `LoadJointTrainingDatasetsTests` (`rgb_cache_dir` forwarded to both train and
 val datasets; defaults to `None`). All existing tests re-run and pass unchanged, confirming this
@@ -1335,3 +1314,117 @@ remove close to all of the remaining non-GPU-compute cost, though the actual T4 
 step time itself was not and could not be measured on this dev machine, which has no GPU) — and
 confirm the "ran out of data" warning still appears exactly once, on Epoch 1, with training then
 continuing normally through all 50 epochs without being stopped by Keras itself.
+
+## 39. §38's local-only canonical RGB cache was itself the ~90-minute fresh-runtime problem — persisted to Drive instead, using the existing cache mechanism unchanged
+
+**Symptom:** after §38 shipped, a real Colab run reported Phase 1 taking ~90 minutes and still not
+completing, and Phase 1b reporting "Flushed 0 Stage 03/04 cache files and 0 RACAF cache files to
+Drive" afterward — raising a real concern that every fresh Colab runtime (`/content` is wiped on
+disconnect) might need a 1-2 hour cache-preparation pass, indefinitely.
+
+**Method:** re-audited fresh, explicitly not assuming §38's local-only design was correct. A local,
+real-code-path diagnostic (synthetic checkpoints/images, no GPU) reproduced the exact fresh-runtime
+condition — empty local cache, complete persistent (Drive-standin) cache — and measured Stage 02 +
+resize in a cleanly-isolated process, independent of any other work, three separate times: 450ms,
+612ms, and 1340ms per image at a realistic 2000×1848 raw resolution. The three runs disagree in
+absolute terms (real variance on this dev machine, most plausibly thermal/background-load related,
+not a stable number) but agree qualitatively: every measurement projects to many minutes-to-over-an-
+hour for the full 3662-image dataset, consistent with the reported ~90 minutes. Root cause: §38
+cached canonical RGB, correctly, but chose to keep that cache LOCAL-ONLY (a separate `rgb_cache_dir`
+the notebook's Phase 1b flush cell never touched) specifically to avoid growing the Drive cache
+~60%. That reasoning weighed Drive storage against a ONE-TIME regeneration cost — it did not price
+in that "one-time" becomes "every fresh runtime" once `/content` is disposable, which is exactly how
+a real Colab session behaves.
+
+Before any code change, independently verified (a separate diagnostic, not assumed): canonical RGB
+is deterministic (`_resolve_processed_rgb`/`preprocess_array` have no `random`/`rng`/seed reference
+anywhere — confirmed by source grep, not inference); the same raw file processed twice, independent
+calls, produces byte-identical output; `np.save`/`np.load` (the exact mechanism `_get_or_compute_
+canonical_rgb`'s persistent-hit branch already uses, unmodified) round-trips an array bit-for-bit,
+by construction of the `.npy` format; and that existing, already-tested persistent-hit-and-mirror
+branch, run end to end with no code change, returns a value numerically identical (`array_equal`
+AND raw-bytes-equal) to a fresh live computation on the same image.
+
+**"Flushed 0" is not a symptom — it is what correct behavior looks like when nothing was newly
+computed.** `sync_missing_files()`'s "flushed" count is `copied_count`: files not yet present at
+the destination. Every locally-cached entry in that run came from `mirrored_from_persistent` (real
+Phase 1 stats showed `cached: 0`, confirmed independently by a mocked `predict_vessel_mask` call
+count of 0 in the local reproduction) — content that *originated on Drive* — so Phase 1b correctly
+found it `already_present` there and copied nothing. This was true before this fix and remains true
+after it; it was never evidence of a stall.
+
+**Fix — minimal, reusing existing plumbing, no new mechanism:** the real notebook no longer passes
+a separate `rgb_cache_dir`. Canonical RGB now shares `cache_dir`/`persistent_cache_dir` with vessel/
+lesion/reliability, exactly like every other cache kind — the SAME existence-check-and-mirror code
+path (`_get_or_compute_canonical_rgb`, already built and tested in §38, entirely unchanged), the
+SAME Phase 1b `sync_missing_files(LOCAL_CACHE_DIR, config.LOCAL_FEATURE_RESULTS_DIR)` call
+(`dataset_staging.py`, also entirely unchanged) — newly-written RGB entries are picked up
+automatically because they now live in the directory that call already walks. `joint_training_
+dataset.py`'s `rgb_cache_dir` parameter itself was NOT removed (it remains a working, tested
+escape hatch for a caller that genuinely wants separation — some existing tests exercise exactly
+that), but the notebook and every default-configured caller now route RGB through the shared,
+Drive-backed path.
+
+**Redundant existence checks — evaluated, not removed.** Traced two candidate redundancies
+precisely: (1) `precompute_joint_frozen_caches`'s persistent-hit branch (`elif persistent_cache_dir
+... and _cache_entry_exists(...)`) already confirms vessel/lesion/reliability exist at the
+persistent location before calling `_get_or_compute_joint_frozen_outputs`, which then re-checks the
+identical three paths itself (present since `164aead`, predates this change); (2) the equivalent
+pattern this session's own code introduced for rgb, between Phase 1's `rgb` block and `_get_or_
+compute_canonical_rgb`'s own first two lines. Neither can be removed by deleting code alone without
+changing behavior for `_build_joint_sample` (Phase 2), which calls the SAME shared functions but has
+NOT already checked persistent existence itself — it depends entirely on that internal check to
+decide hit vs. miss. Removing it safely would require adding a new "caller already verified this"
+parameter (mirroring the existing `known_not_all_cached` parameter, which already solves the exact
+same problem for ONE specific check) to functions that are either extensively tested and load-
+bearing for the explicitly-protected vessel/lesion/reliability path, or brand new from this
+session's own recent commits. Given the explicit brief to prefer the smallest safe change and not
+introduce new complexity, and given the cost of the redundancy itself is small (a handful of extra
+`os.path.exists` calls per image — cheap locally, and only reached on a Drive path when the local
+tier is still cold), both were left untouched rather than adding new parameter surface area to
+remove them. This is a deliberate, evaluated non-change, not an oversight.
+
+**Not changed:** Stage 02's numerical processing, `_resize_rgb_01`'s resize behavior or algorithm,
+Stage 03/04/RACAF models or outputs, Stage 5-7 architecture, CORN formulation, loss, QWK, optimizer,
+learning-rate policy, batch size, epochs, `Trainer`, experiment semantics, or the authoritative
+split. No existing Stage 03 vessel, Stage 04 lesion, or RACAF reliability Drive cache entry was
+deleted, migrated, rewritten, or invalidated — this fix is purely additive (new `rgb` cache entries
+alongside the existing three, using their exact existing directory and flush mechanism). No
+sharding, TFRecords, HDF5, combined cache files, LRU eviction, cache migration, or parallel
+preprocessing was introduced.
+
+**Storage impact:**
+
+| | per image | × 3662 | 
+|---|---|---|
+| Vessel + lesion + reliability (existing, unaffected) | ~5.0 MiB | ~17.9 GiB |
+| Canonical RGB (now Drive-persisted) | 3.0 MiB | ~10.7 GiB |
+| **Drive total after this change** | | **~28.6 GiB** (+60% over pre-existing) |
+| Worst-case local SSD (repo + staged APTOS raw + a full local mirror of all four cache kinds + checkpoints, all warmed simultaneously) | | ~40 GB, against a 112 GB budget (~72 GB headroom) |
+
+**Regression tests:** `tests/test_joint_training.py` — two new tests in `CanonicalRGBCachingTests`
+(`test_persistent_mirrored_rgb_is_numerically_identical_to_a_fresh_live_computation`: a persistent-
+only entry, once mirrored, is byte-for-byte identical to a fresh live computation on the same raw
+image; `test_no_persistent_path_is_probed_once_every_artifact_is_a_local_hit`: once all four cache
+kinds are local hits, not one `os.path.exists` call reaches a persistent/Drive path) and two new
+tests in `Phase1CanonicalRGBCachingTests` (`test_rgb_mirrored_entry_is_not_re_touched_by_a_later_
+phase1_run`: mtime-stability proof, mirroring the existing vessel/lesion resumability test exactly;
+`test_mixed_entry_kinds_all_end_with_a_valid_local_rgb_cache`: the existing already-local/persistent-
+only/genuine-miss mixed scenario, extended to confirm all three end with a correct local rgb entry).
+Two existing tests were renamed (not behaviorally changed) to stop describing the opt-in separate-
+`rgb_cache_dir` scenario as if it were the notebook's default. A new class,
+`Phase1bFlushIncludesCanonicalRGBTests`, validates the actual notebook wiring end to end using the
+REAL, unmodified `dataset_staging.sync_missing_files()` (not a mock): a genuinely new entry's rgb
+file is flushed to the Drive-standin directory alongside vessel/lesion with byte-identical content;
+and, directly answering the "Flushed 0" question, a persistent-only entry (mirrored locally, never
+recomputed) flushes exactly 0 new files and reports every one of them `already_present` — proving
+that specific real-run observation was correct, expected behavior, not a stall. All existing tests
+re-run and pass unchanged.
+
+**Still required before declaring the pipeline training-ready:** the real-Colab validation this
+session's diagnostics cannot substitute for — a fresh runtime, small (10-25 image) diagnostic Phase
+1 run confirming persistent hits mirror rather than recompute, a full Phase 1 run confirming elapsed
+time drops from ~90 minutes to a small number, a Phase 1b run confirming only genuinely-new entries
+(now including rgb) are flushed and existing Drive entries are untouched, a SECOND fresh-runtime
+Phase 1 confirming rgb is no longer regenerated, and a direct ~20-batch dataset iteration (no
+`Trainer.fit()`) confirming zero Drive dependency in steady-state sample delivery.

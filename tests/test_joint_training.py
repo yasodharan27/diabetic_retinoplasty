@@ -17,6 +17,7 @@ import csv
 import inspect
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -34,6 +35,14 @@ import lesion_segmentation_model as lsm
 import local_feature_extraction_dataset as lfed
 import racaf
 from vessel_segmentation_model import build_vessel_segmentation_model, load_state_dict_from_checkpoint
+
+# colab/common/dataset_staging.py -- matches test_dataset_staging.py's established pattern for
+# testing colab/common/ modules outside Colab (no Drive, no google.colab import).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_COLAB_COMMON = os.path.join(_REPO_ROOT, "colab", "common")
+if _COLAB_COMMON not in sys.path:
+    sys.path.insert(0, _COLAB_COMMON)
+import dataset_staging  # noqa: E402
 
 IMAGE_SIZE = 256  # large enough for Stage 03's FOV circle-fit to succeed reliably
 
@@ -1588,6 +1597,57 @@ class CanonicalRGBCachingTests(unittest.TestCase):
         self.assertEqual(mocked_vessel.call_count, 0)
         self.assertTrue(os.path.exists(self._rgb_cache_path()))
 
+    def test_persistent_mirrored_rgb_is_numerically_identical_to_a_fresh_live_computation(self):
+        """§39: independent proof the Drive round-trip (np.save on write, np.load on read --
+        raw, uncompressed, exactly what every other cache entry already uses) introduces no
+        precision loss -- a persistent-only entry, once mirrored locally, must be byte-for-byte
+        identical to computing canonical RGB live from the same raw image, not merely close."""
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+        rng = np.random.default_rng(0)
+        jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng,
+        )
+        mirrored_sample = jtd._build_joint_sample(
+            "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, augment=False, rng=rng,
+            persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+        )
+
+        raw_bgr = lfed._load_raw_bgr(self.tree.image_dir, "img_01")
+        rgb_native = lfed._resolve_processed_rgb(raw_bgr, lfed.DEFAULT_PROCESSED_DIR, "img_01")
+        live_canonical_rgb = jtd._resize_rgb_01(rgb_native, jtd.STAGE5_IMAGE_SIZE)
+
+        mirrored_rgb = mirrored_sample["stage5_input"][..., :3]
+        np.testing.assert_array_equal(mirrored_rgb, live_canonical_rgb)
+        self.assertEqual(mirrored_rgb.tobytes(), live_canonical_rgb.tobytes())
+
+    def test_no_persistent_path_is_probed_once_every_artifact_is_a_local_hit(self):
+        """Once vessel/lesion/reliability/rgb are all local hits (steady-state training, the
+        normal case from epoch 2 onward), NOT ONE `os.path.exists` call may reach a PERSISTENT
+        (Drive) path -- confirms sharing `persistent_cache_dir` with vessel/lesion for rgb too
+        does not reintroduce a Drive touch on an otherwise-fully-local sample."""
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+        self._build()  # populates a full local hit (no persistent dirs passed this call)
+
+        real_exists = os.path.exists
+        persistent_dir_probed = []
+
+        def spying_exists(path):
+            if persistent_cache_dir in str(path) or persistent_racaf_cache_dir in str(path):
+                persistent_dir_probed.append(path)
+            return real_exists(path)
+
+        with mock.patch("os.path.exists", side_effect=spying_exists):
+            jtd._build_joint_sample(
+                "img_01", 2, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model, augment=False, rng=np.random.default_rng(0),
+                persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            )
+        self.assertEqual(persistent_dir_probed, [])
+
     def test_persistent_cache_dir_none_preserves_prior_default_behavior(self):
         """Regression safety: every existing caller that never passes persistent_cache_dir must
         behave exactly as before -- rgb still gets cached locally, just with no persistent tier."""
@@ -1604,9 +1664,10 @@ class CanonicalRGBCachingTests(unittest.TestCase):
         )))
 
     def test_separate_rgb_cache_dir_keeps_the_rgb_entry_out_of_cache_dir(self):
-        """§38's local-only design: with a separate `rgb_cache_dir`, the ~3 MiB/image rgb array
-        must land ONLY there -- so the notebook's Phase 1b flush cell (which syncs all of
-        `cache_dir` to Drive) never picks up ~10.7 GiB of regenerable arrays."""
+        """`rgb_cache_dir` is a caller-level escape hatch, not what the real notebook uses (§39:
+        the notebook shares `cache_dir` for rgb too, so Phase 1b's existing flush picks it up) --
+        but a caller that DOES pass a separate directory must still get a clean separation, with
+        the rgb array landing ONLY there and nothing rgb-shaped leaking into `cache_dir`."""
         rgb_dir = os.path.join(self.tree.root, "rgb_only")
         rng = np.random.default_rng(0)
         jtd._build_joint_sample(
@@ -1651,9 +1712,9 @@ class Phase1CanonicalRGBCachingTests(unittest.TestCase):
             rgb_cache = jtd._canonical_rgb_cache_path(id_code, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
             self.assertTrue(os.path.exists(rgb_cache), f"missing rgb cache for {id_code}")
 
-    def test_phase1_honors_a_separate_local_only_rgb_cache_dir(self):
-        """Phase 1 must write the rgb entries to `rgb_cache_dir`, leaving `cache_dir` (the
-        directory the notebook flushes to Drive) with only the frozen Stage 03/04/RACAF files."""
+    def test_phase1_honors_a_separate_rgb_cache_dir_when_a_caller_opts_in(self):
+        """`rgb_cache_dir` remains a working escape hatch for a caller that wants rgb kept apart
+        from `cache_dir`, even though the real notebook does not use it (§39)."""
         rgb_dir = os.path.join(self.tree.root, "rgb_only")
         jtd.precompute_joint_frozen_caches(
             self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
@@ -1663,9 +1724,10 @@ class Phase1CanonicalRGBCachingTests(unittest.TestCase):
             self.assertTrue(os.path.exists(jtd._canonical_rgb_cache_path(id_code, rgb_dir, jtd.STAGE5_IMAGE_SIZE)))
         self.assertEqual([f for f in os.listdir(self.tree.cache_dir) if "_rgb_" in f], [])
 
-    def test_phase1_then_phase2_share_the_separate_rgb_cache_dir(self):
-        """End-to-end §38 wiring, matching the real notebook: Phase 1 precomputes into a separate
-        local-only rgb dir, and Phase 2 reading from that same dir needs no raw image at all."""
+    def test_phase1_then_phase2_share_a_caller_opted_in_separate_rgb_cache_dir(self):
+        """When a caller DOES opt into a separate `rgb_cache_dir`, Phase 1 and Phase 2 must still
+        agree on where to find it -- Phase 1 precomputes into that dir, Phase 2 reading from the
+        same dir needs no raw image at all. (The real notebook does not opt in -- see §39.)"""
         rgb_dir = os.path.join(self.tree.root, "rgb_only")
         jtd.precompute_joint_frozen_caches(
             self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
@@ -1683,6 +1745,66 @@ class Phase1CanonicalRGBCachingTests(unittest.TestCase):
         self.assertEqual(len(samples), len(self.tree.pairs))
         self.assertEqual(mocked_load.call_count, 0)
         self.assertEqual(mocked_vessel.call_count, 0)
+
+    def test_rgb_mirrored_entry_is_not_re_touched_by_a_later_phase1_run(self):
+        """The core resumability guarantee (already proven for vessel/lesion), extended to rgb:
+        once an entry's rgb has been mirrored locally, a later Phase 1 call over the same entries
+        must find it as a plain local hit and never re-touch it (or the persistent location)."""
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        id_code = self.tree.pairs[0][0]
+        rgb_cache_local = jtd._canonical_rgb_cache_path(id_code, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+        mtime_after_mirror = os.path.getmtime(rgb_cache_local)
+
+        stats = jtd.precompute_joint_frozen_caches(
+            [self.tree.pairs[0]], self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 0)
+        self.assertEqual(os.path.getmtime(rgb_cache_local), mtime_after_mirror)
+
+    def test_mixed_entry_kinds_all_end_with_a_valid_local_rgb_cache(self):
+        """The realistic mixed-resumability scenario (already proven for vessel/lesion: one entry
+        already local, one persistent-only, one a genuine miss) must also leave all three with a
+        correct, local rgb cache entry after a single Phase 1 pass -- no kind is skipped."""
+        tree = _SyntheticAPTOSTree([("already_local", 0), ("persistent_only", 1), ("brand_new", 2)])
+        self.addCleanup(tree.cleanup)
+        persistent_cache_dir = os.path.join(self.tree.root, "persistent_cache")
+        persistent_racaf_cache_dir = os.path.join(self.tree.root, "persistent_racaf_cache")
+
+        jtd.precompute_joint_frozen_caches(
+            [tree.pairs[0]], tree.image_dir, tree.cache_dir, tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        jtd.precompute_joint_frozen_caches(
+            [tree.pairs[1]], tree.image_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        stats = jtd.precompute_joint_frozen_caches(
+            tree.pairs, tree.image_dir, tree.cache_dir, tree.racaf_cache_dir,
+            persistent_cache_dir=persistent_cache_dir, persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+
+        self.assertEqual(stats["already_cached"], 1)
+        self.assertEqual(stats["mirrored_from_persistent"], 1)
+        self.assertEqual(stats["cached"], 1)
+        for id_code, _diagnosis in tree.pairs:
+            rgb_cache = jtd._canonical_rgb_cache_path(id_code, tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+            self.assertTrue(os.path.exists(rgb_cache), f"missing rgb cache for {id_code}")
 
     def test_second_phase1_run_never_rereads_raw_images(self):
         jtd.precompute_joint_frozen_caches(
@@ -1751,6 +1873,80 @@ class Phase1CanonicalRGBCachingTests(unittest.TestCase):
         self.assertTrue(os.path.exists(rgb_cache))
         vessel_cache = lfed._cache_path(tree.cache_dir, "img_empty_fov", "vessel", jtd.STAGE5_IMAGE_SIZE)
         self.assertFalse(os.path.exists(vessel_cache))
+
+
+class Phase1bFlushIncludesCanonicalRGBTests(unittest.TestCase):
+    """§39: validates the actual notebook configuration end to end -- Phase 1 writing rgb entries
+    into the SAME `cache_dir` as vessel/lesion, then the real, unmodified `dataset_staging.
+    sync_missing_files()` (Phase 1b's exact call) picking them up automatically, with no new
+    plumbing. Also directly verifies the "Flushed 0" semantics: a persistent-only entry produces
+    nothing new to flush, and that is correct, not a stall."""
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("img_a", 0), ("img_b", 1)])
+        self.addCleanup(self.tree.cleanup)
+        self.drive_cache_dir = os.path.join(self.tree.root, "drive_cache")
+        self.drive_racaf_cache_dir = os.path.join(self.tree.root, "drive_racaf_cache")
+
+    def test_a_genuinely_new_entrys_rgb_file_is_flushed_to_drive_alongside_vessel_and_lesion(self):
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        flushed_lf, _kept, failures = dataset_staging.sync_missing_files(
+            self.tree.cache_dir, self.drive_cache_dir,
+        )
+        self.assertEqual(failures, [])
+        for id_code, _diagnosis in self.tree.pairs:
+            for kind in ("vessel", "lesion", "rgb"):
+                drive_path = lfed._cache_path(self.drive_cache_dir, id_code, kind, jtd.STAGE5_IMAGE_SIZE)
+                self.assertTrue(os.path.exists(drive_path), f"{kind} for {id_code} was not flushed to Drive")
+        # 2 images x (vessel + lesion + rgb) = 6; reliability lives under racaf_cache_dir, flushed separately.
+        self.assertEqual(flushed_lf, 6)
+
+    def test_flushed_rgb_content_on_drive_matches_the_local_source_exactly(self):
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        dataset_staging.sync_missing_files(self.tree.cache_dir, self.drive_cache_dir)
+        id_code = self.tree.pairs[0][0]
+        local_rgb = jtd._canonical_rgb_cache_path(id_code, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)
+        drive_rgb = jtd._canonical_rgb_cache_path(id_code, self.drive_cache_dir, jtd.STAGE5_IMAGE_SIZE)
+        np.testing.assert_array_equal(np.load(local_rgb), np.load(drive_rgb))
+
+    def test_a_persistent_only_entry_flushes_nothing_new_this_is_correct_not_a_stall(self):
+        """Directly verifies the 'Flushed 0' semantics the user asked to have confirmed: an entry
+        found only via `persistent_cache_dir` (content already on Drive) is mirrored locally, but
+        that content is -- by construction -- already present at the Drive flush destination, so
+        `sync_missing_files` correctly reports it as `already_present`, not `copied`."""
+        # Populate the "Drive" cache directly -- as if from an earlier session's Phase 1 run.
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.drive_cache_dir, self.drive_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        # This session's Phase 1: local cache starts empty, everything comes from the persistent hit.
+        stats = jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            persistent_cache_dir=self.drive_cache_dir, persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        self.assertEqual(stats["cached"], 0)
+        self.assertEqual(stats["mirrored_from_persistent"], len(self.tree.pairs))
+
+        flushed_lf, kept_lf, failures = dataset_staging.sync_missing_files(
+            self.tree.cache_dir, self.drive_cache_dir,
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(flushed_lf, 0)  # matches a real run's "Flushed 0" -- correct, not a stall
+        self.assertEqual(kept_lf, 6)     # every file WAS already on Drive -- that's WHY nothing flushed
+        for id_code, _diagnosis in self.tree.pairs:
+            for kind in ("vessel", "lesion", "rgb"):
+                self.assertTrue(os.path.exists(
+                    lfed._cache_path(self.drive_cache_dir, id_code, kind, jtd.STAGE5_IMAGE_SIZE),
+                ))
 
 
 # =====================================================================
