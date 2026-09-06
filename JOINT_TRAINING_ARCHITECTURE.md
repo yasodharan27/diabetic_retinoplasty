@@ -1428,3 +1428,78 @@ time drops from ~90 minutes to a small number, a Phase 1b run confirming only ge
 (now including rgb) are flushed and existing Drive entries are untouched, a SECOND fresh-runtime
 Phase 1 confirming rgb is no longer regenerated, and a direct ~20-batch dataset iteration (no
 `Trainer.fit()`) confirming zero Drive dependency in steady-state sample delivery.
+
+---
+
+## 40. §39's persistence was never triggered — Phase 1 wrote canonical RGB locally but nothing flushed it, so Drive held `rgb = 0`
+
+**Symptom.** A real-runtime diagnostic (§39's `joint_cache_diagnostics.py`, run on 5 images)
+reported the persistent Drive cache holding `vessel = 3651`, `lesion = 3651`,
+`reliability = 3651` and **`rgb = 0`**. Canonical RGB existed only under
+`/content/cache/local_feature_extraction`, so every fresh runtime regenerated it for every image.
+Pass 1 showed RGB as the only artifact with 0 persistent hits and 5 recomputations; pass 2 showed
+it reused with zero recomputation once local; the cached bytes were bitwise identical to a fresh
+generation.
+
+The `3651` is itself informative: `3662 - 3651 = 11`, exactly the count of empty-field-of-view
+images a real Phase 1 skips. The Drive cache was therefore written by a Phase 1 run that predates
+the canonical-RGB cache kind entirely.
+
+**Method — what was actually wrong, established before editing.** The reported state has two
+possible causes, and they call for opposite fixes: either the read/mirror/flush machinery from
+§38/§39 is broken, or it is correct and simply was never run. A throwaway script reproduced the
+exact reported Drive state (vessel/lesion/reliability present, rgb deleted) and drove the real,
+unmodified code path end to end under the §39 instrumentation:
+
+| Step | Result |
+|---|---|
+| Fresh runtime, Phase 1 against that Drive cache | Stage 03/04/RACAF all `mirrored_from_persistent`, `predict_vessel_mask` 0 calls; RGB computed locally (3 calls); **0 writes to Drive**; Drive `rgb` still 0 |
+| The existing Phase 1b `sync_missing_files()` call, unchanged | flushed exactly the 3 rgb files (6 vessel/lesion already present); Drive `rgb` now 3 |
+| Second fresh runtime (local wiped), Phase 1 again | **`_resize_rgb_01` 0 calls, raw image loads 0**, 3 rgb Drive reads, 3 local mirrors |
+| Drive-persisted rgb vs fresh generation | bitwise identical, max abs diff `0.0` |
+
+So the machinery was already complete and correct. `_get_or_compute_canonical_rgb` already
+detects a persistent hit and mirrors it; `_canonical_rgb_cache_path` already writes
+`APTOS_<id>_rgb_512x512.npy` beside vessel/lesion via `lfed._cache_path`; Phase 1b's
+`sync_missing_files()` already picks rgb up because §39 made all four kinds share
+`LOCAL_CACHE_DIR`. **Nothing in `joint_training_dataset.py` needed to change, and nothing did.**
+
+The real gap was operational: Phase 1 writes to local SSD only, and persisting it was a *separate
+cell someone has to remember to run*. For vessel/lesion that was harmless — Drive already had
+them. For canonical RGB it meant a ~90-minute Phase 1 could complete, the runtime could be
+recycled, and all of that work would be gone.
+
+**Fix (notebook only).** The Phase 1 cell now flushes when it finishes, gated by
+`FLUSH_TO_DRIVE_AFTER_PHASE1 = True`, reusing the Phase 1b cell's own unmodified
+`dataset_staging.sync_missing_files()` over the same directories. That is the same
+safe/atomic persistence path vessel and lesion have always used: `_copy_one` writes a temp file,
+verifies its size, renames it into place, and retries transient Drive FUSE errors with backoff.
+Only files missing at the destination are copied, so existing vessel/lesion/reliability entries
+are never re-uploaded, rewritten or invalidated, and re-running after an interruption copies
+only what is still missing. Setting the flag `False` prints an explicit warning that the new
+entries are local-only.
+
+**Not changed.** `joint_training_dataset.py`, `racaf.py`,
+`local_feature_extraction_dataset.py`, `dataset_staging.py` — byte-identical. No separate RGB
+cache directory, no change to RGB generation, Stage 02's processing, the resize, Stage 03/04,
+RACAF, the split, CORN, loss, QWK, optimizer, batch size, epochs, `Trainer`, or experiment
+semantics. The training-time path (`_build_joint_sample`) still never writes to the persistent
+cache, in either the local-hit or the persistent-hit-mirrored-down state.
+
+**Known limit, stated rather than hidden.** The flush is end-of-run. If Phase 1 is interrupted
+partway (a Colab disconnect), nothing has been persisted yet — but Phase 1 is resumable and
+`sync_missing_files()` is incremental, so re-running the Phase 1b cell after a partial run
+persists whatever was completed. A mid-run periodic flush was deliberately not added: pushing
+thousands of small files to Drive in bursts is the load shape that caused §35's
+`OSError: [Errno 107] Transport endpoint is not connected`.
+
+**Regression tests.** `CanonicalRGBDrivePersistenceLifecycleTests` (8 tests,
+`tests/test_joint_training.py`) covers the lifecycle across two simulated runtimes with a flush
+in between: rgb missing from a legacy Drive cache is computed locally then flushed; it lands at
+`APTOS_<id>_rgb_512x512.npy` in the same directory as vessel/lesion; a second fresh runtime finds
+it and calls neither `_resize_rgb_01` nor `_load_raw_bgr` nor `predict_vessel_mask`; the
+following flush then reports nothing new; every pre-existing Drive entry stays byte- and
+mtime-identical; `_build_joint_sample` writes nothing to either persistent directory in either
+cache state; the round-tripped rgb is bitwise identical to a fresh generation on both the Drive
+copy and the local mirror; and the resulting `stage5_input`/`stage6_input`/`reliability` are
+unchanged versus a live build.
