@@ -1,0 +1,881 @@
+"""
+MEASUREMENT-ONLY profiler for the joint Stage 05-08 + RACAF TRAINING step
+(`joint_training_dataset.py` + `joint_training_model.py`). A sibling to
+`joint_cache_diagnostics.py`, which profiles Phase 1; this one profiles Phase 2 -- the actual
+per-batch training loop -- to answer one question from measurements rather than plausibility:
+when a step takes ~4s instead of ~2s, WHERE does the time go.
+
+Nothing here is imported by the pipeline: `joint_training_dataset.py`,
+`joint_training_model.py`, `training/`, `racaf.py` and every notebook training cell are unchanged
+and never import this module.
+
+Design -- the decisive experiment is separation, not a single number:
+
+  * PHASE C (input only) iterates the REAL `tf.data` pipeline with NO model attached. Its
+    throughput is the ceiling the input pipeline can sustain.
+  * PHASE D (compute only) runs the REAL model, loss and optimizer on ONE already-materialized
+    batch, reused, so no dataset work happens at all. Its throughput is the ceiling the GPU can
+    sustain.
+  * PHASE E (combined) runs both together, timing `next(iterator)` separately from the train
+    step, so input starvation is observed directly rather than inferred.
+
+  With `prefetch`, a healthy pipeline gives combined ~= max(input, compute). If combined is close
+  to input-only and much slower than compute-only, the input pipeline is the bottleneck; the
+  reverse means the GPU is. If combined is much worse than BOTH, the two are contending (CPU, RAM
+  or disk), which no single-phase measurement can reveal.
+
+Safety -- this must not perturb the run it is diagnosing:
+
+  * Model weights are snapshotted before and restored after, so the diagnostic's real gradient
+    steps leave the model numerically where they found it. The optimizer's own slot/iteration
+    state IS advanced, so rebuild + recompile the model before the real run (re-run the model
+    construction cell); the report says so explicitly.
+  * No `Trainer`, no callbacks, no `ModelCheckpoint`, no `TensorBoard`. Nothing is written to the
+    experiment directory, so the diagnostic never writes to Drive on its own account.
+  * Every filesystem operation the pipeline performs is recorded and classified local vs
+    persistent, and a tripwire reports any write to a persistent root.
+  * Cache files are read, never modified. A full local cache means the production path only
+    reads; the tripwire proves it rather than assuming it.
+"""
+
+import os
+import shutil
+import subprocess
+import threading
+import time
+
+import numpy as np
+import tensorflow as tf
+
+import joint_cache_diagnostics as jcd
+import joint_training_dataset as jtd
+
+DEFAULT_BATCHES = 30
+
+
+# =====================================================================
+# 1. Storage / mount survey
+# =====================================================================
+
+def _run(command, timeout=120):
+    """A shell command's stdout, or None. Never raises -- a survey must not abort the cell."""
+    try:
+        completed = subprocess.run(command, shell=True, capture_output=True, text=True,
+                                   timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    return completed.stdout.strip() or None
+
+
+def _statvfs_report(path):
+    try:
+        stats = os.statvfs(path)
+    except (OSError, AttributeError):
+        return None
+    return {
+        "total_bytes": stats.f_blocks * stats.f_frsize,
+        "free_bytes": stats.f_bavail * stats.f_frsize,
+        "used_bytes": (stats.f_blocks - stats.f_bfree) * stats.f_frsize,
+        "inodes_total": stats.f_files,
+        "inodes_free": stats.f_favail,
+        "inodes_used": (stats.f_files - stats.f_ffree) if stats.f_files else None,
+    }
+
+
+def survey_storage(paths, du_root="/content", du_depth=2):
+    """Free/used space, filesystem type and inode pressure for every interesting path, plus the
+    largest directories under `du_root`. `du` is bounded by `du_depth` and never descends into
+    `/content/drive` -- walking a Drive FUSE mount to size it would itself take minutes."""
+    report = {"paths": {}, "largest_dirs": None, "df": _run("df -h"), "du_root": du_root}
+    for label, path in paths.items():
+        entry = {
+            "path": path,
+            "exists": os.path.exists(path) if path else False,
+            "filesystem": jcd._filesystem_of(path) if path else None,
+            "statvfs": _statvfs_report(path) if path and os.path.exists(path) else None,
+            "size_bytes": None,
+            "file_count": None,
+        }
+        # Directory size via `du` (fast, one pass) -- skipped for the Drive mount.
+        if entry["exists"] and path and not path.rstrip("/").startswith("/content/drive"):
+            out = _run(f"du -sb {path!r} 2>/dev/null")
+            if out:
+                try:
+                    entry["size_bytes"] = int(out.split()[0])
+                except (ValueError, IndexError):
+                    pass
+            count = _run(f"find {path!r} -type f 2>/dev/null | wc -l")
+            if count:
+                try:
+                    entry["file_count"] = int(count.split()[0])
+                except (ValueError, IndexError):
+                    pass
+        report["paths"][label] = entry
+
+    if os.path.isdir(du_root):
+        report["largest_dirs"] = _run(
+            f"du -h --max-depth={du_depth} --exclude=/content/drive {du_root!r} 2>/dev/null "
+            "| sort -rh | head -25", timeout=300,
+        )
+    return report
+
+
+# =====================================================================
+# 2. GPU / CPU telemetry sampled DURING training (same process, no second cell)
+# =====================================================================
+
+class _TelemetrySampler:
+    """Samples nvidia-smi and psutil on a background thread while the measured loop runs in the
+    foreground. This is a subprocess of the training process, not a competing notebook cell, so it
+    observes the GPU while it is actually under load -- the gap a post-run nvidia-smi cannot fill."""
+
+    def __init__(self, interval=0.25):
+        self.interval = interval
+        self.gpu_util = []
+        self.gpu_mem_used_mb = []
+        self.gpu_mem_total_mb = None
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._stop = threading.Event()
+        self._thread = None
+        self._psutil = None
+        try:
+            import psutil
+            self._psutil = psutil
+        except ImportError:
+            pass
+
+    def _sample_gpu(self):
+        out = _run("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+                   "--format=csv,noheader,nounits", timeout=10)
+        if not out:
+            return
+        try:
+            util, used, total = (part.strip() for part in out.splitlines()[0].split(","))
+            self.gpu_util.append(float(util))
+            self.gpu_mem_used_mb.append(float(used))
+            self.gpu_mem_total_mb = float(total)
+        except (ValueError, IndexError):
+            pass
+
+    def _loop(self):
+        if self._psutil is not None:
+            self._psutil.cpu_percent(interval=None)  # prime the counter
+        while not self._stop.is_set():
+            self._sample_gpu()
+            if self._psutil is not None:
+                try:
+                    self.cpu_percent.append(self._psutil.cpu_percent(interval=None))
+                    self.ram_used_gb.append(self._psutil.virtual_memory().used / float(1024 ** 3))
+                except Exception:  # noqa: BLE001
+                    pass
+            self._stop.wait(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return self.summary()
+
+    def summary(self):
+        def stats(values):
+            if not values:
+                return None
+            return {"mean": sum(values) / len(values), "max": max(values), "min": min(values),
+                    "samples": len(values)}
+        return {
+            "gpu_util_percent": stats(self.gpu_util),
+            "gpu_mem_used_mb": stats(self.gpu_mem_used_mb),
+            "gpu_mem_total_mb": self.gpu_mem_total_mb,
+            "cpu_percent": stats(self.cpu_percent),
+            "ram_used_gb": stats(self.ram_used_gb),
+            "psutil_available": self._psutil is not None,
+        }
+
+
+def tf_gpu_memory():
+    try:
+        if not tf.config.list_physical_devices("GPU"):
+            return None
+        info = tf.config.experimental.get_memory_info("GPU:0")
+        return {"current_mb": info["current"] / (1024.0 ** 2),
+                "peak_mb": info.get("peak", 0) / (1024.0 ** 2)}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# =====================================================================
+# 3. Runtime configuration snapshot (for the previous-vs-current comparison)
+# =====================================================================
+
+def snapshot_configuration(model=None):
+    """Every runtime setting that could plausibly differ between two runs, read from the live
+    process rather than from what the notebook says it configured."""
+    snapshot = {
+        "tensorflow_version": tf.__version__,
+        "keras_version": getattr(tf.keras, "__version__", None),
+        "gpu_devices": [device.name for device in tf.config.list_physical_devices("GPU")],
+        "gpu_details": None,
+        "mixed_precision_policy": None,
+        "eager_execution": tf.executing_eagerly(),
+        "intra_op_threads": tf.config.threading.get_intra_op_parallelism_threads(),
+        "inter_op_threads": tf.config.threading.get_inter_op_parallelism_threads(),
+        "cpu_count": os.cpu_count(),
+        "memory_growth": None,
+        "tf_gpu_memory": tf_gpu_memory(),
+        "shuffle_buffer_size": jtd.DEFAULT_SHUFFLE_BUFFER_SIZE,
+        "stage5_image_size": jtd.STAGE5_IMAGE_SIZE,
+        "stage6_image_size": jtd.STAGE6_IMAGE_SIZE,
+        "env": {name: os.environ.get(name) for name in
+                ("TF_GPU_ALLOCATOR", "TF_FORCE_GPU_ALLOW_GROWTH", "XLA_FLAGS",
+                 "TF_XLA_FLAGS", "TF_ENABLE_ONEDNN_OPTS", "CUDA_VISIBLE_DEVICES")},
+    }
+    try:
+        snapshot["mixed_precision_policy"] = tf.keras.mixed_precision.global_policy().name
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        devices = tf.config.list_physical_devices("GPU")
+        if devices:
+            snapshot["gpu_details"] = tf.config.experimental.get_device_details(devices[0])
+            snapshot["memory_growth"] = tf.config.experimental.get_memory_growth(devices[0])
+    except Exception:  # noqa: BLE001
+        pass
+    snapshot["nvidia_smi"] = _run("nvidia-smi --query-gpu=name,driver_version,memory.total,"
+                                  "utilization.gpu --format=csv,noheader")
+
+    if model is not None:
+        try:
+            trainable = int(sum(np.prod(v.shape) for v in model.trainable_variables))
+            non_trainable = int(sum(np.prod(v.shape) for v in model.non_trainable_variables))
+            optimizer = getattr(model, "optimizer", None)
+            snapshot["model"] = {
+                "total_params": int(model.count_params()),
+                "trainable_params": trainable,
+                "non_trainable_params": non_trainable,
+                "num_trainable_tensors": len(model.trainable_variables),
+                "loss": getattr(getattr(model, "loss", None), "__name__", str(getattr(model, "loss", None))),
+                "optimizer": type(optimizer).__name__ if optimizer is not None else None,
+                "learning_rate": (float(tf.keras.backend.get_value(optimizer.learning_rate))
+                                  if optimizer is not None and hasattr(optimizer, "learning_rate") else None),
+                "jit_compile": getattr(model, "jit_compile", None),
+                "steps_per_execution": (int(tf.keras.backend.get_value(model.steps_per_execution))
+                                        if getattr(model, "steps_per_execution", None) is not None else None),
+                "dtype_policy": getattr(getattr(model, "dtype_policy", None), "name", None),
+            }
+        except Exception as error:  # noqa: BLE001
+            snapshot["model"] = {"error": repr(error)}
+    return snapshot
+
+
+# =====================================================================
+# 4. The three measurement phases
+# =====================================================================
+
+def _roots_for(cache_dir, racaf_cache_dir, persistent_cache_dir, persistent_racaf_cache_dir,
+               image_dir, drive_mount="/content/drive"):
+    return jcd._Roots([
+        ("local_cache", cache_dir, False),
+        ("local_racaf_cache", racaf_cache_dir, False),
+        ("staged_images", image_dir, False),
+        ("drive_cache", persistent_cache_dir, True),
+        ("drive_racaf_cache", persistent_racaf_cache_dir, True),
+        ("drive_mount", drive_mount, True),
+    ])
+
+
+def profile_input_only(dataset, roots, batches=DEFAULT_BATCHES):
+    """PHASE C -- the real tf.data pipeline with NO model attached. Every filesystem operation the
+    generator performs is recorded and attributed per artifact, so cache I/O is separated from the
+    rest of per-sample work rather than lumped into one 'input' figure."""
+    recorder = jcd._Recorder(roots)
+    telemetry = _TelemetrySampler().start()
+    per_batch = []
+    iterator = iter(dataset)
+    start_all = time.perf_counter()
+    with jcd._instrument(recorder):
+        # The first batch pays one-time costs (generator start, shuffle-buffer fill), so it is
+        # timed but reported separately rather than averaged into steady state.
+        for _ in range(batches):
+            start = time.perf_counter()
+            try:
+                next(iterator)
+            except StopIteration:
+                break
+            per_batch.append(time.perf_counter() - start)
+    total = time.perf_counter() - start_all
+    return {
+        "batches": len(per_batch),
+        "total_seconds": total,
+        "first_batch_seconds": per_batch[0] if per_batch else None,
+        "per_batch_seconds": per_batch,
+        "steady_mean_seconds": (sum(per_batch[1:]) / len(per_batch[1:])) if len(per_batch) > 1 else None,
+        "telemetry": telemetry.stop(),
+        "recorder": recorder,
+    }
+
+
+def profile_compute_only(model, batch, batches=DEFAULT_BATCHES):
+    """PHASE D -- the real model, loss and optimizer on ONE already-materialized batch, reused, so
+    zero dataset work happens. Weights are restored afterward.
+
+    Forward and backward are timed separately by running the forward pass alone first, then the
+    full taped step: backward is (taped step - forward), which is the only decomposition available
+    without a full TF profiler trace. On GPU this needs an explicit synchronization per timing
+    boundary, done by forcing a host read of a scalar derived from the result."""
+    (inputs, labels) = batch
+    saved_weights = model.get_weights()
+    optimizer = model.optimizer
+    loss_fn = model.loss
+
+    def sync(tensor):
+        # Forces the async GPU queue to drain, so the timing boundary is real.
+        return float(tf.reduce_sum(tf.cast(tensor, tf.float32)).numpy())
+
+    forward_times, step_times, apply_times = [], [], []
+    telemetry = _TelemetrySampler().start()
+    # Warm-up: first call builds/compiles the graph and autotunes cuDNN. Never averaged in.
+    warm_start = time.perf_counter()
+    with tf.GradientTape() as tape:
+        outputs = model(inputs, training=True)
+        loss = loss_fn(labels, outputs)
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    sync(outputs)
+    warmup_seconds = time.perf_counter() - warm_start
+
+    start_all = time.perf_counter()
+    for _ in range(batches):
+        start = time.perf_counter()
+        outputs = model(inputs, training=True)
+        sync(outputs)
+        forward_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        with tf.GradientTape() as tape:
+            outputs = model(inputs, training=True)
+            loss = loss_fn(labels, outputs)
+        grads = tape.gradient(loss, model.trainable_variables)
+        sync(grads[0])
+        step_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        sync(model.trainable_variables[0])
+        apply_times.append(time.perf_counter() - start)
+    total = time.perf_counter() - start_all
+    summary = telemetry.stop()
+    model.set_weights(saved_weights)  # leave the model numerically where we found it
+
+    def mean(values):
+        return sum(values) / len(values) if values else None
+    forward = mean(forward_times)
+    taped = mean(step_times)
+    return {
+        "batches": len(step_times),
+        "total_seconds": total,
+        "warmup_seconds": warmup_seconds,
+        "forward_seconds": forward,
+        "forward_and_backward_seconds": taped,
+        "backward_seconds": (taped - forward) if (taped is not None and forward is not None) else None,
+        "optimizer_seconds": mean(apply_times),
+        "per_step_seconds": (total / len(step_times)) if step_times else None,
+        "telemetry": summary,
+        "tf_gpu_memory": tf_gpu_memory(),
+    }
+
+
+def profile_combined(model, dataset, roots, batches=DEFAULT_BATCHES):
+    """PHASE E -- dataset and model together, the real training loop shape. `next(iterator)` is
+    timed separately from the train step, so input starvation is observed directly. Weights are
+    restored afterward."""
+    saved_weights = model.get_weights()
+    optimizer = model.optimizer
+    loss_fn = model.loss
+    recorder = jcd._Recorder(roots)
+    telemetry = _TelemetrySampler().start()
+
+    def sync(tensor):
+        return float(tf.reduce_sum(tf.cast(tensor, tf.float32)).numpy())
+
+    wait_times, compute_times, batch_times = [], [], []
+    iterator = iter(dataset)
+    start_all = time.perf_counter()
+    with jcd._instrument(recorder):
+        for _ in range(batches):
+            batch_start = time.perf_counter()
+            start = time.perf_counter()
+            try:
+                inputs, labels = next(iterator)
+            except StopIteration:
+                break
+            wait_times.append(time.perf_counter() - start)
+
+            start = time.perf_counter()
+            with tf.GradientTape() as tape:
+                outputs = model(inputs, training=True)
+                loss = loss_fn(labels, outputs)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            sync(outputs)
+            compute_times.append(time.perf_counter() - start)
+            batch_times.append(time.perf_counter() - batch_start)
+    total = time.perf_counter() - start_all
+    summary = telemetry.stop()
+    model.set_weights(saved_weights)
+
+    def mean(values, skip_first=True):
+        values = values[1:] if (skip_first and len(values) > 1) else values
+        return sum(values) / len(values) if values else None
+    return {
+        "batches": len(batch_times),
+        "total_seconds": total,
+        "first_batch_seconds": batch_times[0] if batch_times else None,
+        "input_wait_seconds": mean(wait_times),
+        "compute_seconds": mean(compute_times),
+        "batch_seconds": mean(batch_times),
+        "per_batch_seconds": batch_times,
+        "telemetry": summary,
+        "tf_gpu_memory": tf_gpu_memory(),
+        "recorder": recorder,
+    }
+
+
+# =====================================================================
+# 5. Per-artifact I/O breakdown from a recorder
+# =====================================================================
+
+def io_breakdown(recorder, batches, batch_size):
+    """Per-artifact I/O, normalized by the batches CONSUMED.
+
+    Caveat reported alongside the numbers rather than hidden: `prefetch(AUTOTUNE)` lets the
+    generator run ahead of the consumer, so the recorded operation counts cover every sample the
+    generator PRODUCED, which is generally more than `batches * batch_size`. `reads_per_sample`
+    below makes the discrepancy visible -- it should be ~4 (vessel, lesion, rgb, reliability) if
+    the counts and the batch total refer to the same samples, and higher when prefetch ran ahead.
+    The per-batch time figures are therefore an upper bound on what the consumed batches cost."""
+    samples = max(1, batches * batch_size)
+    breakdown = {}
+    for artifact in jcd.ARTIFACTS:
+        reads = recorder.matching(op="read", artifact=artifact)
+        breakdown[artifact] = {
+            "reads": len(reads),
+            "read_seconds": sum(op.seconds for op in reads),
+            "bytes": sum(op.nbytes for op in reads),
+            "drive_reads": recorder.count(op="read", artifact=artifact, is_persistent=True),
+            "local_reads": recorder.count(op="read", artifact=artifact, is_persistent=False),
+            "ms_per_sample": (sum(op.seconds for op in reads) / samples) * 1000.0,
+        }
+    all_reads = recorder.matching(op="read")
+    return {
+        "per_artifact": breakdown,
+        "totals": {
+            "local_stats": recorder.count(op="stat", is_persistent=False),
+            "drive_stats": recorder.count(op="stat", is_persistent=True),
+            "local_reads": recorder.count(op="read", is_persistent=False),
+            "drive_reads": recorder.count(op="read", is_persistent=True),
+            "local_writes": recorder.count(op="write", is_persistent=False),
+            "drive_writes": recorder.count(op="write", is_persistent=True),
+            "cache_read_seconds": sum(op.seconds for op in all_reads),
+            "bytes_read": sum(op.nbytes for op in all_reads),
+            "bytes_per_batch": sum(op.nbytes for op in all_reads) / max(1, batches),
+            "reads_per_sample": recorder.count(op="read") / float(samples),
+            "raw_image_loads": recorder.call_count("lfed._load_raw_bgr"),
+            "raw_image_seconds": recorder.call_seconds("lfed._load_raw_bgr"),
+            "stage02_calls": recorder.call_count("lfed._resolve_processed_rgb"),
+            "rgb_recomputations": recorder.call_count("_resize_rgb_01"),
+            "vessel_recomputations": recorder.call_count("predict_vessel_mask"),
+            "lesion_recomputations": recorder.call_count("racaf.tta_views"),
+        },
+        "drive_paths_touched": sorted({op.path for op in recorder.matching(is_persistent=True)}),
+        "drive_write_paths": [op.path for op in recorder.matching(op="write", is_persistent=True)],
+    }
+
+
+def measure_augmentation_cost(cache_dir, racaf_cache_dir, image_dir, entries, image_size,
+                              vessel_model, stage4_model, repeats=10):
+    """Augmentation and the Stage 06 resize, timed on their own against real cached samples --
+    the part of per-sample cost that is pure CPU rather than I/O. Read-only."""
+    import local_feature_extraction_dataset as lfed
+    rng = np.random.default_rng(0)
+    build_times, augment_times, resize_times = [], [], []
+    for id_code, diagnosis in list(entries)[:repeats]:
+        start = time.perf_counter()
+        try:
+            sample = jtd._build_joint_sample(
+                id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir,
+                vessel_model, stage4_model, False, None, image_size=image_size,
+            )
+        except Exception:  # noqa: BLE001 -- e.g. an empty-FOV image; skip it
+            continue
+        build_times.append(time.perf_counter() - start)
+
+        tensor = sample["stage5_input"]
+        start = time.perf_counter()
+        lfed._augment_spatial(np.array(tensor, copy=True), rng)
+        augment_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        lfed._resize_input(tensor[..., :3], jtd.STAGE6_IMAGE_SIZE)
+        resize_times.append(time.perf_counter() - start)
+
+    def mean(values):
+        return (sum(values) / len(values)) if values else None
+    return {
+        "samples": len(build_times),
+        "build_joint_sample_seconds": mean(build_times),
+        "augment_spatial_seconds": mean(augment_times),
+        "stage6_resize_seconds": mean(resize_times),
+    }
+
+
+# =====================================================================
+# 6. Orchestration
+# =====================================================================
+
+def run_profile(model, train_ds, cache_dir, racaf_cache_dir, image_dir,
+                persistent_cache_dir=None, persistent_racaf_cache_dir=None,
+                batch_size=2, batches=DEFAULT_BATCHES, entries=None,
+                vessel_model=None, stage4_model=None, image_size=None,
+                drive_mount="/content/drive", extra_paths=None):
+    """Runs the storage survey, the configuration snapshot and all three measurement phases, and
+    returns a plain-dict report (`print_report` renders it).
+
+    `train_ds` must be the REAL training dataset the run uses, and `model` the REAL compiled joint
+    model; its weights are restored after every phase that takes gradient steps."""
+    image_size = image_size if image_size is not None else jtd.STAGE5_IMAGE_SIZE
+    paths = {
+        "/content": "/content",
+        "local_cache": cache_dir,
+        "local_racaf_cache": racaf_cache_dir,
+        "staged_datasets": "/content/datasets",
+        "staged_images": image_dir,
+        "repo": "/content/diabetic_retinoplasty",
+        "drive_mount": drive_mount,
+        "persistent_cache": persistent_cache_dir,
+        "persistent_racaf_cache": persistent_racaf_cache_dir,
+        "tmp": "/tmp",
+        "root": "/",
+    }
+    if extra_paths:
+        paths.update(extra_paths)
+
+    report = {"batch_size": batch_size, "requested_batches": batches}
+    print("[1/5] storage survey ...")
+    report["storage"] = survey_storage(paths)
+    print("[2/5] configuration snapshot ...")
+    report["config"] = snapshot_configuration(model)
+
+    roots = _roots_for(cache_dir, racaf_cache_dir, persistent_cache_dir,
+                       persistent_racaf_cache_dir, image_dir, drive_mount)
+
+    print("[3/5] PHASE C -- input pipeline only, no model ...")
+    input_only = profile_input_only(train_ds, roots, batches=batches)
+    report["input_only"] = {k: v for k, v in input_only.items() if k != "recorder"}
+    report["input_io"] = io_breakdown(input_only["recorder"], input_only["batches"], batch_size)
+
+    print("[4/5] PHASE D -- model compute only, one reused batch ...")
+    warm_batch = None
+    for batch in train_ds.take(1):
+        warm_batch = batch
+    if warm_batch is None:
+        report["compute_only"] = {"error": "could not materialize a batch from train_ds"}
+    else:
+        report["compute_only"] = profile_compute_only(model, warm_batch, batches=batches)
+
+    print("[5/5] PHASE E -- combined dataset + train step ...")
+    combined = profile_combined(model, train_ds, roots, batches=batches)
+    report["combined"] = {k: v for k, v in combined.items() if k != "recorder"}
+    report["combined_io"] = io_breakdown(combined["recorder"], combined["batches"], batch_size)
+
+    if entries is not None and vessel_model is not None and stage4_model is not None:
+        print("      per-sample CPU breakdown (augmentation / resize) ...")
+        report["cpu_breakdown"] = measure_augmentation_cost(
+            cache_dir, racaf_cache_dir, image_dir, entries, image_size,
+            vessel_model, stage4_model,
+        )
+    report["classification"] = classify(report)
+    return report
+
+
+def classify(report):
+    """A/B/C/D/E/F/G/H, from the measurements only. Every verdict carries its numbers."""
+    verdicts, evidence = [], []
+    combined = report.get("combined") or {}
+    compute = report.get("compute_only") or {}
+    input_only = report.get("input_only") or {}
+    totals = (report.get("combined_io") or {}).get("totals", {})
+
+    batch = combined.get("batch_seconds")
+    wait = combined.get("input_wait_seconds")
+    step = combined.get("compute_seconds")
+    input_ceiling = input_only.get("steady_mean_seconds")
+    compute_ceiling = compute.get("per_step_seconds")
+
+    if batch and wait is not None and step is not None:
+        evidence.append(
+            "combined batch %.0f ms = input wait %.0f ms (%.0f%%) + train step %.0f ms (%.0f%%)"
+            % (batch * 1000, wait * 1000, 100 * wait / batch, step * 1000, 100 * step / batch))
+    if input_ceiling:
+        evidence.append("input-only ceiling %.0f ms/batch" % (input_ceiling * 1000))
+    if compute_ceiling:
+        evidence.append("compute-only ceiling %.0f ms/step" % (compute_ceiling * 1000))
+
+    gpu = (combined.get("telemetry") or {}).get("gpu_util_percent")
+    if gpu:
+        evidence.append("GPU utilization during the combined loop: mean %.0f%%, max %.0f%% over "
+                        "%d samples" % (gpu["mean"], gpu["max"], gpu["samples"]))
+    cpu = (combined.get("telemetry") or {}).get("cpu_percent")
+    if cpu:
+        evidence.append("CPU utilization: mean %.0f%%, max %.0f%%" % (cpu["mean"], cpu["max"]))
+
+    if totals.get("drive_reads") or totals.get("drive_stats") or totals.get("drive_writes"):
+        verdicts.append(("C. DRIVE I/O",
+                         "the training loop touched Drive: %d stat(s), %d read(s), %d write(s)"
+                         % (totals.get("drive_stats", 0), totals.get("drive_reads", 0),
+                            totals.get("drive_writes", 0))))
+    else:
+        evidence.append("zero Drive stats, reads and writes during the combined training loop")
+
+    if batch and wait is not None and step is not None:
+        if wait > step:
+            verdicts.append(("B. INPUT PIPELINE",
+                             "input wait (%.0f ms) exceeds train step (%.0f ms): the GPU is "
+                             "waiting for data" % (wait * 1000, step * 1000)))
+        elif step > wait * 2:
+            verdicts.append(("A. GPU COMPUTE",
+                             "train step (%.0f ms) dominates input wait (%.0f ms): the pipeline "
+                             "keeps up" % (step * 1000, wait * 1000)))
+
+    cache_seconds = totals.get("cache_read_seconds")
+    if cache_seconds is not None and combined.get("total_seconds"):
+        share = 100.0 * cache_seconds / max(1e-9, combined["total_seconds"])
+        evidence.append("cache file reads took %.2fs = %.1f%% of the combined loop's wall clock; "
+                        "%.1f MB read per batch"
+                        % (cache_seconds, share, totals.get("bytes_per_batch", 0) / 1e6))
+        if share >= 25.0:
+            verdicts.append(("D. LOCAL SSD I/O",
+                             "cache reads alone are %.0f%% of training wall clock" % share))
+
+    cpu_break = report.get("cpu_breakdown") or {}
+    if cpu_break.get("build_joint_sample_seconds"):
+        evidence.append("_build_joint_sample %.0f ms/sample -> %.0f ms/batch at batch_size=%d"
+                        % (cpu_break["build_joint_sample_seconds"] * 1000,
+                           cpu_break["build_joint_sample_seconds"] * 1000 * report["batch_size"],
+                           report["batch_size"]))
+
+    content = (report.get("storage") or {}).get("paths", {}).get("/content", {})
+    vfs = content.get("statvfs")
+    if vfs and vfs["total_bytes"]:
+        free_gib = vfs["free_bytes"] / float(1024 ** 3)
+        pct_used = 100.0 * (1 - vfs["free_bytes"] / float(vfs["total_bytes"]))
+        evidence.append("/content %.0f%% full, %.1f GiB free" % (pct_used, free_gib))
+        if free_gib < 5.0:
+            verdicts.append(("F. STORAGE PRESSURE", "only %.1f GiB free on /content" % free_gib))
+        if vfs.get("inodes_total") and vfs.get("inodes_free") is not None:
+            inode_pct = 100.0 * (1 - vfs["inodes_free"] / float(vfs["inodes_total"]))
+            evidence.append("inode usage %.1f%%" % inode_pct)
+            if inode_pct > 90.0:
+                verdicts.append(("F. STORAGE PRESSURE", "inode usage %.0f%%" % inode_pct))
+
+    if batch and input_ceiling and compute_ceiling:
+        ceiling = max(input_ceiling, compute_ceiling)
+        if batch > ceiling * 1.35:
+            verdicts.append(("H. MIXED / CONTENTION",
+                             "combined %.0f ms/batch is %.2fx the slower of the two isolated "
+                             "ceilings (%.0f ms) -- the phases contend rather than overlap"
+                             % (batch * 1000, batch / ceiling, ceiling * 1000)))
+    return {"verdicts": verdicts, "evidence": evidence}
+
+
+# =====================================================================
+# 7. Rendering
+# =====================================================================
+
+def _ms(seconds):
+    return "n/a" if seconds is None else "%.1f ms" % (seconds * 1000.0)
+
+
+def _gib(num_bytes):
+    return "n/a" if num_bytes is None else "%.2f GiB" % (num_bytes / float(1024 ** 3))
+
+
+def print_report(report):
+    line = "=" * 78
+    print(line)
+    print("JOINT TRAINING STEP PROFILE -- MEASUREMENT ONLY (no Trainer, no callbacks, no fit)")
+    print(line)
+    print("batch_size=%d, batches per phase=%d" % (report["batch_size"], report["requested_batches"]))
+
+    # --- A. environment / storage -------------------------------------
+    print("")
+    print("A. ENVIRONMENT AND STORAGE")
+    print("-" * 78)
+    print("%-22s %10s %10s %10s  %-12s %s" % ("path", "size", "free", "files", "fstype", "location"))
+    for label, entry in report["storage"]["paths"].items():
+        if not entry["exists"]:
+            print("%-22s %10s" % (label, "ABSENT"))
+            continue
+        filesystem = entry["filesystem"]
+        vfs = entry["statvfs"]
+        print("%-22s %10s %10s %10s  %-12s %s" % (
+            label,
+            _gib(entry["size_bytes"]) if entry["size_bytes"] is not None else "-",
+            _gib(vfs["free_bytes"]) if vfs else "-",
+            entry["file_count"] if entry["file_count"] is not None else "-",
+            filesystem["fstype"] if filesystem else "?",
+            entry["path"]))
+    if report["storage"].get("df"):
+        print("")
+        print("df -h:")
+        print(report["storage"]["df"])
+    if report["storage"].get("largest_dirs"):
+        print("")
+        print("largest directories under /content (Drive excluded):")
+        print(report["storage"]["largest_dirs"])
+
+    # --- B. configuration ---------------------------------------------
+    print("")
+    print("B. RUNTIME CONFIGURATION (read from the live process)")
+    print("-" * 78)
+    config = report["config"]
+    for key in ("tensorflow_version", "keras_version", "gpu_devices", "mixed_precision_policy",
+                "eager_execution", "intra_op_threads", "inter_op_threads", "cpu_count",
+                "memory_growth", "shuffle_buffer_size", "nvidia_smi"):
+        print("  %-24s %s" % (key + ":", config.get(key)))
+    if config.get("gpu_details"):
+        print("  %-24s %s" % ("gpu_details:", config["gpu_details"]))
+    if config.get("tf_gpu_memory"):
+        print("  %-24s current %.0f MB, peak %.0f MB" % (
+            "tf_gpu_memory:", config["tf_gpu_memory"]["current_mb"],
+            config["tf_gpu_memory"]["peak_mb"]))
+    print("  env: %s" % {k: v for k, v in config.get("env", {}).items() if v is not None})
+    if config.get("model"):
+        print("  model:")
+        for key, value in config["model"].items():
+            print("      %-20s %s" % (key + ":", value))
+
+    # --- C. the metric table -------------------------------------------
+    combined = report.get("combined") or {}
+    compute = report.get("compute_only") or {}
+    input_only = report.get("input_only") or {}
+    totals = (report.get("combined_io") or {}).get("totals", {})
+    per_artifact = (report.get("combined_io") or {}).get("per_artifact", {})
+    cpu_break = report.get("cpu_breakdown") or {}
+    batch_size = report["batch_size"]
+
+    def artifact_ms(name):
+        entry = per_artifact.get(name)
+        return None if not entry else entry["read_seconds"] / max(1, combined.get("batches", 1))
+
+    telemetry = combined.get("telemetry") or {}
+    gpu_util = telemetry.get("gpu_util_percent")
+    gpu_mem = telemetry.get("gpu_mem_used_mb")
+    cpu_util = telemetry.get("cpu_percent")
+    content_vfs = (report["storage"]["paths"].get("/content") or {}).get("statvfs")
+
+    print("")
+    print("C. PER-BATCH PROFILE (combined loop -- the real training shape)")
+    print("-" * 78)
+    print("%-30s %s" % ("METRIC", "RESULT"))
+    print("-" * 78)
+    rows = [
+        ("batch wall time", _ms(combined.get("batch_seconds"))),
+        ("input wait", _ms(combined.get("input_wait_seconds"))),
+        ("train step (fwd+bwd+opt)", _ms(combined.get("compute_seconds"))),
+        ("_build_joint_sample (per sample)", _ms(cpu_break.get("build_joint_sample_seconds"))),
+        ("cache I/O (per batch)", _ms(totals.get("cache_read_seconds", 0) / max(1, combined.get("batches", 1)))),
+        ("  vessel I/O", _ms(artifact_ms("vessel"))),
+        ("  lesion I/O", _ms(artifact_ms("lesion"))),
+        ("  RGB I/O", _ms(artifact_ms("rgb"))),
+        ("  RACAF reliability I/O", _ms(artifact_ms("reliability"))),
+        ("augmentation (per sample)", _ms(cpu_break.get("augment_spatial_seconds"))),
+        ("stage6 resize (per sample)", _ms(cpu_break.get("stage6_resize_seconds"))),
+        ("forward pass", _ms(compute.get("forward_seconds"))),
+        ("backward pass", _ms(compute.get("backward_seconds"))),
+        ("optimizer step", _ms(compute.get("optimizer_seconds"))),
+        ("", ""),
+        ("input-only ceiling /batch", _ms(input_only.get("steady_mean_seconds"))),
+        ("compute-only ceiling /step", _ms(compute.get("per_step_seconds"))),
+        ("first batch (one-time cost)", _ms(combined.get("first_batch_seconds"))),
+        ("graph warm-up (one-time)", _ms(compute.get("warmup_seconds"))),
+        ("", ""),
+        ("Drive reads", totals.get("drive_reads")),
+        ("Drive stats", totals.get("drive_stats")),
+        ("Drive writes", totals.get("drive_writes")),
+        ("local reads", totals.get("local_reads")),
+        ("local writes", totals.get("local_writes")),
+        ("bytes read per batch", "%.1f MB" % (totals.get("bytes_per_batch", 0) / 1e6)),
+        ("reads per sample", "%.1f  (4.0 = exactly one read of each artifact; higher means "
+                             "prefetch ran ahead of the consumed batches)"
+                             % totals.get("reads_per_sample", 0)),
+        ("raw image loads", totals.get("raw_image_loads")),
+        ("cache recomputations (rgb)", totals.get("rgb_recomputations")),
+        ("cache recomputations (vessel)", totals.get("vessel_recomputations")),
+        ("cache recomputations (lesion)", totals.get("lesion_recomputations")),
+        ("", ""),
+        ("GPU utilization", "mean %.0f%%, max %.0f%%" % (gpu_util["mean"], gpu_util["max"]) if gpu_util else "n/a"),
+        ("GPU memory used", "%.2f GiB / %.2f GiB" % (gpu_mem["mean"] / 1024.0, (telemetry.get("gpu_mem_total_mb") or 0) / 1024.0) if gpu_mem else "n/a"),
+        ("TF GPU memory (cur/peak)", "%.0f / %.0f MB" % (combined["tf_gpu_memory"]["current_mb"], combined["tf_gpu_memory"]["peak_mb"]) if combined.get("tf_gpu_memory") else "n/a"),
+        ("CPU utilization", "mean %.0f%%, max %.0f%%" % (cpu_util["mean"], cpu_util["max"]) if cpu_util else "n/a"),
+        ("RAM used", "%.1f GiB" % telemetry["ram_used_gb"]["max"] if telemetry.get("ram_used_gb") else "n/a"),
+        ("disk free (/content)", _gib(content_vfs["free_bytes"]) if content_vfs else "n/a"),
+    ]
+    for label, value in rows:
+        if label == "":
+            print("")
+        else:
+            print("%-30s %s" % (label, value))
+
+    # --- extrapolation --------------------------------------------------
+    if combined.get("batch_seconds"):
+        print("")
+        print("Extrapolated from the measured steady-state batch time:")
+        print("  %.2f s/step x 1461 steps = %.0f s/epoch (%.2f h)" % (
+            combined["batch_seconds"], combined["batch_seconds"] * 1461,
+            combined["batch_seconds"] * 1461 / 3600.0))
+        print("  (train steps only -- excludes validation, checkpointing and TensorBoard, none of")
+        print("   which this diagnostic runs)")
+
+    # --- D. Drive evidence -----------------------------------------------
+    print("")
+    print("D. DRIVE ACCESS EVIDENCE")
+    print("-" * 78)
+    drive_paths = (report.get("combined_io") or {}).get("drive_paths_touched") or []
+    if not drive_paths:
+        print("  No path under any persistent root was stat'ed, read or written during the")
+        print("  combined training loop. Training is reading local SSD only.")
+    else:
+        print("  %d distinct Drive path(s) touched during training:" % len(drive_paths))
+        for path in drive_paths[:25]:
+            print("    %s" % path)
+    writes = (report.get("combined_io") or {}).get("drive_write_paths") or []
+    print("  Drive WRITE tripwire: %s" % ("PASS -- none" if not writes else "FAILED: %s" % writes))
+
+    # --- E. classification -----------------------------------------------
+    print("")
+    print("E. CLASSIFICATION (from measurements only)")
+    print("-" * 78)
+    classification = report.get("classification") or {}
+    print("Evidence:")
+    for item in classification.get("evidence", []):
+        print("  - %s" % item)
+    print("")
+    print("Verdict(s):")
+    if not classification.get("verdicts"):
+        print("  none triggered -- no single component crossed its threshold; read the table above")
+    for name, why in classification["verdicts"]:
+        print("  %s" % name)
+        print("      %s" % why)
+    print("")
+    print("This reports what was measured. It does not name a root cause on its own.")
+    print("")
+    print("NOTE: this diagnostic took real gradient steps. Model weights were snapshotted and")
+    print("restored, but the optimizer's slot/iteration state was advanced -- rebuild and")
+    print("recompile the model (re-run the model construction cell) before the real training run.")
