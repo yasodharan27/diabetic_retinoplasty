@@ -17,13 +17,16 @@ not an instrumented variant of it.
 """
 
 import csv
+import errno
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
+import tensorflow as tf
 from PIL import Image
 
 import joint_cache_diagnostics as jcd
@@ -724,3 +727,111 @@ class NoPipelineDependencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfilerPreflightAndFailureClassificationTests(_DiagnosticTestBase):
+    """§41: the profiler must diagnose its own Phase C failure rather than surfacing an opaque
+    TensorFlow wrapper, and must know BEFORE measuring whether the local cache is complete for the
+    entries it is about to iterate."""
+
+    def test_preflight_reports_a_complete_local_cache_as_needing_no_drive(self):
+        import joint_training_profiler as jtp
+        self.run_phase1(self.tree.pairs)
+        audit = jtp.preflight_cache_audit(
+            self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir, CANONICAL_SIZE,
+            persistent_cache_dir=self.tree.drive_cache_dir,
+            persistent_racaf_cache_dir=self.tree.drive_racaf_cache_dir)
+        self.assertEqual(audit["fully_local"], len(self.tree.pairs))
+        self.assertEqual(audit["would_read_drive"], 0)
+        self.assertEqual(audit["missing_everywhere"], 0)
+        self.assertFalse(audit["drive_unreachable"])
+
+    def test_preflight_counts_entries_that_would_fall_back_to_drive(self):
+        """The condition that actually caused the reported Phase C failure: entries whose LOCAL
+        artifact is missing, so the pipeline correctly reads Drive for each one."""
+        import joint_training_profiler as jtp
+        self.run_phase1(self.tree.pairs, cache_dir=self.tree.drive_cache_dir,
+                        racaf_cache_dir=self.tree.drive_racaf_cache_dir)
+        audit = jtp.preflight_cache_audit(
+            self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir, CANONICAL_SIZE,
+            persistent_cache_dir=self.tree.drive_cache_dir,
+            persistent_racaf_cache_dir=self.tree.drive_racaf_cache_dir)
+        self.assertEqual(audit["fully_local"], 0)
+        self.assertEqual(audit["would_read_drive"], len(self.tree.pairs))
+        self.assertTrue(audit["examples_needing_drive"])
+        self.assertEqual(audit["per_artifact_local_missing"]["lesion"], len(self.tree.pairs))
+
+    def test_preflight_reports_entries_missing_from_both_locations(self):
+        import joint_training_profiler as jtp
+        audit = jtp.preflight_cache_audit(
+            self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir, CANONICAL_SIZE,
+            persistent_cache_dir=self.tree.drive_cache_dir,
+            persistent_racaf_cache_dir=self.tree.drive_racaf_cache_dir)
+        self.assertEqual(audit["missing_everywhere"], len(self.tree.pairs))
+        self.assertEqual(audit["would_read_drive"], 0)
+
+    def test_preflight_stops_immediately_when_drive_is_unreachable(self):
+        """It must not hammer a mount that has already failed once."""
+        import joint_training_profiler as jtp
+        with mock.patch.object(
+                jtd, "_persistent_exists",
+                side_effect=jtd.PersistentCacheUnavailableError(
+                    "lesion", "x", "/drive/x.npy",
+                    OSError(errno.ENOTCONN, "Transport endpoint is not connected"))):
+            audit = jtp.preflight_cache_audit(
+                self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir, CANONICAL_SIZE,
+                persistent_cache_dir=self.tree.drive_cache_dir,
+                persistent_racaf_cache_dir=self.tree.drive_racaf_cache_dir)
+        self.assertTrue(audit["drive_unreachable"])
+        self.assertIn("Transport endpoint", audit["drive_error"])
+
+    def test_preflight_probes_are_not_counted_as_pipeline_operations(self):
+        import joint_training_profiler as jtp
+        self.run_phase1(self.tree.pairs)
+        audit = jtp.preflight_cache_audit(
+            self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir, CANONICAL_SIZE)
+        self.assertEqual(audit["probe_count"], 4 * len(self.tree.pairs))
+
+    # --- failure classification ------------------------------------------
+    def test_a_tf_wrapped_drive_failure_is_classified_as_a_drive_problem(self):
+        import joint_training_profiler as jtp
+        cause = jtd.PersistentCacheUnavailableError(
+            "lesion", "abc123", "/content/drive/x/APTOS_abc123_lesion_512x512.npy",
+            OSError(errno.ENOTCONN, "Transport endpoint is not connected"),
+            local_path="/content/cache/x.npy", local_exists=False)
+        wrapped = tf.errors.UnknownError(None, None, "IteratorGetNext ... blah")
+        wrapped.__cause__ = cause
+        described = jtp.describe_pipeline_failure(wrapped)
+        self.assertEqual(described["category"], "DRIVE_FUSE")
+        self.assertEqual(described["artifact"], "lesion")
+        self.assertEqual(described["id_code"], "abc123")
+        self.assertEqual(described["errno"], errno.ENOTCONN)
+
+    def test_a_wrapped_corrupt_file_is_classified_as_a_corrupt_cache(self):
+        import joint_training_profiler as jtp
+        cause = jtd.CorruptCacheFileError("lesion", "abc123", "/content/drive/x.npy",
+                                          "short read", persistent=True)
+        wrapped = tf.errors.UnknownError(None, None, "IteratorGetNext")
+        wrapped.__cause__ = cause
+        described = jtp.describe_pipeline_failure(wrapped)
+        self.assertEqual(described["category"], "CORRUPT_CACHE")
+        self.assertEqual(described["artifact"], "lesion")
+        self.assertTrue(described["persistent"])
+
+    def test_an_untyped_errno_107_message_is_still_recognized(self):
+        """The exact string the first Phase C attempt produced, with no typed cause attached."""
+        import joint_training_profiler as jtp
+        described = jtp.describe_pipeline_failure(
+            RuntimeError("OSError: [Errno 107] Transport endpoint is not connected"))
+        self.assertEqual(described["category"], "DRIVE_FUSE")
+
+    def test_an_untyped_reshape_message_is_recognized_as_a_truncated_read(self):
+        import joint_training_profiler as jtp
+        described = jtp.describe_pipeline_failure(
+            ValueError("cannot reshape array of size 99296 into shape (512,512,4)"))
+        self.assertEqual(described["category"], "CORRUPT_CACHE")
+
+    def test_an_unrelated_error_is_not_misclassified(self):
+        import joint_training_profiler as jtp
+        described = jtp.describe_pipeline_failure(RuntimeError("something else entirely"))
+        self.assertEqual(described["category"], "UNKNOWN")

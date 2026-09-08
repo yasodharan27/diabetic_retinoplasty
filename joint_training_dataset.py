@@ -163,6 +163,7 @@ proven safe for vessel/lesion/reliability across §35-§37 -- so RGB now follows
 already-tested pattern instead of a bespoke local-only one.
 """
 
+import errno
 import logging
 import os
 import time
@@ -233,13 +234,187 @@ def _resize_rgb_01(rgb_native_uint8, image_size):
 # before (module docstring, §38): every `_build_joint_sample` call paid `_resize_rgb_01`'s cost
 # fresh, regardless of vessel/lesion/reliability cache status. ---
 
+# --- Persistent (Drive/FUSE) cache access safety -- §41 ---------------------------------------
+#
+# `os.path.exists()` returns False for EVERY `OSError`, not just `ENOENT` (see `genericpath.exists`).
+# On a Drive FUSE mount that has dropped (`OSError: [Errno 107] Transport endpoint is not
+# connected`) that makes "the mount is down" indistinguishable from "this image was never cached"
+# -- and the caller then falls through to its compute-fresh branch, silently re-running frozen
+# Stage 03 + Stage 04 for an image whose cache entry exists and is merely unreachable. That is the
+# single most expensive possible reaction to a transient mount hiccup, so persistent-path checks
+# go through `_persistent_exists()` below, which tells the two cases apart.
+#
+# Mirrors `colab/common/dataset_staging.py`'s own `_TRANSIENT_ERRNOS` set and its bounded-retry
+# convention (that module cannot be imported from here -- it lives on the Colab-only path -- so
+# the small set is restated rather than depended on).
+
+_TRANSIENT_FUSE_ERRNOS = frozenset({errno.ENOTCONN, errno.ESTALE, errno.ETIMEDOUT, errno.EIO})
+_PERSISTENT_READ_ATTEMPTS = 3
+_PERSISTENT_RETRY_BASE_DELAY_SECONDS = 0.25  # 0.25 + 0.5 = 0.75s worst case, deliberately bounded
+
+
+class PersistentCacheUnavailableError(RuntimeError):
+    """A persistent (Drive) cache entry could not be checked or read because the mount itself
+    failed -- NOT because the entry is absent. Raised rather than swallowed so the caller fails
+    loudly instead of silently recomputing a frozen Stage 03/04/RACAF artifact that already
+    exists."""
+
+    def __init__(self, artifact, id_code, path, os_error, local_path=None, local_exists=None):
+        self.artifact = artifact
+        self.id_code = id_code
+        self.path = path
+        self.os_error = os_error
+        self.errno = getattr(os_error, "errno", None)
+        self.local_path = local_path
+        self.local_exists = local_exists
+        super().__init__(
+            "Persistent cache unavailable for artifact=%s image_id=%s: %s (errno=%s) at %s. "
+            "Local cache %s. No recomputation was attempted -- the frozen artifact very likely "
+            "still exists on Drive and is merely unreachable; re-mount Drive and retry rather "
+            "than regenerating it."
+            % (artifact, id_code, os_error, self.errno, path,
+               ("exists at " + str(local_path)) if local_exists
+               else ("is ALSO missing at " + str(local_path)))
+        )
+
+
+class CorruptCacheFileError(RuntimeError):
+    """A cache file was reachable but its contents could not be used -- a truncated/partial read
+    (the classic FUSE symptom, surfacing from NumPy as `cannot reshape array of size N into shape
+    (...)`), or an array whose shape/dtype does not match what this cache kind must hold. Never
+    triggers deletion or regeneration; the file is reported so a human can decide."""
+
+    def __init__(self, artifact, id_code, path, detail, persistent=False):
+        self.artifact = artifact
+        self.id_code = id_code
+        self.path = path
+        self.detail = detail
+        self.persistent = persistent
+        super().__init__(
+            "Corrupt or unreadable %s cache file for artifact=%s image_id=%s at %s: %s. The file "
+            "was NOT deleted or regenerated -- inspect it and, if it is genuinely truncated, "
+            "remove just that one entry so the next Phase 1 run rebuilds it."
+            % ("persistent" if persistent else "local", artifact, id_code, path, detail)
+        )
+
+
+def _persistent_exists(path, artifact=None, id_code=None, local_path=None, local_exists=None):
+    """`os.path.exists()` for a persistent path, but distinguishing "absent" from "unreachable".
+
+    Returns `False` only for a real `ENOENT`/`ENOTDIR`. A transient FUSE errno raises
+    `PersistentCacheUnavailableError`; any other `OSError` raises it too, since guessing is what
+    causes the expensive recomputation this exists to prevent."""
+    try:
+        os.stat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError:
+        return False
+    except OSError as error:
+        raise PersistentCacheUnavailableError(
+            artifact, id_code, path, error, local_path=local_path, local_exists=local_exists,
+        ) from error
+
+
+def _expected_cache_shape(artifact, image_size):
+    """The shape each `.npy` cache kind must hold, or `None` where it is not fixed. Used for a
+    FREE post-load validation -- the array is already in memory, so this costs one tuple compare
+    and catches a truncated read that NumPy would otherwise surface as an opaque reshape error."""
+    return {
+        "vessel": (*image_size, 1),
+        "lesion": (*image_size, 4),
+        "rgb": (*image_size, 3),
+    }.get(artifact)
+
+
+def _validate_cached_array(array, artifact, id_code, path, image_size, persistent):
+    if artifact == "reliability":
+        # An `.npz`, and `np.load` on one is LAZY -- members are read on first access. Touching
+        # `kappa` here forces that read inside the caller's guarded block, so a truncated
+        # reliability file is reported as a corrupt cache entry rather than surfacing later as a
+        # bare NumPy error from somewhere else. It is 4 floats plus a scalar; the read is free.
+        try:
+            kappa = array["kappa"]
+        except Exception as error:  # noqa: BLE001 -- any failure here means an unusable entry
+            raise CorruptCacheFileError(artifact, id_code, path, repr(error),
+                                        persistent=persistent) from error
+        if tuple(np.shape(kappa)) != (4,):
+            raise CorruptCacheFileError(
+                artifact, id_code, path,
+                "expected kappa shape (4,), found %s" % (tuple(np.shape(kappa)),),
+                persistent=persistent,
+            )
+        return array
+    expected = _expected_cache_shape(artifact, image_size)
+    if expected is not None and tuple(array.shape) != tuple(expected):
+        raise CorruptCacheFileError(
+            artifact, id_code, path,
+            "expected shape %s, found %s" % (tuple(expected), tuple(array.shape)),
+            persistent=persistent,
+        )
+    return array
+
+
+def _load_local_array(path, artifact, id_code, image_size):
+    """A LOCAL cache read. Deliberately as thin as the plain `np.load` it replaces -- no stat, no
+    retry, no extra I/O -- so the hot training path costs exactly what it did before. The only
+    addition is turning a truncated-file failure into a message that names the artifact, the image
+    and the file (zero cost when the load succeeds)."""
+    try:
+        array = np.load(path)
+    except (ValueError, OSError, EOFError) as error:
+        raise CorruptCacheFileError(artifact, id_code, path, repr(error), persistent=False) from error
+    return _validate_cached_array(array, artifact, id_code, path, image_size, persistent=False)
+
+
+def _load_persistent_array(path, artifact, id_code, image_size, local_path=None):
+    """A PERSISTENT (Drive) cache read, with a small bounded retry for transient FUSE errors.
+
+    Bounded on purpose: at most `_PERSISTENT_READ_ATTEMPTS` tries with 0.25s then 0.5s of backoff,
+    so a genuinely dead mount costs well under a second per image rather than stalling a run for
+    minutes. A truncated read (NumPy's `cannot reshape array of size N into shape (...)`) is
+    retried once as well, since that is the usual way a FUSE hiccup surfaces mid-read, and then
+    reported as `CorruptCacheFileError` rather than being papered over.
+
+    Never falls back to recomputation and never writes to or deletes the persistent file."""
+    last_error = None
+    for attempt in range(_PERSISTENT_READ_ATTEMPTS):
+        try:
+            array = np.load(path)
+            return _validate_cached_array(array, artifact, id_code, path, image_size, persistent=True)
+        except OSError as error:
+            last_error = error
+            if getattr(error, "errno", None) not in _TRANSIENT_FUSE_ERRNOS:
+                raise PersistentCacheUnavailableError(
+                    artifact, id_code, path, error, local_path=local_path, local_exists=False,
+                ) from error
+        except (ValueError, EOFError, CorruptCacheFileError) as error:
+            # A partial read from a flaky mount looks exactly like a corrupt file. Retry once
+            # before believing it really is corrupt.
+            last_error = error
+            if attempt == _PERSISTENT_READ_ATTEMPTS - 1:
+                raise CorruptCacheFileError(
+                    artifact, id_code, path,
+                    "%r (persisted after %d read attempts -- either genuinely truncated on Drive, "
+                    "or the mount is dropping mid-read)" % (error, _PERSISTENT_READ_ATTEMPTS),
+                    persistent=True,
+                ) from error
+        if attempt < _PERSISTENT_READ_ATTEMPTS - 1:
+            time.sleep(_PERSISTENT_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+    raise PersistentCacheUnavailableError(
+        artifact, id_code, path, last_error, local_path=local_path, local_exists=False,
+    )
+
+
 def _canonical_rgb_cache_path(id_code, cache_dir, image_size):
     """Reuses `lfed._cache_path`'s existing filename convention with a new `kind="rgb"` -- no new
     cache-path scheme, just one more entry alongside the existing `"vessel"`/`"lesion"` kinds."""
     return lfed._cache_path(cache_dir, id_code, "rgb", image_size)
 
 
-def _get_or_compute_canonical_rgb(rgb_native, rgb_cache_path, image_size, persistent_rgb_cache_path=None):
+def _get_or_compute_canonical_rgb(rgb_native, rgb_cache_path, image_size,
+                                  persistent_rgb_cache_path=None, id_code=None):
     """Returns `stage5_input`'s channels 0-2 -- the canonical (Stage 02-processed, resized to
     `image_size`, [0,1] float32) RGB for one image. Cached exactly like `_get_or_compute_joint_
     frozen_outputs` caches vessel/lesion/reliability: a local hit is a plain `np.load`; a miss
@@ -251,10 +426,14 @@ def _get_or_compute_canonical_rgb(rgb_native, rgb_cache_path, image_size, persis
     confirmed (via its own existence check) that one of the two cache paths already holds this
     image's entry -- mirrors `_get_or_compute_joint_frozen_outputs`'s identical convention."""
     if os.path.exists(rgb_cache_path):
-        return np.load(rgb_cache_path)
+        return _load_local_array(rgb_cache_path, "rgb", id_code, image_size)
 
-    if persistent_rgb_cache_path is not None and os.path.exists(persistent_rgb_cache_path):
-        canonical_rgb = np.load(persistent_rgb_cache_path)
+    if persistent_rgb_cache_path is not None and _persistent_exists(
+        persistent_rgb_cache_path, "rgb", id_code, local_path=rgb_cache_path, local_exists=False,
+    ):
+        canonical_rgb = _load_persistent_array(
+            persistent_rgb_cache_path, "rgb", id_code, image_size, local_path=rgb_cache_path,
+        )
         os.makedirs(os.path.dirname(rgb_cache_path), exist_ok=True)
         np.save(rgb_cache_path, canonical_rgb)
         return canonical_rgb
@@ -272,7 +451,7 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
                                           image_size=STAGE5_IMAGE_SIZE, known_not_all_cached=False,
                                           persistent_vessel_cache_path=None,
                                           persistent_lesion_cache_path=None,
-                                          persistent_reliability_cache_path=None):
+                                          persistent_reliability_cache_path=None, id_code=None):
     """Returns `(canonical_rgb, vessel_map, lesion_maps, kappa, r)` for one image --
     `canonical_rgb`/`vessel_map`: `(*image_size, {3,1})`, `lesion_maps`: `(*image_size, 4)`,
     `kappa`: `(4,)`, `r`: scalar float. `canonical_rgb` is always freshly resized (cheap, never
@@ -327,9 +506,11 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
         and os.path.exists(reliability_cache_path)
     )
     if all_cached:
-        vessel_map = np.load(vessel_cache_path)
-        lesion_maps = np.load(lesion_cache_path)
-        reliability_cached = np.load(reliability_cache_path)
+        vessel_map = _load_local_array(vessel_cache_path, "vessel", id_code, image_size)
+        lesion_maps = _load_local_array(lesion_cache_path, "lesion", id_code, image_size)
+        reliability_cached = _load_local_array(
+            reliability_cache_path, "reliability", id_code, image_size,
+        )
         return vessel_map, lesion_maps, reliability_cached["kappa"], float(reliability_cached["r"])
 
     persistent_paths_given = (
@@ -337,14 +518,24 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
         and persistent_lesion_cache_path is not None
         and persistent_reliability_cache_path is not None
     )
+    # `_persistent_exists` (not `os.path.exists`) so a dead Drive mount raises instead of reading
+    # as "not cached" and dropping through to the compute-fresh branch below (§41).
     if persistent_paths_given and (
-        os.path.exists(persistent_vessel_cache_path)
-        and os.path.exists(persistent_lesion_cache_path)
-        and os.path.exists(persistent_reliability_cache_path)
+        _persistent_exists(persistent_vessel_cache_path, "vessel", id_code,
+                           local_path=vessel_cache_path, local_exists=False)
+        and _persistent_exists(persistent_lesion_cache_path, "lesion", id_code,
+                               local_path=lesion_cache_path, local_exists=False)
+        and _persistent_exists(persistent_reliability_cache_path, "reliability", id_code,
+                               local_path=reliability_cache_path, local_exists=False)
     ):
-        vessel_map = np.load(persistent_vessel_cache_path)
-        lesion_maps = np.load(persistent_lesion_cache_path)
-        reliability_cached = np.load(persistent_reliability_cache_path)
+        vessel_map = _load_persistent_array(persistent_vessel_cache_path, "vessel", id_code,
+                                            image_size, local_path=vessel_cache_path)
+        lesion_maps = _load_persistent_array(persistent_lesion_cache_path, "lesion", id_code,
+                                             image_size, local_path=lesion_cache_path)
+        reliability_cached = _load_persistent_array(
+            persistent_reliability_cache_path, "reliability", id_code, image_size,
+            local_path=reliability_cache_path,
+        )
         kappa = reliability_cached["kappa"]
         r = float(reliability_cached["r"])
         # Mirror to the local cache path (once) so every later call for this image reads local
@@ -454,16 +645,25 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
         persistent_reliability_cache = racaf.reliability_cache_path(persistent_racaf_cache_dir, id_code)
         persistent_rgb_cache = _canonical_rgb_cache_path(id_code, persistent_cache_dir, image_size)
 
+    # LOCAL FIRST, and the `or` short-circuits: when all three local files exist, NO persistent
+    # path is stat'ed at all, so a full local hit never touches Drive (§41 test coverage proves
+    # this by making every persistent path raise if touched). Persistent checks use
+    # `_persistent_exists` so a dead mount raises instead of masquerading as "not cached".
     frozen_outputs_cached = (
         os.path.exists(vessel_cache) and os.path.exists(lesion_cache) and os.path.exists(reliability_cache)
     ) or (
         persistent_vessel_cache is not None
-        and os.path.exists(persistent_vessel_cache)
-        and os.path.exists(persistent_lesion_cache)
-        and os.path.exists(persistent_reliability_cache)
+        and _persistent_exists(persistent_vessel_cache, "vessel", id_code,
+                               local_path=vessel_cache, local_exists=False)
+        and _persistent_exists(persistent_lesion_cache, "lesion", id_code,
+                               local_path=lesion_cache, local_exists=False)
+        and _persistent_exists(persistent_reliability_cache, "reliability", id_code,
+                               local_path=reliability_cache, local_exists=False)
     )
     rgb_cached = os.path.exists(rgb_cache) or (
-        persistent_rgb_cache is not None and os.path.exists(persistent_rgb_cache)
+        persistent_rgb_cache is not None
+        and _persistent_exists(persistent_rgb_cache, "rgb", id_code,
+                               local_path=rgb_cache, local_exists=False)
     )
 
     rgb_native = None
@@ -477,9 +677,11 @@ def _build_joint_sample(id_code, diagnosis, image_dir, cache_dir, racaf_cache_di
         persistent_vessel_cache_path=persistent_vessel_cache,
         persistent_lesion_cache_path=persistent_lesion_cache,
         persistent_reliability_cache_path=persistent_reliability_cache,
+        id_code=id_code,
     )
     canonical_rgb = _get_or_compute_canonical_rgb(
         rgb_native, rgb_cache, image_size, persistent_rgb_cache_path=persistent_rgb_cache,
+        id_code=id_code,
     )
     stage5_input = np.concatenate([canonical_rgb, vessel_map, lesion_maps], axis=-1)
 
@@ -506,7 +708,7 @@ def _cache_entry_paths(id_code, cache_dir, racaf_cache_dir, image_size):
     return vessel_cache, lesion_cache, reliability_cache
 
 
-def _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
+def _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size, persistent=False):
     """True iff ALL THREE of `id_code`'s FROZEN STAGE 03/04/RACAF cache files already exist under
     `cache_dir`/`racaf_cache_dir` -- an existence-only check (`os.path.exists`, a stat call), never
     reading or copying any file's content. Shared by `precompute_joint_frozen_caches`'s own
@@ -521,6 +723,14 @@ def _cache_entry_exists(id_code, cache_dir, racaf_cache_dir, image_size):
     vessel_cache, lesion_cache, reliability_cache = _cache_entry_paths(
         id_code, cache_dir, racaf_cache_dir, image_size,
     )
+    if persistent:
+        # Drive-backed: a transient mount failure must raise, not read as "not cached" and send
+        # the caller off to recompute a frozen artifact that already exists (§41).
+        return (
+            _persistent_exists(vessel_cache, "vessel", id_code)
+            and _persistent_exists(lesion_cache, "lesion", id_code)
+            and _persistent_exists(reliability_cache, "reliability", id_code)
+        )
     return (
         os.path.exists(vessel_cache)
         and os.path.exists(lesion_cache)
@@ -705,7 +915,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
             stats["already_cached"] += 1
             _log_diagnostic(i, id_code, "already_cached", time.monotonic() - image_start)
         elif persistent_cache_dir is not None and _cache_entry_exists(
-            id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size,
+            id_code, persistent_cache_dir, persistent_racaf_cache_dir, image_size, persistent=True,
         ):
             # Not locally cached, but the complete entry already exists at the persistent (Drive)
             # location from a prior run. Read it from there ONCE and mirror it to local disk now,
@@ -738,6 +948,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 persistent_vessel_cache_path=persistent_vessel,
                 persistent_lesion_cache_path=persistent_lesion,
                 persistent_reliability_cache_path=persistent_reliability,
+                id_code=id_code,
             )
             stats["mirrored_from_persistent"] += 1
             _log_diagnostic(i, id_code, "mirrored_from_persistent", time.monotonic() - image_start)
@@ -748,7 +959,7 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 _get_or_compute_joint_frozen_outputs(
                     rgb_native, vessel_cache, lesion_cache, reliability_cache,
                     resolved_vessel_model, resolved_stage4_model, image_size=image_size,
-                    known_not_all_cached=True,
+                    known_not_all_cached=True, id_code=id_code,
                 )
                 stats["cached"] += 1
                 _log_diagnostic(i, id_code, "cached", time.monotonic() - image_start)
@@ -777,11 +988,15 @@ def precompute_joint_frozen_caches(entries, image_dir=DEFAULT_TRAIN_IMAGE_DIR, c
                 _canonical_rgb_cache_path(id_code, persistent_cache_dir, image_size)
                 if persistent_cache_dir is not None else None
             )
-            if rgb_native is None and not (persistent_rgb_cache and os.path.exists(persistent_rgb_cache)):
+            persistent_rgb_present = bool(persistent_rgb_cache) and _persistent_exists(
+                persistent_rgb_cache, "rgb", id_code, local_path=rgb_cache, local_exists=False,
+            )
+            if rgb_native is None and not persistent_rgb_present:
                 raw_bgr = lfed._load_raw_bgr(image_dir, id_code)
                 rgb_native = lfed._resolve_processed_rgb(raw_bgr, processed_dir, id_code)
             _get_or_compute_canonical_rgb(
                 rgb_native, rgb_cache, image_size, persistent_rgb_cache_path=persistent_rgb_cache,
+                id_code=id_code,
             )
 
         if progress_every and (i + 1) % progress_every == 0:

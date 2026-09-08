@@ -278,6 +278,143 @@ def snapshot_configuration(model=None):
 # 4. The three measurement phases
 # =====================================================================
 
+def describe_pipeline_failure(error):
+    """Turns whatever surfaced out of `next(iterator)` into a classified diagnosis.
+
+    A cache failure inside the `from_generator` callback reaches the consumer wrapped as
+    `tf.errors.UnknownError: ... IteratorGetNext ...`, whose message concatenates the original
+    Python traceback as text. That hides the two facts that matter -- WHICH artifact and WHICH
+    image -- behind a TensorFlow frame, which is exactly why the first Phase C attempt was hard to
+    read. This walks the `__cause__`/`__context__` chain for a typed cache error and, failing
+    that, pattern-matches the wrapped message.
+
+    Returns a dict whose `category` is one of the classes the profiler must distinguish:
+    DRIVE_FUSE (B), CORRUPT_CACHE, LOCAL_CACHE (A), or UNKNOWN."""
+    chain, seen, current = [], set(), error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    for item in chain:
+        if isinstance(item, jtd.PersistentCacheUnavailableError):
+            return {
+                "category": "DRIVE_FUSE",
+                "artifact": item.artifact, "id_code": item.id_code, "path": item.path,
+                "errno": item.errno, "local_path": item.local_path,
+                "local_exists": item.local_exists,
+                "message": str(item),
+                "meaning": "The persistent Drive mount failed while the LOCAL entry for this "
+                           "image was missing. This is a Drive/FUSE problem (B), not a local "
+                           "cache problem -- and nothing was recomputed.",
+            }
+        if isinstance(item, jtd.CorruptCacheFileError):
+            return {
+                "category": "CORRUPT_CACHE",
+                "artifact": item.artifact, "id_code": item.id_code, "path": item.path,
+                "persistent": item.persistent, "detail": item.detail,
+                "message": str(item),
+                "meaning": "A cache file was reachable but unusable. On a persistent path this is "
+                           "usually a truncated FUSE read rather than genuine corruption; the "
+                           "file was left untouched either way.",
+            }
+
+    text = str(error)
+    if "Transport endpoint is not connected" in text or "Errno 107" in text:
+        return {"category": "DRIVE_FUSE", "message": text,
+                "meaning": "Drive FUSE dropped (errno 107). Raised from below the typed-error "
+                           "layer -- re-mount Drive before re-running."}
+    if "cannot reshape array of size" in text:
+        return {"category": "CORRUPT_CACHE", "message": text,
+                "meaning": "A truncated read (NumPy could not reshape a short buffer). Almost "
+                           "always a partial FUSE read of a persistent file."}
+    return {"category": "UNKNOWN", "message": text,
+            "meaning": "Not a recognized cache failure -- see the message."}
+
+
+def preflight_cache_audit(entries, cache_dir, racaf_cache_dir, image_size,
+                          persistent_cache_dir=None, persistent_racaf_cache_dir=None,
+                          sample_limit=None):
+    """PER-IMAGE, PER-ARTIFACT existence audit run BEFORE any measurement -- the question a
+    directory-level count cannot answer.
+
+    Phase C failed with `Errno 107` reading a PERSISTENT lesion path. Under the documented
+    precedence that can only happen when the LOCAL entry for that specific image is missing, so
+    the pipeline correctly fell through to the Drive fallback -- and doing that for thousands of
+    images in a row is what takes a FUSE mount down. Whether the local cache is complete for the
+    exact entries the profiler will iterate is therefore the first thing to establish, and it is
+    established here by stat-ing every artifact of every entry rather than by counting files in a
+    directory.
+
+    Uses the REAL path builders (`lfed._cache_path`, `racaf.reliability_cache_path`,
+    `jtd._canonical_rgb_cache_path`) so a filename-convention mismatch would show up as a miss
+    here exactly as it would in training. Local paths are stat'ed with plain `os.path.exists`;
+    persistent paths go through `jtd._persistent_exists`, so a dead mount is reported as
+    UNREACHABLE rather than silently as "absent".
+
+    These are the PROFILER's own probes and are never mixed into the pipeline operation counts."""
+    entries = list(entries)
+    if sample_limit is not None:
+        entries = entries[:sample_limit]
+    result = {
+        "entries_checked": len(entries),
+        "fully_local": 0,
+        "would_read_drive": 0,
+        "missing_everywhere": 0,
+        "drive_unreachable": False,
+        "drive_error": None,
+        "per_artifact_local_missing": {artifact: 0 for artifact in jcd.ARTIFACTS},
+        "per_artifact_persistent_missing": {artifact: 0 for artifact in jcd.ARTIFACTS},
+        "examples_needing_drive": [],
+        "examples_missing_everywhere": [],
+        "probe_count": 0,
+    }
+    have_persistent = persistent_cache_dir is not None and persistent_racaf_cache_dir is not None
+
+    for id_code, _diagnosis in entries:
+        local = jcd.artifact_paths(id_code, cache_dir, racaf_cache_dir, image_size)
+        missing_local = []
+        for artifact, path in local.items():
+            result["probe_count"] += 1
+            if not os.path.exists(path):
+                missing_local.append(artifact)
+                result["per_artifact_local_missing"][artifact] += 1
+        if not missing_local:
+            result["fully_local"] += 1
+            continue
+
+        if not have_persistent:
+            result["missing_everywhere"] += 1
+            if len(result["examples_missing_everywhere"]) < 10:
+                result["examples_missing_everywhere"].append((id_code, missing_local))
+            continue
+
+        persistent = jcd.artifact_paths(id_code, persistent_cache_dir,
+                                        persistent_racaf_cache_dir, image_size)
+        missing_persistent = []
+        for artifact in missing_local:
+            result["probe_count"] += 1
+            try:
+                present = jtd._persistent_exists(persistent[artifact], artifact, id_code)
+            except jtd.PersistentCacheUnavailableError as error:
+                # The mount is down right now. Stop probing -- hammering it makes it worse.
+                result["drive_unreachable"] = True
+                result["drive_error"] = str(error)
+                return result
+            if not present:
+                missing_persistent.append(artifact)
+                result["per_artifact_persistent_missing"][artifact] += 1
+        if missing_persistent:
+            result["missing_everywhere"] += 1
+            if len(result["examples_missing_everywhere"]) < 10:
+                result["examples_missing_everywhere"].append((id_code, missing_persistent))
+        else:
+            result["would_read_drive"] += 1
+            if len(result["examples_needing_drive"]) < 10:
+                result["examples_needing_drive"].append((id_code, missing_local))
+    return result
+
+
 def _roots_for(cache_dir, racaf_cache_dir, persistent_cache_dir, persistent_racaf_cache_dir,
                image_dir, drive_mount="/content/drive"):
     return jcd._Roots([
@@ -297,6 +434,7 @@ def profile_input_only(dataset, roots, batches=DEFAULT_BATCHES):
     recorder = jcd._Recorder(roots)
     telemetry = _TelemetrySampler().start()
     per_batch = []
+    failure = None
     iterator = iter(dataset)
     start_all = time.perf_counter()
     with jcd._instrument(recorder):
@@ -308,6 +446,13 @@ def profile_input_only(dataset, roots, batches=DEFAULT_BATCHES):
                 next(iterator)
             except StopIteration:
                 break
+            except Exception as error:  # noqa: BLE001 -- classified, then re-reported, below
+                # A cache failure inside the generator reaches us wrapped in tf.errors.UnknownError
+                # ("IteratorGetNext..."), which hides which artifact and which image failed.
+                # `describe_pipeline_failure` digs the real cause back out so Phase C ends with a
+                # usable diagnosis instead of an opaque TensorFlow traceback.
+                failure = describe_pipeline_failure(error)
+                break
             per_batch.append(time.perf_counter() - start)
     total = time.perf_counter() - start_all
     return {
@@ -317,6 +462,7 @@ def profile_input_only(dataset, roots, batches=DEFAULT_BATCHES):
         "per_batch_seconds": per_batch,
         "steady_mean_seconds": (sum(per_batch[1:]) / len(per_batch[1:])) if len(per_batch) > 1 else None,
         "telemetry": telemetry.stop(),
+        "failure": failure,
         "recorder": recorder,
     }
 
@@ -405,6 +551,7 @@ def profile_combined(model, dataset, roots, batches=DEFAULT_BATCHES):
         return float(tf.reduce_sum(tf.cast(tensor, tf.float32)).numpy())
 
     wait_times, compute_times, batch_times = [], [], []
+    failure = None
     iterator = iter(dataset)
     start_all = time.perf_counter()
     with jcd._instrument(recorder):
@@ -414,6 +561,9 @@ def profile_combined(model, dataset, roots, batches=DEFAULT_BATCHES):
             try:
                 inputs, labels = next(iterator)
             except StopIteration:
+                break
+            except Exception as error:  # noqa: BLE001 -- classified by describe_pipeline_failure
+                failure = describe_pipeline_failure(error)
                 break
             wait_times.append(time.perf_counter() - start)
 
@@ -443,6 +593,7 @@ def profile_combined(model, dataset, roots, batches=DEFAULT_BATCHES):
         "per_batch_seconds": batch_times,
         "telemetry": summary,
         "tf_gpu_memory": tf_gpu_memory(),
+        "failure": failure,
         "recorder": recorder,
     }
 
@@ -543,7 +694,8 @@ def run_profile(model, train_ds, cache_dir, racaf_cache_dir, image_dir,
                 persistent_cache_dir=None, persistent_racaf_cache_dir=None,
                 batch_size=2, batches=DEFAULT_BATCHES, entries=None,
                 vessel_model=None, stage4_model=None, image_size=None,
-                drive_mount="/content/drive", extra_paths=None):
+                drive_mount="/content/drive", extra_paths=None,
+                preflight_sample_limit=None, abort_if_drive_fallback=True):
     """Runs the storage survey, the configuration snapshot and all three measurement phases, and
     returns a plain-dict report (`print_report` renders it).
 
@@ -567,20 +719,60 @@ def run_profile(model, train_ds, cache_dir, racaf_cache_dir, image_dir,
         paths.update(extra_paths)
 
     report = {"batch_size": batch_size, "requested_batches": batches}
-    print("[1/5] storage survey ...")
+    print("[1/6] storage survey ...")
     report["storage"] = survey_storage(paths)
-    print("[2/5] configuration snapshot ...")
+    print("[2/6] configuration snapshot ...")
     report["config"] = snapshot_configuration(model)
+
+    # Establish whether the local cache is complete for the entries about to be iterated, BEFORE
+    # iterating them. A local miss is what sends the pipeline to Drive, and doing that thousands
+    # of times in a row is what took the mount down on the first attempt.
+    if entries is not None:
+        print("[3/6] preflight per-image cache audit ...")
+        report["preflight"] = preflight_cache_audit(
+            entries, cache_dir, racaf_cache_dir, image_size,
+            persistent_cache_dir=persistent_cache_dir,
+            persistent_racaf_cache_dir=persistent_racaf_cache_dir,
+            sample_limit=preflight_sample_limit,
+        )
+        audit = report["preflight"]
+        print("      %d/%d entries fully local; %d would fall back to Drive; %d missing everywhere"
+              % (audit["fully_local"], audit["entries_checked"], audit["would_read_drive"],
+                 audit["missing_everywhere"]))
+        if audit["drive_unreachable"]:
+            print("      Drive is UNREACHABLE right now -- see the report below.")
+        if audit["would_read_drive"] and abort_if_drive_fallback:
+            report["classification"] = classify(report)
+            report["aborted"] = (
+                "Aborted before Phase C: %d of %d entries have a missing LOCAL artifact and would "
+                "read Drive during measurement. That is what took the mount down last time, and it "
+                "would also make the timings measure Drive latency rather than the training step. "
+                "Complete the local cache first (Phase 1 mirrors persistent entries locally), or "
+                "re-run with abort_if_drive_fallback=False to measure anyway."
+                % (audit["would_read_drive"], audit["entries_checked"]))
+            print("")
+            print(report["aborted"])
+            return report
 
     roots = _roots_for(cache_dir, racaf_cache_dir, persistent_cache_dir,
                        persistent_racaf_cache_dir, image_dir, drive_mount)
 
-    print("[3/5] PHASE C -- input pipeline only, no model ...")
+    print("[4/6] PHASE C -- input pipeline only, no model ...")
     input_only = profile_input_only(train_ds, roots, batches=batches)
     report["input_only"] = {k: v for k, v in input_only.items() if k != "recorder"}
     report["input_io"] = io_breakdown(input_only["recorder"], input_only["batches"], batch_size)
+    if input_only.get("failure"):
+        # Phase C could not complete. Running D and E now would only produce numbers that cannot
+        # be compared against a missing Phase C baseline, so stop and report the classified cause.
+        report["classification"] = classify(report)
+        report["aborted"] = ("Phase C failed: %s"
+                             % input_only["failure"].get("meaning", "see the failure block"))
+        print("")
+        print("PHASE C FAILED -- %s" % input_only["failure"].get("category"))
+        print(input_only["failure"].get("message", ""))
+        return report
 
-    print("[4/5] PHASE D -- model compute only, one reused batch ...")
+    print("[5/6] PHASE D -- model compute only, one reused batch ...")
     warm_batch = None
     for batch in train_ds.take(1):
         warm_batch = batch
@@ -589,7 +781,7 @@ def run_profile(model, train_ds, cache_dir, racaf_cache_dir, image_dir,
     else:
         report["compute_only"] = profile_compute_only(model, warm_batch, batches=batches)
 
-    print("[5/5] PHASE E -- combined dataset + train step ...")
+    print("[6/6] PHASE E -- combined dataset + train step ...")
     combined = profile_combined(model, train_ds, roots, batches=batches)
     report["combined"] = {k: v for k, v in combined.items() if k != "recorder"}
     report["combined_io"] = io_breakdown(combined["recorder"], combined["batches"], batch_size)
@@ -760,6 +952,56 @@ def print_report(report):
         print("  model:")
         for key, value in config["model"].items():
             print("      %-20s %s" % (key + ":", value))
+
+    # --- preflight -------------------------------------------------------
+    audit = report.get("preflight")
+    if audit:
+        print("")
+        print("B2. PREFLIGHT PER-IMAGE CACHE AUDIT (profiler's own probes, not pipeline ops)")
+        print("-" * 78)
+        print("  entries checked            : %d" % audit["entries_checked"])
+        print("  fully local (no Drive need): %d" % audit["fully_local"])
+        print("  would fall back to Drive   : %d   <-- each of these is a Drive read during training"
+              % audit["would_read_drive"])
+        print("  missing local AND persistent: %d" % audit["missing_everywhere"])
+        print("  probes performed           : %d (excluded from every pipeline counter)"
+              % audit["probe_count"])
+        if audit["drive_unreachable"]:
+            print("  DRIVE UNREACHABLE: %s" % audit["drive_error"])
+        missing_local = {k: v for k, v in audit["per_artifact_local_missing"].items() if v}
+        if missing_local:
+            print("  local misses by artifact   : %s" % missing_local)
+        missing_persistent = {k: v for k, v in audit["per_artifact_persistent_missing"].items() if v}
+        if missing_persistent:
+            print("  persistent misses by artifact: %s" % missing_persistent)
+        for id_code, artifacts in audit["examples_needing_drive"][:5]:
+            print("      would read Drive: %s -> %s" % (id_code, artifacts))
+        for id_code, artifacts in audit["examples_missing_everywhere"][:5]:
+            print("      missing everywhere: %s -> %s" % (id_code, artifacts))
+        if audit["would_read_drive"] == 0 and not audit["drive_unreachable"]:
+            print("  VERDICT: the local cache is complete for these entries. Training will not")
+            print("           read Drive, so a Drive outage cannot affect these measurements.")
+
+    if report.get("aborted"):
+        print("")
+        print("=" * 78)
+        print("RUN STOPPED EARLY")
+        print("=" * 78)
+        print(report["aborted"])
+        for phase_name in ("input_only", "combined"):
+            failure = (report.get(phase_name) or {}).get("failure")
+            if failure:
+                print("")
+                print("  %s failure category: %s" % (phase_name, failure.get("category")))
+                for key in ("artifact", "id_code", "path", "errno", "local_path", "local_exists",
+                            "persistent", "detail"):
+                    if failure.get(key) is not None:
+                        print("      %-14s %s" % (key + ":", failure[key]))
+                print("      meaning: %s" % failure.get("meaning"))
+                print("      raw: %s" % str(failure.get("message"))[:600])
+        print("")
+        print("Nothing was recomputed and no cache file was modified.")
+        return
 
     # --- C. the metric table -------------------------------------------
     combined = report.get("combined") or {}

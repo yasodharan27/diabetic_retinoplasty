@@ -50,15 +50,30 @@ class TrainingConfig:
 
 
 def check_gpu():
-    """Print GPU availability and enable memory growth. Returns the GPU device list."""
+    """Print GPU availability and enable memory growth. Returns the GPU device list.
+
+    Safe to call repeatedly, including after TensorFlow has already initialized the device.
+    `set_memory_growth` raises `RuntimeError: Physical devices cannot be modified after being
+    initialized`, so this checks the CURRENT setting first and only calls the setter when it would
+    actually change something. Once growth is already on -- which is the normal case, since the
+    first caller in a session turns it on before any op touches the GPU -- later calls are a
+    silent no-op instead of printing a warning that reads like a failure but is not one."""
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
         print(f"GPU available: {[g.name for g in gpus]}")
         for g in gpus:
             try:
+                if tf.config.experimental.get_memory_growth(g):
+                    continue  # already enabled -- nothing to do, and setting it again would raise
+            except (RuntimeError, ValueError):
+                pass  # cannot be queried on this build; fall through and try to set it
+            try:
                 tf.config.experimental.set_memory_growth(g, True)
             except RuntimeError as e:
-                print(f"Could not set memory growth on {g.name}: {e}")
+                # The device is already initialized and growth is NOT on. Worth saying once, but
+                # it is not fatal: TF simply keeps the allocator it already built.
+                print(f"Memory growth could not be enabled on {g.name} (device already "
+                      f"initialized); continuing with the existing allocator: {e}")
     else:
         print("No GPU detected -- training will run on CPU.")
     return gpus

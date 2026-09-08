@@ -14,6 +14,7 @@ BOUNDARY (which variables receive a gradient), never to update a weight.
 """
 
 import csv
+import errno
 import inspect
 import os
 import shutil
@@ -2180,6 +2181,275 @@ class CanonicalRGBDrivePersistenceLifecycleTests(unittest.TestCase):
         np.testing.assert_array_equal(live["stage5_input"], round_tripped["stage5_input"])
         np.testing.assert_array_equal(live["stage6_input"], round_tripped["stage6_input"])
         self.assertEqual(float(live["reliability"]), float(round_tripped["reliability"]))
+
+
+class DriveFuseFailureSafetyTests(unittest.TestCase):
+    """§41: a dropped Drive FUSE mount must never be mistaken for "this image was never cached".
+
+    `os.path.exists()` returns False for EVERY OSError, not just ENOENT, so before this fix a
+    mount that had dropped read as "not cached" and the caller fell straight through to its
+    compute-fresh branch -- silently re-running frozen Stage 03 + Stage 04 for an image whose
+    cache entry exists and is merely unreachable. That is the most expensive possible reaction to
+    a transient hiccup, and these tests pin it shut."""
+
+    ENOTCONN = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("fuse_a", 0), ("fuse_b", 2)])
+        self.addCleanup(self.tree.cleanup)
+        self.drive_cache_dir = os.path.join(self.tree.root, "drive_cache")
+        self.drive_racaf_cache_dir = os.path.join(self.tree.root, "drive_racaf_cache")
+
+    def _populate_drive(self):
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.drive_cache_dir,
+            self.drive_racaf_cache_dir, vessel_model=self.vessel_model,
+            stage4_model=self.stage4_model,
+        )
+
+    def _dead_drive(self):
+        """Every os.stat / np.load against a persistent path raises ENOTCONN; local is untouched.
+        This is what a dropped FUSE mount actually looks like to Python."""
+        drive_roots = (os.path.abspath(self.drive_cache_dir),
+                       os.path.abspath(self.drive_racaf_cache_dir))
+
+        def is_drive(path):
+            resolved = os.path.abspath(str(path))
+            return any(resolved.startswith(root) for root in drive_roots)
+
+        real_stat, real_load = os.stat, np.load
+
+        def stat(path, *args, **kwargs):
+            if is_drive(path):
+                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+            return real_stat(path, *args, **kwargs)
+
+        def load(path, *args, **kwargs):
+            if is_drive(path):
+                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+            return real_load(path, *args, **kwargs)
+
+        return mock.patch.multiple("os", stat=stat), mock.patch.object(jtd.np, "load", load)
+
+    # --- the core safety property ---------------------------------------
+    def test_a_dead_drive_raises_instead_of_silently_recomputing_frozen_artifacts(self):
+        self._populate_drive()  # entry exists on "Drive"; local cache is empty
+        stat_patch, load_patch = self._dead_drive()
+        with mock.patch("joint_training_dataset.predict_vessel_mask") as vessel_spy, \
+             mock.patch.object(jtd.racaf, "tta_views") as lesion_spy:
+            with stat_patch, load_patch:
+                with self.assertRaises(jtd.PersistentCacheUnavailableError) as caught:
+                    jtd._build_joint_sample(
+                        "fuse_a", 0, self.tree.image_dir, self.tree.cache_dir,
+                        self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                        augment=False, rng=None,
+                        persistent_cache_dir=self.drive_cache_dir,
+                        persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+                    )
+        self.assertEqual(vessel_spy.call_count, 0, "Stage 03 was recomputed on a Drive outage")
+        self.assertEqual(lesion_spy.call_count, 0, "Stage 04 was recomputed on a Drive outage")
+        self.assertEqual(caught.exception.errno, errno.ENOTCONN)
+
+    def test_the_error_names_the_artifact_image_path_errno_and_local_state(self):
+        self._populate_drive()
+        stat_patch, load_patch = self._dead_drive()
+        with stat_patch, load_patch:
+            with self.assertRaises(jtd.PersistentCacheUnavailableError) as caught:
+                jtd._build_joint_sample(
+                    "fuse_a", 0, self.tree.image_dir, self.tree.cache_dir,
+                    self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                    augment=False, rng=None,
+                    persistent_cache_dir=self.drive_cache_dir,
+                    persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+                )
+        error = caught.exception
+        self.assertIn(error.artifact, ("vessel", "lesion", "reliability", "rgb"))
+        self.assertEqual(error.id_code, "fuse_a")
+        self.assertTrue(os.path.abspath(error.path).startswith(os.path.abspath(self.drive_cache_dir))
+                        or os.path.abspath(error.path).startswith(
+                            os.path.abspath(self.drive_racaf_cache_dir)))
+        self.assertEqual(error.errno, errno.ENOTCONN)
+        message = str(error)
+        self.assertIn("fuse_a", message)
+        # errno.ENOTCONN is 107 on Linux/Colab but 10057 on Windows, so assert the symbolic
+        # value the code actually uses rather than a platform-specific literal.
+        self.assertIn(str(errno.ENOTCONN), message)
+        self.assertIn("No recomputation was attempted", message)
+
+    def test_phase1_also_refuses_to_recompute_when_drive_drops(self):
+        self._populate_drive()
+        stat_patch, load_patch = self._dead_drive()
+        with mock.patch("joint_training_dataset.predict_vessel_mask") as vessel_spy:
+            with stat_patch, load_patch:
+                with self.assertRaises(jtd.PersistentCacheUnavailableError):
+                    jtd.precompute_joint_frozen_caches(
+                        self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                        self.tree.racaf_cache_dir,
+                        persistent_cache_dir=self.drive_cache_dir,
+                        persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+                        vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+                        progress_every=0,
+                    )
+        self.assertEqual(vessel_spy.call_count, 0)
+
+    # --- the invariant the user asked to be proven explicitly ------------
+    def test_a_full_local_hit_never_touches_drive_even_when_drive_is_booby_trapped(self):
+        """The critical invariant: if the local artifact exists, training must not read the
+        persistent one. Proven by making EVERY persistent access raise -- if the local-first path
+        were not airtight, this would fail."""
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )  # local cache now complete; Drive dirs do not even exist
+        stat_patch, load_patch = self._dead_drive()
+        with stat_patch, load_patch:
+            for id_code, diagnosis in self.tree.pairs:
+                sample = jtd._build_joint_sample(
+                    id_code, diagnosis, self.tree.image_dir, self.tree.cache_dir,
+                    self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                    augment=False, rng=None,
+                    persistent_cache_dir=self.drive_cache_dir,
+                    persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+                )
+                self.assertEqual(sample["stage5_input"].shape, (*jtd.STAGE5_IMAGE_SIZE, 8))
+
+    def test_a_full_local_hit_survives_a_dead_drive_through_the_real_dataset_generator(self):
+        """Same invariant, through the actual tf.data generator rather than a direct call."""
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        dataset = jtd._make_joint_dataset(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False,
+            seed=0, persistent_cache_dir=self.drive_cache_dir,
+            persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+        )
+        stat_patch, load_patch = self._dead_drive()
+        with stat_patch, load_patch:
+            batches = list(dataset.as_numpy_iterator())
+        self.assertEqual(len(batches), len(self.tree.pairs))
+
+    # --- truncated / corrupt persistent file ------------------------------
+    def test_a_truncated_persistent_file_is_reported_not_silently_recomputed(self):
+        """Reproduces the reported `cannot reshape array of size 99296 into shape (512,512,4)`:
+        a persistent lesion file that reads short. It must surface as a named cache error, and the
+        file must be left exactly as found."""
+        self._populate_drive()
+        lesion_path = lfed._cache_path(self.drive_cache_dir, "fuse_a", "lesion",
+                                       jtd.STAGE5_IMAGE_SIZE)
+        truncated = np.zeros((8, 8, 4), dtype=np.float32)  # right dtype, wrong (short) shape
+        np.save(lesion_path, truncated)
+        before = open(lesion_path, "rb").read()
+
+        with mock.patch("joint_training_dataset.predict_vessel_mask") as vessel_spy:
+            with self.assertRaises(jtd.CorruptCacheFileError) as caught:
+                jtd._build_joint_sample(
+                    "fuse_a", 0, self.tree.image_dir, self.tree.cache_dir,
+                    self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                    augment=False, rng=None,
+                    persistent_cache_dir=self.drive_cache_dir,
+                    persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+                )
+        self.assertEqual(vessel_spy.call_count, 0, "a corrupt cache file triggered recomputation")
+        self.assertEqual(caught.exception.artifact, "lesion")
+        self.assertEqual(caught.exception.id_code, "fuse_a")
+        self.assertTrue(caught.exception.persistent)
+        self.assertIn("NOT deleted or regenerated", str(caught.exception))
+        self.assertEqual(open(lesion_path, "rb").read(), before, "the corrupt file was modified")
+
+    def test_a_genuinely_absent_persistent_entry_still_computes_normally(self):
+        """The fix must not turn a real ENOENT into an error -- an absent entry is still just a
+        miss, and computing it is correct."""
+        with mock.patch("joint_training_dataset.predict_vessel_mask",
+                        wraps=jtd.predict_vessel_mask) as vessel_spy:
+            sample = jtd._build_joint_sample(
+                "fuse_a", 0, self.tree.image_dir, self.tree.cache_dir,
+                self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                augment=False, rng=None,
+                persistent_cache_dir=self.drive_cache_dir,       # exists as a path, holds nothing
+                persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+            )
+        self.assertEqual(vessel_spy.call_count, 1)
+        self.assertEqual(sample["stage5_input"].shape, (*jtd.STAGE5_IMAGE_SIZE, 8))
+
+    def test_bounded_retry_does_not_stall(self):
+        """Retry must be bounded: at most 3 attempts with 0.25s + 0.5s of backoff."""
+        self.assertEqual(jtd._PERSISTENT_READ_ATTEMPTS, 3)
+        self.assertLessEqual(
+            sum(jtd._PERSISTENT_RETRY_BASE_DELAY_SECONDS * (2 ** i)
+                for i in range(jtd._PERSISTENT_READ_ATTEMPTS - 1)),
+            1.0, "persistent-read backoff must stay well under a second")
+
+    def test_a_transient_read_that_recovers_on_retry_succeeds_without_recomputing(self):
+        self._populate_drive()
+        real_load = np.load
+        calls = {"n": 0}
+        lesion_path = lfed._cache_path(self.drive_cache_dir, "fuse_a", "lesion",
+                                       jtd.STAGE5_IMAGE_SIZE)
+
+        def flaky(path, *args, **kwargs):
+            if os.path.abspath(str(path)) == os.path.abspath(lesion_path):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+            return real_load(path, *args, **kwargs)
+
+        with mock.patch.object(jtd.np, "load", flaky), \
+             mock.patch("joint_training_dataset.predict_vessel_mask") as vessel_spy:
+            sample = jtd._build_joint_sample(
+                "fuse_a", 0, self.tree.image_dir, self.tree.cache_dir,
+                self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                augment=False, rng=None,
+                persistent_cache_dir=self.drive_cache_dir,
+                persistent_racaf_cache_dir=self.drive_racaf_cache_dir,
+            )
+        self.assertGreaterEqual(calls["n"], 2, "the transient failure was not retried")
+        self.assertEqual(vessel_spy.call_count, 0, "a retryable blip caused recomputation")
+        self.assertEqual(sample["stage5_input"].shape, (*jtd.STAGE5_IMAGE_SIZE, 8))
+
+
+class MemoryGrowthInitializationTests(unittest.TestCase):
+    """§41: `check_gpu()` is called by several entry points in one session, so it must be a no-op
+    once memory growth is already on -- not print a warning that reads like a failure."""
+
+    def test_check_gpu_does_not_reconfigure_when_growth_is_already_enabled(self):
+        device = mock.Mock()
+        device.name = "/physical_device:GPU:0"
+        with mock.patch.object(tf.config, "list_physical_devices", return_value=[device]), \
+             mock.patch.object(tf.config.experimental, "get_memory_growth", return_value=True), \
+             mock.patch.object(tf.config.experimental, "set_memory_growth") as setter:
+            from training.trainer import check_gpu
+            check_gpu()
+        setter.assert_not_called()
+
+    def test_check_gpu_sets_growth_when_it_is_not_yet_enabled(self):
+        device = mock.Mock()
+        device.name = "/physical_device:GPU:0"
+        with mock.patch.object(tf.config, "list_physical_devices", return_value=[device]), \
+             mock.patch.object(tf.config.experimental, "get_memory_growth", return_value=False), \
+             mock.patch.object(tf.config.experimental, "set_memory_growth") as setter:
+            from training.trainer import check_gpu
+            check_gpu()
+        setter.assert_called_once_with(device, True)
+
+    def test_an_already_initialized_device_reports_once_without_raising(self):
+        device = mock.Mock()
+        device.name = "/physical_device:GPU:0"
+        with mock.patch.object(tf.config, "list_physical_devices", return_value=[device]), \
+             mock.patch.object(tf.config.experimental, "get_memory_growth", return_value=False), \
+             mock.patch.object(tf.config.experimental, "set_memory_growth",
+                               side_effect=RuntimeError("Physical devices cannot be modified "
+                                                        "after being initialized")):
+            from training.trainer import check_gpu
+            import io as _io
+            import contextlib as _contextlib
+            buffer = _io.StringIO()
+            with _contextlib.redirect_stdout(buffer):
+                check_gpu()   # must not raise
+        self.assertIn("continuing with the existing allocator", buffer.getvalue())
 
 
 # =====================================================================

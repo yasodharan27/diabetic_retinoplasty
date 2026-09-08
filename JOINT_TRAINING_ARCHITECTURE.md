@@ -1503,3 +1503,89 @@ mtime-identical; `_build_joint_sample` writes nothing to either persistent direc
 cache state; the round-tripped rgb is bitwise identical to a fresh generation on both the Drive
 copy and the local mirror; and the resulting `stage5_input`/`stage6_input`/`reliability` are
 unchanged versus a live build.
+
+---
+
+## 41. A dropped Drive mount read as "never cached" — `os.path.exists` masks ENOTCONN, so an outage could silently recompute frozen Stage 03/04
+
+**Symptom.** The Phase 2a profiler's first real run died in Phase C with
+`UnknownError: ... OSError: [Errno 107] Transport endpoint is not connected`, thrown from
+`_build_joint_sample` → `_get_or_compute_joint_frozen_outputs` → `np.load(persistent_lesion_cache_path)`,
+preceded by `ValueError: cannot reshape array of size 99296 into shape (512,512,4)`. It also printed
+`Could not set memory growth on /physical_device:GPU:0: Physical devices cannot be modified after
+being initialized`.
+
+**The real defect, found while tracing the failure rather than the failure itself.**
+`genericpath.exists` swallows EVERY `OSError`, not just `ENOENT`:
+
+```python
+def exists(path):
+    try: os.stat(path)
+    except (OSError, ValueError): return False
+    return True
+```
+
+Empirically confirmed: with `os.stat` raising `ENOTCONN`, `os.path.exists()` returns `False`. So on
+a Drive mount that had dropped, the persistent-cache existence check read as *"this image was never
+cached"*, and `_get_or_compute_joint_frozen_outputs` fell through to its compute-fresh branch —
+**silently re-running frozen Stage 03 + Stage 04 for an image whose cache entry exists and is
+merely unreachable**. That is the most expensive possible reaction to a transient hiccup, and it
+was reachable in production, not only in the profiler.
+
+**Fix.** Persistent-path checks now go through `_persistent_exists()`, which returns `False` only
+for a genuine `ENOENT`/`ENOTDIR` and raises `PersistentCacheUnavailableError` for anything else.
+Persistent reads go through `_load_persistent_array()`: a bounded retry (3 attempts, 0.25s then
+0.5s of backoff — under one second worst case, deliberately not a stall), then post-load shape
+validation, then `CorruptCacheFileError` naming the artifact, image, path and errno. Neither error
+path ever deletes, rewrites or regenerates anything. The reliability `.npz` is validated by
+touching `kappa` inside the guarded block, since `np.load` on an `.npz` is lazy and would otherwise
+surface a truncated file as a bare NumPy error somewhere else entirely.
+
+Local reads go through `_load_local_array()`, which is as thin as the plain `np.load` it replaced
+— no extra stat, no retry, no extra I/O — so the hot training path costs exactly what it did
+before. Its only addition is turning a truncated-file failure into a message that names the
+artifact and image, which is free when the load succeeds.
+
+**Local-first is unchanged and now proven.** `_build_joint_sample`'s `or` short-circuits: when all
+three local files exist, no persistent path is stat'ed at all. Two tests pin this by making EVERY
+`os.stat` and `np.load` against a persistent root raise `ENOTCONN` and then asserting that a fully
+local cache still builds samples — once through a direct call, once through the real `tf.data`
+generator. If the local-first path were not airtight, those fail.
+
+**Memory-growth warning.** `check_gpu()` called `set_memory_growth` unconditionally, which raises
+once TensorFlow has initialized the device — normal on the second and later calls in a session, and
+harmless, but printed text that reads like a failure. It now queries `get_memory_growth` first and
+only calls the setter when it would change something; if the device really is initialized with
+growth off, it says so once and continues rather than implying breakage.
+
+**Why Phase C reached Drive at all.** Under the documented precedence, a persistent read happens
+only when the LOCAL entry for that specific image is missing. Directory-level counts cannot show
+that, so `preflight_cache_audit()` now stats every artifact of every entry the profiler will
+iterate, before measuring, and reports how many are fully local, how many would fall back to Drive,
+and how many are missing from both. It stops probing the moment the mount fails rather than
+hammering it. By default the run aborts if any entry would read Drive — those reads would both
+risk the mount and make the timings measure Drive latency instead of the training step
+(`abort_if_drive_fallback=False` to measure anyway).
+
+`describe_pipeline_failure()` walks the `__cause__`/`__context__` chain of whatever surfaces from
+`next(iterator)` — a generator failure arrives wrapped as `tf.errors.UnknownError: ...
+IteratorGetNext ...`, which hides which artifact and which image failed — and classifies it as
+DRIVE_FUSE, CORRUPT_CACHE, LOCAL_CACHE or UNKNOWN, falling back to pattern-matching the wrapped
+message text when no typed cause is attached.
+
+**Not changed.** Model architecture, batch size, optimizer, learning rate, loss, QWK, the split,
+epochs, frozen Stage 03/04, RACAF, canonical RGB generation, vessel/lesion outputs, reliability,
+augmentation, cache layout and cache directories are all untouched. No cache was regenerated, no
+cache directory was added, canonical RGB did not move, and local-SSD-first was preserved.
+
+**Regression tests.** `DriveFuseFailureSafetyTests` (9) and `MemoryGrowthInitializationTests` (3)
+in `tests/test_joint_training.py`; `ProfilerPreflightAndFailureClassificationTests` (10) in
+`tests/test_joint_cache_diagnostics.py`. They cover: a dead mount raising instead of recomputing
+(Stage 03 and Stage 04 spies both at zero calls), the error naming artifact/image/path/errno/local
+state, Phase 1 refusing to recompute on an outage, local-hit-wins under a booby-trapped Drive both
+directly and through the generator, a truncated persistent lesion file reported without being
+modified, a genuine ENOENT still computing normally, bounded retry, a transient blip recovering on
+retry without recomputation, and the preflight/classification behaviors.
+
+**Still open.** This fixes the profiler's failure and a real production hazard; it does not yet
+explain the 2.44 → 4.65 s/step regression. That needs the profiler to complete on the real runtime.
