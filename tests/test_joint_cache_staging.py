@@ -156,21 +156,41 @@ class PlanTests(_StagingTestBase):
                          + jcs.FREE_SPACE_MARGIN_BYTES)
         self.assertTrue(plan["fits"])
 
-    def test_plan_stops_at_the_first_mount_failure_instead_of_scanning_on(self):
+    def test_planning_performs_no_per_file_drive_stat(self):
+        """The metadata-cost fix (§43): planning must cost two directory listings, not one Drive
+        stat per file. A real run measured ~1.0 s per Drive file operation, so per-file stat-ing
+        14,595 sources cost hours before the first byte moved."""
         self.populate_drive()
-        calls = {"n": 0}
+        drive_root = os.path.abspath(self.tree.root)
+        stats = {"n": 0}
         real_stat = os.stat
 
-        def flaky(path, *args, **kwargs):
+        def counting_stat(path, *args, **kwargs):
             if os.path.abspath(str(path)).startswith(os.path.abspath(self.tree.drive)):
-                calls["n"] += 1
-                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+                stats["n"] += 1
             return real_stat(path, *args, **kwargs)
 
-        with mock.patch("os.stat", side_effect=flaky):
+        with mock.patch("os.stat", side_effect=counting_stat):
             plan = self.plan()
-        self.assertTrue(plan["drive_unreachable"])
-        self.assertIn("Transport endpoint", plan["drive_error"])
+        self.assertEqual(len(plan["to_copy"]), 4 * len(self.IDS))
+        self.assertEqual(stats["n"], 0, "planning still stats individual persistent files")
+
+    def test_plan_stops_at_the_first_mount_failure_instead_of_scanning_on(self):
+        """Planning now reads directory listings, so that is the operation a dead mount fails on.
+        The property under test is unchanged: it must stop, not read the failure as 'absent'."""
+        self.populate_drive()
+        calls = {"n": 0}
+        real_listdir = os.listdir
+
+        def flaky(path, *args, **kwargs):
+            if os.path.abspath(str(path)).startswith(os.path.abspath(self.tree.root))                     and "drive" in str(path).lower():
+                calls["n"] += 1
+                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+            return real_listdir(path, *args, **kwargs)
+
+        with mock.patch("os.listdir", side_effect=flaky):
+            with self.assertRaises(jtd.PersistentCacheUnavailableError):
+                self.plan()
         self.assertLessEqual(calls["n"], 2, "kept probing a mount that had already failed")
 
 

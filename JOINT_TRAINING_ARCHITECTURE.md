@@ -1667,3 +1667,96 @@ byte identical to their persistent originals.
 **Still open.** This makes the local cache complete and the profiler runnable. It does NOT explain
 the 2.44 -> 4.65 s/step regression, which remains unmeasured until the profiler completes with
 zero Drive fallback.
+
+---
+
+## 43. Staging 14,595 loose files from Drive takes 4 hours — the cost is per-file latency, so the cache is packed into a few large shards
+
+**The measurement that settles it.** A real staging run moved 200 files in 201.4s and 400 in
+404.2s: **1.007 and 1.011 s/file, constant to within 3.5 ms**. At the measured 2.00 MiB average
+that is an effective **2.08 MB/s** — an order of magnitude below what the same mount delivers
+sequentially, and flat with respect to how many files have already been copied. A bandwidth-bound
+copy would vary with file size; a fixed per-file cost does not. So the price is ~1 second per
+Drive file *open*: 14,595 x 1 s = 4.05 h, while the same 28.56 GiB read sequentially is 10-26 min.
+
+**The lever is therefore the NUMBER of Drive file operations, not the number of bytes.** That also
+condemned part of Sec 42's own implementation: `plan_mirror()` performed one `os.stat` per source
+file, adding ~14,595 more Drive round trips before the first byte was copied.
+
+**Artifact geometry (measured on real-format files).**
+
+| artifact | shape | dtype | bytes | derivation |
+|---|---|---|---|---|
+| vessel | (512,512,1) | float32 | 1,048,704 | 512*512*1*4 + 128 |
+| lesion | (512,512,4) | float32 | 4,194,432 | 512*512*4*4 + 128 |
+| rgb | (512,512,3) | float32 | 3,145,856 | 512*512*3*4 + 128 |
+| reliability | kappa(4,) + scalar r | float32 | ~518 | `.npz`, not geometric |
+
+Every `.npy` size is exactly determined by shape and dtype, verified against real files. Planning
+therefore needs **no per-file stat at all**: two directory listings answer existence for all 3662
+entries, and sizes are computed. `plan_mirror()` now works this way and performs zero per-file
+Drive stats; the reliability `.npz` uses a documented nominal size for the space check only, since
+stat-ing 3662 of them would cost roughly an hour to refine a rounding error.
+
+Train and validation are built by the SAME `_make_joint_dataset` and need the same four artifacts
+per entry — validation differs only by `shuffle=False, augment=False` — so train-only staging
+defers validation's cost rather than removing it.
+
+**Chosen design: uncompressed tar shards on Drive, stream-extracted.** Four measured properties
+decided it, on artifacts produced by the real Phase 1 code path:
+
+  * tar overhead is **0.11%** (53 KiB on 48 MiB), so a shard is the same size as the loose files;
+  * streaming extraction runs at **~135 MB/s** locally, ~3.8 min for 28.56 GiB;
+  * extracted files are **byte-identical** to the originals (24/24);
+  * `tarfile.open(mode="r|")` extracts from a **non-seekable source with zero seek attempts**.
+
+That last property is why a shard can be streamed straight off the FUSE mount with one open and
+never copied locally first — which is not a nicety but a requirement: archive plus extracted is
+~57.1 GiB against 45.83 GiB free, while extracted alone is 28.56 GiB and leaves ~17.3 GiB.
+
+The reason to prefer tar over a consolidated/mmap array format is compatibility: **extraction
+reproduces the existing representation exactly**, individual `.npy`/`.npz` files at the paths the
+pipeline already builds, so `_build_joint_sample`, `_get_or_compute_joint_frozen_outputs`,
+`_persistent_exists`, local-first precedence and every Sec 41 guarantee keep working with no
+change. A consolidated format would require changing the loader and inventing new cache semantics.
+
+**Compression is off by default, on evidence.** It was measured — vessel 42%, lesion 65%, rgb 25%
+of original — but those arrays came from an UNTRAINED model over synthetic images, which are far
+smoother than real Stage 03/04 output, so the ratios are optimistic and are not relied on. What
+does generalize is throughput: gzip-6 compresses at 7.7-22 MB/s on this CPU and Colab provides 2
+cores. Paying 20-40 min of CPU to shrink a transfer whose cost is latency rather than bandwidth is
+a bad trade. `compress=True` round-trips byte-identically and is available to evaluate on real
+data.
+
+**Costs.** Building pays the ~1 s/file cost once and is resumable per shard (a finished shard is
+durable and skipped; `max_shards` bounds a runtime): ~30 min per 1824-file shard, so two ~3-hour
+runtimes complete all 8. Every runtime after pays only extraction: 8 Drive opens, 17-26 min of
+sequential transfer plus ~3.8 min of local write. Fresh-runtime preparation goes from ~4 h to
+~40 min end to end.
+
+**Immediate unblock.** `STAGING_MAX_ENTRIES` on the Phase 1c cell stages a subset — 400 train
+entries is ~1600 files, ~27 min — which is enough for the profiler (30 batches plus a 256-entry
+shuffle buffer touches ~316 entries). Stated caveat: a ~3.1 GiB working set page-caches in RAM
+where 28.56 GiB cannot, so subset profiling yields a trustworthy COMPUTE-side measurement and an
+optimistic I/O-side one.
+
+**Persistent local storage.** Inspected rather than assumed: `colab_config.py` knows only
+`/content/drive` (Drive FUSE) and paths under the ephemeral `/content`. No persistent-local
+mechanism exists in this configuration; Drive is the only persistence available.
+
+**Not changed.** `joint_training_dataset.py`'s cache resolution, the model, batch size, optimizer,
+augmentation and every training setting are untouched. The persistent cache is only ever read.
+
+**Regression tests.** `tests/test_joint_cache_archive.py` (25) covers derived sizes matching real
+files, indexing via listings with zero per-file stats, a dead mount raising rather than listing
+empty, shards covering every complete entry, the source staying byte- and mtime-identical,
+incomplete entries excluded and never fabricated, resumable builds skipping finished shards, an
+interrupted shard leaving nothing a later run would trust, byte-identical extraction at the
+expected paths, idempotent extraction, a corrupt shard reported without aborting the rest, a mount
+failure mid-extract keeping what landed, refusal on insufficient space, streaming never seeking the
+source, and compressed round-trip correctness. The decisive one runs the REAL `_build_joint_sample`
+against an extracted cache with every persistent path booby-trapped to raise, proving the extracted
+cache alone is sufficient and no recomputation occurs.
+
+**Still open.** This makes trustworthy profiling reachable. It does not explain the 2.44 -> 4.65
+s/step regression, which remains unmeasured.

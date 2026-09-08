@@ -106,6 +106,15 @@ def plan_mirror(entries, cache_dir, racaf_cache_dir, persistent_cache_dir,
     Stops at the first mount failure and returns what it has, with `drive_unreachable` set."""
     image_size = image_size if image_size is not None else jtd.STAGE5_IMAGE_SIZE
     entries = list(entries)
+    # ONE directory listing per persistent cache dir replaces ~14,595 per-file Drive stats. A real
+    # run measured ~1.0 s per Drive file operation, so per-file stat-ing the plan alone cost hours
+    # before the first byte was copied. Sizes are derived from shape+dtype rather than stat'ed --
+    # a `.npy` is exactly H*W*C*4 + 128 bytes, verified against real files (§43).
+    import joint_cache_archive as _jca
+    persistent_names = {
+        "features": _jca.list_cache_dir(persistent_cache_dir),
+        "racaf": _jca.list_cache_dir(persistent_racaf_cache_dir),
+    }
     plan = {
         "entries": len(entries),
         "already_local_entries": 0,
@@ -133,15 +142,13 @@ def plan_mirror(entries, cache_dir, racaf_cache_dir, persistent_cache_dir,
         missing_both = []
         for artifact in missing_local:
             source = persistent[artifact]
-            try:
-                size = _persistent_size(source, artifact, id_code)
-            except jtd.PersistentCacheUnavailableError as error:
-                plan["drive_unreachable"] = True
-                plan["drive_error"] = str(error)
-                return _finalize_plan(plan)
-            if size is None:
+            names = persistent_names["racaf"] if artifact == "reliability" else persistent_names["features"]
+            if os.path.basename(source) not in names:
                 missing_both.append(artifact)
                 continue
+            # Derived, never stat'ed -- see _jca.expected_artifact_bytes. The plan's byte total
+            # is a space check, and the real size of every file is measured when it is copied.
+            size = _jca.expected_artifact_bytes(artifact, image_size) or 0
             plan["to_copy"].append((id_code, artifact, source, local[artifact], size))
             plan["bytes_to_copy"] += size
             plan["bytes_by_artifact"][artifact] += size
