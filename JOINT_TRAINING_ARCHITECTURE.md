@@ -1589,3 +1589,81 @@ retry without recomputation, and the preflight/classification behaviors.
 
 **Still open.** This fixes the profiler's failure and a real production hazard; it does not yet
 explain the 2.44 → 4.65 s/step regression. That needs the profiler to complete on the real runtime.
+
+---
+
+## 42. The local cache is empty on every fresh runtime — a one-time persistent-to-local mirror, and atomic cache writes
+
+**Symptom.** A fresh-runtime preflight audited the 2929 training entries and found **5 fully
+local, 2916 that would fall back to Drive, 8 missing from both**. The profiler correctly refused to
+measure: 2916 Drive reads would have measured FUSE latency rather than the training step, and that
+is the load shape that previously produced `Errno 107`.
+
+**Root cause, proven from the numbers and the notebook, not inferred.** The reported figures are
+internally exact: `5 + 2916 + 8 = 2929`; local misses `2924 = 2929 - 5`; the local feature cache
+held **15 files = 5 entries x 3 kinds** (vessel/lesion/rgb) and the local RACAF cache held exactly
+5. That is precisely the footprint of the Phase 1a cache-diagnostic cell, which runs with
+`DIAGNOSTIC_MAX_IMAGES = 5` and writes into `LOCAL_CACHE_DIR`/`LOCAL_RACAF_CACHE_DIR`. In that
+runtime `RUN_CACHE_PRECOMPUTATION` was `False`, so Phase 1 -- the thing that mirrors persistent
+entries locally -- never ran.
+
+So nothing was lost or corrupted. `/content` is wiped on every fresh runtime while the Drive cache
+survives, and the only writer of the local cache that session was the 5-image diagnostic. **Every
+fresh runtime starts with an empty local cache, and the workflow must explicitly populate it
+before training.** That step did not exist as its own operation.
+
+The 8 entries missing persistently are consistent with the known empty-FOV set: persistent counts
+were vessel/lesion/reliability 3651 against rgb 3662, and `3662 - 3651 = 11`, the documented
+empty-FOV count. Eight fall in the 2929-entry train split, which leaves three for the 733-entry
+val split. Those images have no vessel/lesion/reliability by design -- Stage 03's FOV circle-fit
+finds no fundus disk -- and their handling is unchanged: the generator skips them, Phase 1 records
+them under `skipped_empty_fov`, and nothing here fabricates an artifact for them.
+
+**A second, independent defect found while tracing this.** Phase 1's persistent-to-local mirror
+wrote with a plain `np.save(final_path, ...)`. An interrupted write -- a Colab disconnect mid-copy
+-- therefore leaves a TRUNCATED `.npy` at the real cache filename, and every later
+`os.path.exists()` check in this module treats it as a valid cache hit. All five cache-write sites
+now go through `_atomic_save()`: temp file, then `os.replace()`, which is atomic on POSIX, so a
+real cache filename only ever names a complete file. The temp name deliberately preserves the
+original extension, because `np.save`/`np.savez` silently append `.npy`/`.npz` to a name that
+lacks one and would otherwise write somewhere other than the path being renamed.
+
+**The mirror (`joint_cache_staging.py`).** A one-time, controlled copy: plans first by `os.stat`-ing
+the real persistent files (never an assumed per-artifact size), reports per-artifact file counts
+and bytes against measured free space, and refuses to start unless the copy fits with a 5% + 2 GiB
+margin. Each file is copied to a temp name, size-compared against the source, `np.load`-ed and
+shape-validated through the project's own `jtd._validate_cached_array`, and only then
+`os.replace`-d into place -- a byte copy alone would not notice an array that cannot be parsed,
+and a load alone would not give a byte-identical local file; doing both gives both. It never
+writes to, deletes from or repairs anything on Drive, never loads a model (so recomputation is
+structurally impossible), stops immediately on `ENOTCONN` rather than continuing through thousands
+more files, records a corrupt source and moves on so one bad file cannot block ~2900 good ones,
+and is resumable and idempotent since only locally-missing files are copied.
+
+Copying is **sequential by default** (`max_workers=1`). This runs once per runtime and the goal is
+mount stability, not throughput: `dataset_staging.sync_missing_files()`'s 16-thread pool is the
+right tool for the small PUSH back to Drive and explicitly the wrong one for a bulk PULL, per its
+own docstring and Sec 35.
+
+**Not changed.** Batch size, model architecture, trainable parameters, optimizer, learning rate,
+mixed precision, XLA/JIT, loss, QWK, callbacks, validation logic, `steps_per_execution`, the data
+split, frozen Stage 03/04, RACAF, canonical RGB generation, augmentation, cache layout, cache
+filenames and cache directories. No cache was regenerated and the persistent cache was not
+modified.
+
+**Regression tests.** `tests/test_joint_cache_staging.py` (26): planning measures real source sizes
+and per-artifact bytes; already-local entries are not planned; entries absent from Drive are
+reported and never planned; free space is checked and the mirror refuses without copying anything;
+planning stops at the first mount failure instead of scanning on; a full mirror makes every entry
+fully local with zero Drive fallback; copies are byte-identical to their originals; the persistent
+cache is byte- and mtime-identical afterwards; the frozen entry points are never called; mirroring
+is idempotent and resumable; a copy that dies mid-write leaves no file at the real name and no temp
+behind; a truncated source is rejected, left untouched, and does not block the other entries; a
+size mismatch is rejected; a mount failure mid-copy stops immediately; `ENOTCONN` is not recorded
+as corruption; verification separates Drive-fallback from missing-everywhere; empty-FOV-style
+entries are a legitimate skip rather than an error; and sampled staged copies are numerically and
+byte identical to their persistent originals.
+
+**Still open.** This makes the local cache complete and the profiler runnable. It does NOT explain
+the 2.44 -> 4.65 s/step regression, which remains unmeasured until the profiler completes with
+zero Drive fallback.

@@ -407,6 +407,32 @@ def _load_persistent_array(path, artifact, id_code, image_size, local_path=None)
     )
 
 
+def _atomic_save(path, save_fn):
+    """Writes a cache file through a temp name and `os.replace()`s it into place (§42).
+
+    A plain `np.save(final_path, ...)` that is interrupted -- a Colab disconnect, a killed
+    runtime -- leaves a TRUNCATED file at the real cache filename, and every later
+    `os.path.exists()` check in this module then treats it as a valid cache hit. The rename is
+    atomic on POSIX, so the real filename only ever names a complete file. Same convention
+    `dataset_staging._copy_one` already uses for its own copies."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    # The temp name MUST keep the original extension: `np.save`/`np.savez` silently append
+    # `.npy`/`.npz` to a filename that lacks one, which would leave the temp file at a different
+    # path than the one being renamed.
+    base, extension = os.path.splitext(path)
+    temp = "%s.tmp-%d%s" % (base, os.getpid(), extension)
+    try:
+        save_fn(temp)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+
+
 def _canonical_rgb_cache_path(id_code, cache_dir, image_size):
     """Reuses `lfed._cache_path`'s existing filename convention with a new `kind="rgb"` -- no new
     cache-path scheme, just one more entry alongside the existing `"vessel"`/`"lesion"` kinds."""
@@ -434,13 +460,11 @@ def _get_or_compute_canonical_rgb(rgb_native, rgb_cache_path, image_size,
         canonical_rgb = _load_persistent_array(
             persistent_rgb_cache_path, "rgb", id_code, image_size, local_path=rgb_cache_path,
         )
-        os.makedirs(os.path.dirname(rgb_cache_path), exist_ok=True)
-        np.save(rgb_cache_path, canonical_rgb)
+        _atomic_save(rgb_cache_path, lambda tmp: np.save(tmp, canonical_rgb))
         return canonical_rgb
 
     canonical_rgb = _resize_rgb_01(rgb_native, image_size)
-    os.makedirs(os.path.dirname(rgb_cache_path), exist_ok=True)
-    np.save(rgb_cache_path, canonical_rgb)
+    _atomic_save(rgb_cache_path, lambda tmp: np.save(tmp, canonical_rgb))
     return canonical_rgb
 
 
@@ -541,14 +565,12 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
         # Mirror to the local cache path (once) so every later call for this image reads local
         # disk, never the persistent (typically Drive) location again.
         if not os.path.exists(vessel_cache_path):
-            os.makedirs(os.path.dirname(vessel_cache_path), exist_ok=True)
-            np.save(vessel_cache_path, vessel_map)
+            _atomic_save(vessel_cache_path, lambda tmp: np.save(tmp, vessel_map))
         if not os.path.exists(lesion_cache_path):
-            os.makedirs(os.path.dirname(lesion_cache_path), exist_ok=True)
-            np.save(lesion_cache_path, lesion_maps)
+            _atomic_save(lesion_cache_path, lambda tmp: np.save(tmp, lesion_maps))
         if not os.path.exists(reliability_cache_path):
-            os.makedirs(os.path.dirname(reliability_cache_path), exist_ok=True)
-            np.savez(reliability_cache_path, kappa=kappa, r=np.float32(r))
+            _atomic_save(reliability_cache_path,
+                         lambda tmp: np.savez(tmp, kappa=kappa, r=np.float32(r)))
         return vessel_map, lesion_maps, kappa, r
 
     native_vessel_map = predict_vessel_mask(rgb_native, model=vessel_model)["probability_map"].astype(np.float32)
@@ -566,14 +588,12 @@ def _get_or_compute_joint_frozen_outputs(rgb_native, vessel_cache_path, lesion_c
     r = float(reliability["r"][0])
 
     if not os.path.exists(vessel_cache_path):
-        os.makedirs(os.path.dirname(vessel_cache_path), exist_ok=True)
-        np.save(vessel_cache_path, vessel_map)
+        _atomic_save(vessel_cache_path, lambda tmp: np.save(tmp, vessel_map))
     if not os.path.exists(lesion_cache_path):
-        os.makedirs(os.path.dirname(lesion_cache_path), exist_ok=True)
-        np.save(lesion_cache_path, lesion_maps)
+        _atomic_save(lesion_cache_path, lambda tmp: np.save(tmp, lesion_maps))
     if not os.path.exists(reliability_cache_path):
-        os.makedirs(os.path.dirname(reliability_cache_path), exist_ok=True)
-        np.savez(reliability_cache_path, kappa=kappa, r=np.float32(r))
+        _atomic_save(reliability_cache_path,
+                     lambda tmp: np.savez(tmp, kappa=kappa, r=np.float32(r)))
 
     return vessel_map, lesion_maps, kappa, r
 
