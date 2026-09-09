@@ -599,6 +599,527 @@ def profile_combined(model, dataset, roots, batches=DEFAULT_BATCHES):
 
 
 # =====================================================================
+# 4b. PHASE F -- step breakdown with correct asynchronous attribution
+# =====================================================================
+#
+# Why this exists alongside Phase D, rather than replacing it.
+#
+# Phase D answers "roughly where does a step go" and its per-section syncs drain ONE tensor
+# (`grads[0]`, `trainable_variables[0]`). TensorFlow's eager execution is asynchronous: an op
+# returns a handle as soon as it is enqueued, and reading any tensor only forces the ops that
+# tensor depends on. `grads[0]` is the gradient of the FIRST trainable variable, which backprop
+# produces LAST, so draining it happens to cover most of the backward pass -- but that is a
+# property of variable ordering, not a guarantee, and `trainable_variables[0]` is updated near
+# the START of `apply_gradients`, so draining it does NOT cover the other 392 updates. Work that
+# is still in flight when a timing boundary is taken lands in whichever section drains next.
+# That is exactly the misattribution to rule out before believing "the optimizer takes 2.1 s".
+#
+# Phase F therefore:
+#   * drains EVERY tensor a section produces, not one of them, and measures the drain's own cost
+#     separately so it can be subtracted rather than silently included;
+#   * times `apply_gradients` BOTH with and without a drain. Enqueue-only time is CPU work
+#     (Python, op dispatch); drain time is GPU work. That single pair answers "is the optimizer
+#     CPU-bound or GPU-bound" directly instead of by inference;
+#   * records `time.process_time()` (CPU time actually burned by this process) beside wall time
+#     for every section. CPU/wall near 1.0 means the host is busy; near 0.0 means it is blocked
+#     waiting on the device;
+#   * cross-checks the whole decomposition against a single-drain run of the same work. If the
+#     per-section sum matches the one-drain total, the per-section boundaries are real;
+#   * measures the COMPILED path (`model.train_on_batch`, which Keras runs inside a `tf.function`)
+#     next to the eager tape loop. `Trainer.fit()` -> `model.fit()` uses the compiled path, so an
+#     eager-only measurement is not measuring what training does.
+#
+# Measurement only: no architecture, optimizer, batch size, loss, precision policy or JIT setting
+# is changed here. Weights are snapshotted and restored; the optimizer's slot state IS advanced,
+# so rebuild and recompile before a real run.
+
+
+def _grad_tensor(gradient):
+    """Dense tensor for a gradient that may be a `tf.IndexedSlices` (sparse) update."""
+    return gradient.values if isinstance(gradient, tf.IndexedSlices) else gradient
+
+
+def _dtype_name(tensor):
+    """Keras 3 `Variable.dtype` is a plain string while `tf.Tensor.dtype` is a `tf.DType`, and
+    this inventory mixes both. Normalize to the name."""
+    dtype = getattr(tensor, "dtype", None)
+    return getattr(dtype, "name", None) or str(dtype)
+
+
+def _dtype_bytes(tensor):
+    try:
+        return tf.as_dtype(_dtype_name(tensor)).size
+    except Exception:  # noqa: BLE001
+        return 4
+
+
+def _element_count(tensor):
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return 0
+    try:
+        dimensions = [int(d) for d in shape]
+    except TypeError:
+        return 0
+    return int(np.prod(dimensions)) if dimensions else 1
+
+
+def _drain(tensors):
+    """Forces every op producing `tensors` to complete, with ONE host read.
+
+    `tf.add_n` over per-tensor reductions makes the single scalar depend on all of them, so the
+    `.numpy()` cannot return until the whole set is materialized -- unlike reading one tensor,
+    which leaves the rest in flight. Cast to float32 first so a mixed-precision (float16) or
+    integer tensor is handled identically."""
+    parts = [tf.reduce_sum(tf.cast(_grad_tensor(t), tf.float32))
+             for t in tensors if t is not None]
+    if not parts:
+        return 0.0
+    return float(tf.add_n(parts).numpy())
+
+
+class _Section:
+    """Wall time, process CPU time and (optionally) GPU telemetry for one measured region."""
+
+    def __init__(self, name):
+        self.name = name
+        self.wall = []
+        self.cpu = []
+        self._wall0 = None
+        self._cpu0 = None
+
+    def __enter__(self):
+        self._wall0 = time.perf_counter()
+        self._cpu0 = time.process_time()
+        return self
+
+    def __exit__(self, *exc):
+        self.wall.append(time.perf_counter() - self._wall0)
+        self.cpu.append(time.process_time() - self._cpu0)
+        return False
+
+    def summary(self, skip_first=True):
+        wall = self.wall[1:] if (skip_first and len(self.wall) > 1) else self.wall
+        cpu = self.cpu[1:] if (skip_first and len(self.cpu) > 1) else self.cpu
+        if not wall:
+            return None
+        mean_wall = sum(wall) / len(wall)
+        mean_cpu = sum(cpu) / len(cpu)
+        return {
+            "samples": len(wall),
+            "wall_seconds": mean_wall,
+            "cpu_seconds": mean_cpu,
+            "cpu_over_wall": (mean_cpu / mean_wall) if mean_wall else None,
+            "min_wall_seconds": min(wall),
+            "max_wall_seconds": max(wall),
+            # Every individual iteration, so a one-off outlier is visible rather than averaged
+            # into a mean that then looks like steady state.
+            "all_wall_seconds": list(wall),
+        }
+
+
+def describe_training_stack(model, gradients=None):
+    """The static inventory the step breakdown has to be read against: how many tensors the
+    optimizer actually updates, what dtypes they are, how many slot variables back them, whether
+    any gradient processing is configured, and whether anything is compiled or XLA'd.
+
+    Read from the live objects, never from what the notebook says it configured."""
+    optimizer = getattr(model, "optimizer", None)
+    trainable = list(model.trainable_variables)
+
+    def inventory(tensors):
+        by_dtype, total_elements, total_bytes = {}, 0, 0
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            dense = _grad_tensor(tensor)
+            dtype = _dtype_name(dense)
+            by_dtype[dtype] = by_dtype.get(dtype, 0) + 1
+            elements = _element_count(dense)
+            total_elements += elements
+            total_bytes += elements * _dtype_bytes(dense)
+        return {"count": sum(by_dtype.values()), "by_dtype": by_dtype,
+                "elements": total_elements, "bytes": total_bytes}
+
+    report = {
+        "trainable": inventory(trainable),
+        "gradients": inventory(gradients) if gradients is not None else None,
+        "none_gradients": (sum(1 for g in gradients if g is None)
+                           if gradients is not None else None),
+        "largest_trainable": sorted(
+            ((_element_count(v), getattr(v, "path", None) or v.name, tuple(v.shape),
+              _dtype_name(v)) for v in trainable), reverse=True)[:10],
+        "optimizer": None,
+        "jit": {
+            "model_jit_compile": getattr(model, "jit_compile", None),
+            "global_jit": None,
+            "XLA_FLAGS": os.environ.get("XLA_FLAGS"),
+            "TF_XLA_FLAGS": os.environ.get("TF_XLA_FLAGS"),
+        },
+        "dtype_policy": getattr(getattr(model, "dtype_policy", None), "name", None),
+        "global_policy": None,
+        "run_eagerly": getattr(model, "run_eagerly", None),
+        "steps_per_execution": None,
+    }
+    try:
+        report["jit"]["global_jit"] = tf.config.optimizer.get_jit()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        report["global_policy"] = tf.keras.mixed_precision.global_policy().name
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        value = getattr(model, "steps_per_execution", None)
+        report["steps_per_execution"] = int(value) if value is not None else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    if optimizer is not None:
+        slots = list(getattr(optimizer, "variables", []) or [])
+        slot_by_dtype = {}
+        slot_bytes = 0
+        for variable in slots:
+            dtype = _dtype_name(variable)
+            slot_by_dtype[dtype] = slot_by_dtype.get(dtype, 0) + 1
+            slot_bytes += _element_count(variable) * _dtype_bytes(variable)
+        report["optimizer"] = {
+            "type": type(optimizer).__name__,
+            "inner_optimizer": type(getattr(optimizer, "inner_optimizer", None)).__name__
+                               if getattr(optimizer, "inner_optimizer", None) is not None else None,
+            "loss_scale_factor": getattr(optimizer, "loss_scale_factor", None),
+            "clipnorm": getattr(optimizer, "clipnorm", None),
+            "clipvalue": getattr(optimizer, "clipvalue", None),
+            "global_clipnorm": getattr(optimizer, "global_clipnorm", None),
+            "use_ema": getattr(optimizer, "use_ema", None),
+            "slot_variables": len(slots),
+            "slot_variables_by_dtype": slot_by_dtype,
+            "slot_bytes": slot_bytes,
+            "iterations": None,
+        }
+        try:
+            report["optimizer"]["iterations"] = int(optimizer.iterations)
+        except Exception:  # noqa: BLE001
+            pass
+    return report
+
+
+def profile_optimizer_breakdown(model, batch, batches=DEFAULT_BATCHES):
+    """PHASE F -- see this section's header. One already-materialized batch, reused, so no dataset
+    work happens and every number is model/optimizer time. Returns a plain dict.
+
+    The `apply_gradients` section deliberately re-applies the SAME gradient tensors: the ops, their
+    shapes and their memory traffic are identical to a real step, and holding the gradients fixed
+    is what isolates the optimizer from the backward pass that would otherwise be recomputed inside
+    the timed region. The resulting weights are meaningless, which is why they are restored."""
+    (inputs, labels) = batch
+    # `tf.data` yields the three model inputs as a TUPLE. Keras reads a tuple `x` as a nested
+    # structure in some paths and as `(x, y)` in others, so normalize to a list once here --
+    # the tensors themselves are untouched.
+    if isinstance(inputs, tuple):
+        inputs = list(inputs)
+    saved_weights = model.get_weights()
+    optimizer = model.optimizer
+    loss_fn = model.loss
+    trainable = list(model.trainable_variables)
+
+    report = {"batches": batches, "sections": {}, "telemetry": {}, "notes": []}
+
+    def taped_gradients():
+        with tf.GradientTape() as tape:
+            outputs = model(inputs, training=True)
+            loss = loss_fn(labels, outputs)
+        return outputs, loss, tape.gradient(loss, trainable)
+
+    # --- warm-up: graph build, cuDNN autotune, slot creation. Never measured. ---------------
+    warm = time.perf_counter()
+    outputs, loss, gradients = taped_gradients()
+    optimizer.apply_gradients(zip(gradients, trainable))
+    _drain(trainable)
+    report["warmup_seconds"] = time.perf_counter() - warm
+    report["stack"] = describe_training_stack(model, gradients)
+
+    # --- the cost of the drain itself, on tensors that are ALREADY materialized -------------
+    # Subtractable overhead: whatever this costs is inside every drained section below.
+    drain_grads = _Section("drain_gradients")
+    drain_vars = _Section("drain_variables")
+    for _ in range(max(3, min(batches, 5))):
+        with drain_grads:
+            _drain(gradients)
+        with drain_vars:
+            _drain(trainable)
+    report["sections"]["drain_gradients_overhead"] = drain_grads.summary()
+    report["sections"]["drain_variables_overhead"] = drain_vars.summary()
+
+    # --- F1: forward only -------------------------------------------------------------------
+    forward = _Section("forward")
+    sampler = _TelemetrySampler().start()
+    for _ in range(batches):
+        with forward:
+            out = model(inputs, training=True)
+            _drain([out])
+    report["telemetry"]["forward"] = sampler.stop()
+    report["sections"]["forward"] = forward.summary()
+
+    # --- F2: forward + gradient computation --------------------------------------------------
+    forward_grad = _Section("forward_and_gradients")
+    sampler = _TelemetrySampler().start()
+    for _ in range(batches):
+        with forward_grad:
+            _outputs, _loss, gradients = taped_gradients()
+            _drain(gradients)
+    report["telemetry"]["forward_and_gradients"] = sampler.stop()
+    report["sections"]["forward_and_gradients"] = forward_grad.summary()
+
+    # --- F3: apply_gradients, enqueue-only vs drained ---------------------------------------
+    # `apply_enqueue` measures the host returning from apply_gradients with device work possibly
+    # still in flight -- pure CPU/dispatch cost. `apply_drain` is what remained on the device.
+    # Their sum is the honest total; their ratio is the CPU-bound / GPU-bound answer.
+    apply_enqueue = _Section("apply_gradients_enqueue")
+    apply_drain = _Section("apply_gradients_drain")
+    apply_total = _Section("apply_gradients_total")
+    iterations_before = None
+    try:
+        iterations_before = int(optimizer.iterations)
+    except Exception:  # noqa: BLE001
+        pass
+    sampler = _TelemetrySampler().start()
+    for _ in range(batches):
+        with apply_total:
+            with apply_enqueue:
+                optimizer.apply_gradients(zip(gradients, trainable))
+            with apply_drain:
+                _drain(trainable)
+    report["telemetry"]["apply_gradients"] = sampler.stop()
+    report["sections"]["apply_gradients_enqueue"] = apply_enqueue.summary()
+    report["sections"]["apply_gradients_drain"] = apply_drain.summary()
+    report["sections"]["apply_gradients_total"] = apply_total.summary()
+    try:
+        report["optimizer_iterations"] = {
+            "before": iterations_before, "after": int(optimizer.iterations),
+            "applies_measured": batches,
+        }
+    except Exception:  # noqa: BLE001
+        report["optimizer_iterations"] = None
+
+    # --- F4: reading optimizer.iterations (a host<-device read on every fit() step) ----------
+    iteration_read = _Section("iterations_read")
+    for _ in range(max(3, min(batches, 5))):
+        with iteration_read:
+            try:
+                int(optimizer.iterations)
+            except Exception:  # noqa: BLE001
+                break
+    report["sections"]["iterations_read"] = iteration_read.summary()
+
+    # --- F5: attribution cross-check -- the SAME work, drained ONCE at the very end ----------
+    single = _Section("full_step_single_drain")
+    sampler = _TelemetrySampler().start()
+    for _ in range(batches):
+        with single:
+            _outputs, _loss, grads_once = taped_gradients()
+            optimizer.apply_gradients(zip(grads_once, trainable))
+            _drain(trainable)
+    report["telemetry"]["full_step_single_drain"] = sampler.stop()
+    report["sections"]["full_step_single_drain"] = single.summary()
+
+    # --- F6: the COMPILED path -- what model.fit() actually executes -------------------------
+    compiled = _Section("train_on_batch_compiled")
+    compiled_error = None
+    try:
+        model.train_on_batch(inputs, labels)  # builds the tf.function; not measured
+        sampler = _TelemetrySampler().start()
+        for _ in range(batches):
+            with compiled:
+                model.train_on_batch(inputs, labels)
+        report["telemetry"]["train_on_batch_compiled"] = sampler.stop()
+    except Exception as error:  # noqa: BLE001
+        compiled_error = repr(error)
+    report["sections"]["train_on_batch_compiled"] = compiled.summary()
+    report["compiled_error"] = compiled_error
+
+    model.set_weights(saved_weights)  # leave the model numerically where we found it
+    report["tf_gpu_memory"] = tf_gpu_memory()
+    report["classification"] = classify_optimizer_breakdown(report)
+    return report
+
+
+def classify_optimizer_breakdown(report):
+    """Turns the measured sections into the specific verdicts this diagnostic exists to produce.
+    Every branch cites the numbers it used; nothing is asserted that was not measured."""
+    sections = report["sections"]
+    verdicts = []
+
+    def value(name, key="wall_seconds"):
+        entry = sections.get(name)
+        return entry[key] if entry else None
+
+    enqueue = value("apply_gradients_enqueue")
+    drain = value("apply_gradients_drain")
+    drain_overhead = value("drain_variables_overhead") or 0.0
+    if enqueue is not None and drain is not None:
+        device = max(0.0, drain - drain_overhead)
+        total = enqueue + device
+        if total > 0:
+            host_fraction = enqueue / total
+            verdicts.append({
+                "question": "Is the optimizer CPU-bound or GPU-bound?",
+                "answer": ("CPU-BOUND" if host_fraction >= 0.6 else
+                           "GPU-BOUND" if host_fraction <= 0.4 else "MIXED"),
+                "evidence": ("apply_gradients returned to Python in %.1f ms; %.1f ms of device "
+                             "work remained (drain %.1f ms minus %.1f ms drain overhead). Host "
+                             "share %.0f%% of %.1f ms."
+                             % (enqueue * 1e3, device * 1e3, drain * 1e3,
+                                drain_overhead * 1e3, host_fraction * 100, total * 1e3)),
+            })
+
+    per_section = value("forward_and_gradients")
+    apply_total = value("apply_gradients_total")
+    single = value("full_step_single_drain")
+    samples = value("full_step_single_drain", "samples") or 0
+    if per_section is not None and apply_total is not None and single is not None:
+        summed = per_section + apply_total
+        delta = summed - single
+        relative = abs(delta) / single if single else None
+        thin = samples < 5
+        verdicts.append({
+            "question": "Are the per-section boundaries real, or is async work misattributed?",
+            "answer": ("TOO FEW SAMPLES TO JUDGE (%d)" % samples if thin else
+                       "SOUND" if relative is not None and relative <= 0.15 else
+                       "SUSPECT -- the decomposition does not add up to the full step"),
+            "evidence": ("sum of drained sections %.0f ms vs one-drain full step %.0f ms "
+                         "(difference %+.0f ms, %.0f%%), over %d post-warmup sample(s). A gap "
+                         "here means work is landing outside the section it is attributed to, or "
+                         "that the sections interact (allocator churn, memory pressure) -- "
+                         "re-run with more batches before drawing a conclusion."
+                         % (summed * 1e3, single * 1e3, delta * 1e3,
+                            (relative * 100) if relative is not None else float("nan"), samples)),
+        })
+
+    eager = single
+    compiled = value("train_on_batch_compiled")
+    if eager is not None and compiled is not None and compiled > 0:
+        verdicts.append({
+            "question": "How much of the step is eager dispatch rather than real computation?",
+            "answer": ("COMPILED IS %.2fx FASTER" % (eager / compiled) if compiled < eager
+                       else "COMPILED IS NOT FASTER (%.2fx)" % (eager / compiled)),
+            "evidence": ("eager taped step %.0f ms vs compiled train_on_batch %.0f ms. "
+                         "model.fit() uses the compiled path, so that is the one that bounds a "
+                         "real epoch. The comparison is conservative: train_on_batch ALSO "
+                         "computes the compiled QWK metric, which the eager loop does not."
+                         % (eager * 1e3, compiled * 1e3)),
+        })
+
+    stack = report.get("stack") or {}
+    optimizer = stack.get("optimizer") or {}
+    if optimizer:
+        clipping = [name for name in ("clipnorm", "clipvalue", "global_clipnorm")
+                    if optimizer.get(name) is not None]
+        verdicts.append({
+            "question": "Is there gradient processing/clipping time to account for?",
+            "answer": ("YES: " + ", ".join(clipping)) if clipping else "NO -- none configured",
+            "evidence": ("clipnorm=%r clipvalue=%r global_clipnorm=%r use_ema=%r"
+                         % (optimizer.get("clipnorm"), optimizer.get("clipvalue"),
+                            optimizer.get("global_clipnorm"), optimizer.get("use_ema"))),
+        })
+    policy = stack.get("global_policy")
+    model_policy = stack.get("dtype_policy")
+    if policy is not None:
+        verdicts.append({
+            "question": "Is mixed precision actually in effect for this model?",
+            "answer": ("YES" if model_policy and "float16" in str(model_policy) else
+                       "NO -- the model is %s" % model_policy),
+            "evidence": ("global policy %r, model dtype policy %r, optimizer %r "
+                         "(loss_scale_factor=%r). Keras captures the dtype policy when a layer is "
+                         "BUILT, so a policy set after the model was constructed does not apply "
+                         "to it." % (policy, model_policy, optimizer.get("type"),
+                                     optimizer.get("loss_scale_factor"))),
+        })
+    return verdicts
+
+
+def print_optimizer_breakdown(report):
+    print("=" * 78)
+    print("PHASE F -- STEP BREAKDOWN WITH EXPLICIT SYNCHRONIZATION")
+    print("=" * 78)
+    stack = report.get("stack") or {}
+    trainable = stack.get("trainable") or {}
+    gradients = stack.get("gradients") or {}
+    optimizer = stack.get("optimizer") or {}
+    print("  trainable tensors    : %s (%s parameters, %s)"
+          % (trainable.get("count"), format(trainable.get("elements") or 0, ","),
+             _gib(trainable.get("bytes"))))
+    print("    by dtype           : %s" % trainable.get("by_dtype"))
+    print("  gradient tensors     : %s (%s elements, %s); None gradients: %s"
+          % (gradients.get("count"), format(gradients.get("elements") or 0, ","),
+             _gib(gradients.get("bytes")), stack.get("none_gradients")))
+    print("    by dtype           : %s" % gradients.get("by_dtype"))
+    print("  optimizer            : %s (inner=%s, loss_scale_factor=%s)"
+          % (optimizer.get("type"), optimizer.get("inner_optimizer"),
+             optimizer.get("loss_scale_factor")))
+    print("    slot variables     : %s (%s), by dtype %s"
+          % (optimizer.get("slot_variables"), _gib(optimizer.get("slot_bytes")),
+             optimizer.get("slot_variables_by_dtype")))
+    print("    clipping           : clipnorm=%s clipvalue=%s global_clipnorm=%s use_ema=%s"
+          % (optimizer.get("clipnorm"), optimizer.get("clipvalue"),
+             optimizer.get("global_clipnorm"), optimizer.get("use_ema")))
+    print("  dtype policy         : model=%s global=%s"
+          % (stack.get("dtype_policy"), stack.get("global_policy")))
+    print("  jit/XLA              : model.jit_compile=%s global_jit=%s XLA_FLAGS=%s"
+          % (stack.get("jit", {}).get("model_jit_compile"),
+             stack.get("jit", {}).get("global_jit"), stack.get("jit", {}).get("XLA_FLAGS")))
+    print("  run_eagerly=%s  steps_per_execution=%s  warmup=%.2fs"
+          % (stack.get("run_eagerly"), stack.get("steps_per_execution"),
+             report.get("warmup_seconds") or 0.0))
+    if report.get("optimizer_iterations"):
+        print("  optimizer.iterations : %s -> %s over %s measured applies"
+              % (report["optimizer_iterations"]["before"],
+                 report["optimizer_iterations"]["after"],
+                 report["optimizer_iterations"]["applies_measured"]))
+    print("")
+    print("  %-30s %10s %10s %8s %10s %10s %4s"
+          % ("section", "wall ms", "cpu ms", "cpu/wall", "min ms", "max ms", "n"))
+    print("  " + "-" * 88)
+    for name in ("forward", "forward_and_gradients", "apply_gradients_enqueue",
+                 "apply_gradients_drain", "apply_gradients_total", "full_step_single_drain",
+                 "train_on_batch_compiled", "drain_gradients_overhead",
+                 "drain_variables_overhead", "iterations_read"):
+        entry = report["sections"].get(name)
+        if not entry:
+            continue
+        print("  %-30s %10.1f %10.1f %8.2f %10.1f %10.1f %4d"
+              % (name, entry["wall_seconds"] * 1e3, entry["cpu_seconds"] * 1e3,
+                 entry["cpu_over_wall"] if entry["cpu_over_wall"] is not None else float("nan"),
+                 entry["min_wall_seconds"] * 1e3, entry["max_wall_seconds"] * 1e3,
+                 entry["samples"]))
+    print("  cpu/wall near 1.0 = the host is busy; near 0.0 = the host is waiting on the device.")
+    print("")
+    print("  GPU utilization sampled DURING each section:")
+    for name, telemetry in (report.get("telemetry") or {}).items():
+        if not telemetry:
+            continue
+        gpu = telemetry.get("gpu_util_percent") or {}
+        cpu = telemetry.get("cpu_percent") or {}
+        memory = telemetry.get("gpu_mem_used_mb") or {}
+        print("    %-28s gpu mean %5.1f%% max %5.1f%%   cpu mean %5.1f%%   "
+              "gpu mem %6.0f MiB   samples %d"
+              % (name, gpu.get("mean") or 0.0, gpu.get("max") or 0.0, cpu.get("mean") or 0.0,
+                 memory.get("mean") or 0.0, gpu.get("samples") or 0))
+    if report.get("compiled_error"):
+        print("")
+        print("  compiled path NOT measured: %s" % report["compiled_error"])
+    print("")
+    print("  VERDICTS (each cites the measurement it rests on):")
+    for verdict in report.get("classification") or []:
+        print("    Q: %s" % verdict["question"])
+        print("       -> %s" % verdict["answer"])
+        print("          %s" % verdict["evidence"])
+    print("")
+    print("  This advanced the optimizer's slot state. Re-run the model construction cell before")
+    print("  any real training run.")
+
+
+# =====================================================================
 # 5. Per-artifact I/O breakdown from a recorder
 # =====================================================================
 

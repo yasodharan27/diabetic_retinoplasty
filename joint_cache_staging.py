@@ -464,7 +464,160 @@ def sample_numerical_integrity(entries, cache_dir, racaf_cache_dir, persistent_c
 
 
 # =====================================================================
-# 4. Rendering
+# 4. Raw APTOS images -- the MINIMUM the cache-backed path still needs
+# =====================================================================
+#
+# With a complete local cache, `_build_joint_sample` never opens a raw image: its
+# `if not (frozen_outputs_cached and rgb_cached)` guard short-circuits, so `lfed._load_raw_bgr`
+# is not reached at all (JOINT_TRAINING_ARCHITECTURE.md Sec 44). Staging all 3,662 raw APTOS
+# images is therefore ~9.5 GiB of local disk and ~3,663 Drive file opens spent on files nothing
+# reads.
+#
+# The exception is an entry whose LOCAL cache is incomplete. For the known empty-FOV images that
+# is permanent by design: Phase 1 caches their canonical RGB but cannot produce vessel/lesion/
+# reliability, so every epoch re-enters the compute branch, reads the raw image, and Stage 03
+# raises `EmptyFieldOfViewError`, which the generator catches and skips. Remove the raw image and
+# that graceful skip becomes a hard `FileNotFoundError` -- the generator catches only
+# `EmptyFieldOfViewError`, so the whole run dies on the first such entry (measured, Sec 44).
+#
+# So: stage the raw image for exactly the entries whose local cache is incomplete, and nothing
+# else. That is a pure SCOPE reduction -- every entry still takes the identical code path it
+# takes today, whether it ends in a cache hit, a recomputation, or an empty-FOV skip.
+
+RAW_IMAGE_EXTENSION = ".png"
+
+
+def entries_missing_local_cache(entries, cache_dir, racaf_cache_dir, image_size=None):
+    """`[(id_code, [missing_artifact, ...]), ...]` for every entry that is NOT a complete local
+    hit across all four artifacts -- i.e. exactly the entries whose sample build can still reach
+    `lfed._load_raw_bgr`. Local `os.path.exists` only: no Drive path is touched, no model is
+    loaded, nothing is written."""
+    image_size = image_size if image_size is not None else jtd.STAGE5_IMAGE_SIZE
+    incomplete = []
+    for id_code, _diagnosis in entries:
+        paths = jcd.artifact_paths(id_code, cache_dir, racaf_cache_dir, image_size)
+        missing = [artifact for artifact, path in paths.items() if not os.path.exists(path)]
+        if missing:
+            incomplete.append((id_code, missing))
+    return incomplete
+
+
+def _copy_raw_image(source, destination, attempts=jtd._PERSISTENT_READ_ATTEMPTS,
+                    base_delay=jtd._PERSISTENT_RETRY_BASE_DELAY_SECONDS):
+    """Atomic, size-verified copy of one raw image, with the same bounded retry on transient FUSE
+    errnos this module already uses for cache files. Same temp-then-`os.replace` convention as
+    `_copy_and_validate` and `dataset_staging._copy_one`; no content validation, because a raw
+    `.png` has no project-defined shape to check -- `cv2.imread` failing later is a real,
+    surfaced error, not something to be pre-empted by decoding every file here."""
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    temp = "%s.tmp-%d" % (destination, os.getpid())
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            shutil.copyfile(source, temp)
+            source_size = os.stat(source).st_size
+            if os.path.getsize(temp) != source_size:
+                raise OSError("copied size mismatch for %s" % source)
+            os.replace(temp, destination)
+            return source_size
+        except OSError as error:
+            last_error = error
+            if os.path.exists(temp):
+                try:
+                    os.remove(temp)
+                except OSError:
+                    pass
+            transient = getattr(error, "errno", None) in jtd._TRANSIENT_FUSE_ERRNOS
+            if not transient or attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    raise last_error  # pragma: no cover -- the loop always returns or raises
+
+
+def stage_raw_images_for_uncached_entries(entries, cache_dir, racaf_cache_dir, source_image_dir,
+                                          local_image_dir, image_size=None,
+                                          margin_bytes=FREE_SPACE_MARGIN_BYTES):
+    """Copies `source_image_dir/<id>.png` -> `local_image_dir/<id>.png` for exactly the entries
+    `entries_missing_local_cache` reports, and returns what it did.
+
+    Read-only with respect to `source_image_dir`. Never deletes or overwrites an image already
+    present locally. Never loads a model and never writes a cache file, so no frozen artifact can
+    be regenerated here. An entry whose raw image is absent at the source is REPORTED, not
+    fabricated and not silently dropped -- the training generator will raise for it exactly as it
+    does today when a raw image is genuinely missing.
+
+    Refuses to start (raising `InsufficientLocalSpaceError`) if the measured source bytes plus
+    `margin_bytes` do not fit in local free space. The per-file `os.stat` on the source is
+    affordable here precisely because this is a handful of files, not 14,595."""
+    image_size = image_size if image_size is not None else jtd.STAGE5_IMAGE_SIZE
+    entries = list(entries)
+    incomplete = entries_missing_local_cache(entries, cache_dir, racaf_cache_dir, image_size)
+    result = {
+        "entries": len(entries),
+        "entries_needing_raw": len(incomplete),
+        "needing_raw_ids": [id_code for id_code, _ in incomplete],
+        "copied": 0,
+        "already_local": 0,
+        "missing_at_source": [],
+        "bytes_copied": 0,
+        "source_bytes": 0,
+        "elapsed_seconds": 0.0,
+        "drive_unreachable": False,
+        "drive_error": None,
+        "local_image_dir": local_image_dir,
+    }
+    if not incomplete:
+        return result
+
+    os.makedirs(local_image_dir, exist_ok=True)
+    pending = []
+    for id_code, _missing in incomplete:
+        destination = os.path.join(local_image_dir, id_code + RAW_IMAGE_EXTENSION)
+        if os.path.exists(destination):
+            result["already_local"] += 1
+            continue
+        source = os.path.join(source_image_dir, id_code + RAW_IMAGE_EXTENSION)
+        try:
+            size = os.stat(source).st_size
+        except FileNotFoundError:
+            result["missing_at_source"].append(id_code)
+            continue
+        except OSError as error:
+            if getattr(error, "errno", None) in jtd._TRANSIENT_FUSE_ERRNOS:
+                result["drive_unreachable"] = True
+                result["drive_error"] = repr(error)
+                return result
+            raise
+        result["source_bytes"] += size
+        pending.append((id_code, source, destination))
+
+    if pending:
+        free = _free_bytes(local_image_dir)
+        required = int(result["source_bytes"] * FREE_SPACE_SAFETY_FACTOR) + margin_bytes
+        if free < required:
+            raise InsufficientLocalSpaceError(
+                "Refusing to stage %d raw image(s): %.2f GiB free, %.2f GiB required "
+                "(%.2f GiB of images + %.2f GiB margin)."
+                % (len(pending), free / 1024.0 ** 3, required / 1024.0 ** 3,
+                   result["source_bytes"] / 1024.0 ** 3, margin_bytes / 1024.0 ** 3))
+
+    start = time.perf_counter()
+    for id_code, source, destination in pending:
+        try:
+            result["bytes_copied"] += _copy_raw_image(source, destination)
+            result["copied"] += 1
+        except OSError as error:
+            if getattr(error, "errno", None) in jtd._TRANSIENT_FUSE_ERRNOS:
+                result["drive_unreachable"] = True
+                result["drive_error"] = repr(error)
+                break
+            raise
+    result["elapsed_seconds"] = time.perf_counter() - start
+    return result
+
+
+# =====================================================================
+# 5. Rendering
 # =====================================================================
 
 def _gib(num_bytes):
@@ -576,3 +729,28 @@ def print_result(result):
     for id_code, artifact, path, detail in result["corrupt"][:20]:
         print("    CORRUPT PERSISTENT (left untouched): %s %s %s" % (id_code, artifact, path))
         print("      %s" % detail)
+
+
+def print_raw_image_staging(result):
+    print("=" * 78)
+    print("RAW APTOS IMAGES -- staged only for entries without a complete local cache")
+    print("=" * 78)
+    print("  split entries                 : %d" % result["entries"])
+    print("  entries needing a raw image   : %d   <-- expected: the known empty-FOV entries"
+          % result["entries_needing_raw"])
+    print("  images copied this run        : %d (%.1f MiB in %.1fs)"
+          % (result["copied"], result["bytes_copied"] / 1024.0 ** 2, result["elapsed_seconds"]))
+    print("  already present locally       : %d" % result["already_local"])
+    print("  local image dir               : %s" % result["local_image_dir"])
+    if result["needing_raw_ids"]:
+        print("  ids: %s" % ", ".join(result["needing_raw_ids"][:25]))
+        if len(result["needing_raw_ids"]) > 25:
+            print("       ... and %d more" % (len(result["needing_raw_ids"]) - 25))
+    if result["missing_at_source"]:
+        print("")
+        print("  NOT FOUND at the source (left missing, never fabricated): %s"
+              % ", ".join(result["missing_at_source"][:25]))
+    if result["drive_unreachable"]:
+        print("")
+        print("  DRIVE UNREACHABLE mid-copy: %s" % result["drive_error"])
+        print("  Nothing was recomputed and nothing on Drive was modified. Re-mount and re-run.")

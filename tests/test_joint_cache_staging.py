@@ -110,6 +110,147 @@ class _StagingTestBase(unittest.TestCase):
         return jcs.verify_local_cache(**kwargs)
 
 
+
+# =====================================================================
+# Raw APTOS images -- staged ONLY for entries without a complete local cache
+# =====================================================================
+
+class RawImageStagingTests(_StagingTestBase):
+    """The cleanup that removed full raw-dataset staging from the training path. The property
+    under test is a SCOPE reduction: an entry with a complete local cache needs no raw image
+    (its sample build never reaches `lfed._load_raw_bgr`), while an entry without one still
+    needs exactly the image it needed before -- including the empty-FOV entries, whose graceful
+    skip depends on Stage 03 actually running and raising."""
+
+    def setUp(self):
+        super().setUp()
+        self.source_images = os.path.join(self.tree.root, "drive", "APTOS2019", "train_images")
+        self.local_images = os.path.join(self.tree.root, "content", "raw_images")
+        os.makedirs(self.source_images, exist_ok=True)
+        for id_code, _ in self.tree.entries:
+            with open(os.path.join(self.source_images, id_code + ".png"), "wb") as handle:
+                handle.write(b"\x89PNG\r\n\x1a\n" + id_code.encode() * 64)
+
+    def stage(self, **overrides):
+        kwargs = dict(entries=self.tree.entries, cache_dir=self.tree.local,
+                      racaf_cache_dir=self.tree.local_racaf,
+                      source_image_dir=self.source_images, local_image_dir=self.local_images)
+        kwargs.update(overrides)
+        return jcs.stage_raw_images_for_uncached_entries(**kwargs)
+
+    def test_a_fully_cached_entry_needs_no_raw_image(self):
+        for i, (id_code, _) in enumerate(self.tree.entries):
+            _write_entry(self.tree.local, self.tree.local_racaf, id_code, seed=i)
+        result = self.stage()
+        self.assertEqual(result["entries_needing_raw"], 0)
+        self.assertEqual(result["copied"], 0)
+        self.assertEqual(os.listdir(self.local_images) if os.path.isdir(self.local_images) else [],
+                         [])
+
+    def test_only_the_entries_without_a_complete_local_cache_are_staged(self):
+        # Two complete, one missing vessel only -- the shape of the real empty-FOV case, where
+        # canonical RGB is cached but the frozen Stage 03/04 artifacts are not.
+        for i, (id_code, _) in enumerate(self.tree.entries[:2]):
+            _write_entry(self.tree.local, self.tree.local_racaf, id_code, seed=i)
+        incomplete_id = self.tree.entries[2][0]
+        _write_entry(self.tree.local, self.tree.local_racaf, incomplete_id, seed=9)
+        os.remove(lfed._cache_path(self.tree.local, incomplete_id, "vessel", SIZE))
+
+        result = self.stage()
+        self.assertEqual(result["entries_needing_raw"], 1)
+        self.assertEqual(result["needing_raw_ids"], [incomplete_id])
+        self.assertEqual(result["copied"], 1)
+        self.assertEqual(sorted(os.listdir(self.local_images)), [incomplete_id + ".png"])
+
+    def test_every_artifact_kind_counts_as_incomplete_including_rgb(self):
+        for artifact in ("vessel", "lesion", "rgb", "reliability"):
+            with self.subTest(artifact=artifact):
+                tree = _Tree(["solo"])
+                self.addCleanup(tree.cleanup)
+                _write_entry(tree.local, tree.local_racaf, "solo", seed=0)
+                if artifact == "reliability":
+                    os.remove(racaf.reliability_cache_path(tree.local_racaf, "solo"))
+                elif artifact == "rgb":
+                    os.remove(jtd._canonical_rgb_cache_path("solo", tree.local, SIZE))
+                else:
+                    os.remove(lfed._cache_path(tree.local, "solo", artifact, SIZE))
+                missing = jcs.entries_missing_local_cache(
+                    tree.entries, tree.local, tree.local_racaf)
+                self.assertEqual([(id_code, kinds) for id_code, kinds in missing],
+                                 [("solo", [artifact])])
+
+    def test_the_copy_is_byte_identical_and_the_source_is_untouched(self):
+        source = os.path.join(self.source_images, self.tree.entries[0][0] + ".png")
+        with open(source, "rb") as handle:
+            original = handle.read()
+        original_mtime = os.stat(source).st_mtime_ns
+
+        self.stage()
+        copied = os.path.join(self.local_images, self.tree.entries[0][0] + ".png")
+        with open(copied, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        with open(source, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertEqual(os.stat(source).st_mtime_ns, original_mtime)
+
+    def test_rerunning_is_idempotent_and_recopies_nothing(self):
+        first = self.stage()
+        self.assertEqual(first["copied"], len(self.tree.entries))
+        second = self.stage()
+        self.assertEqual(second["copied"], 0)
+        self.assertEqual(second["already_local"], len(self.tree.entries))
+
+    def test_an_image_absent_at_the_source_is_reported_never_fabricated(self):
+        missing_id = self.tree.entries[1][0]
+        os.remove(os.path.join(self.source_images, missing_id + ".png"))
+        result = self.stage()
+        self.assertEqual(result["missing_at_source"], [missing_id])
+        self.assertFalse(os.path.exists(os.path.join(self.local_images, missing_id + ".png")))
+
+    def test_no_cache_file_is_ever_written_by_raw_image_staging(self):
+        before_local = sorted(os.listdir(self.tree.local))
+        before_racaf = sorted(os.listdir(self.tree.local_racaf))
+        self.stage()
+        self.assertEqual(sorted(os.listdir(self.tree.local)), before_local)
+        self.assertEqual(sorted(os.listdir(self.tree.local_racaf)), before_racaf)
+
+    def test_a_partial_copy_never_appears_under_the_real_filename(self):
+        id_code = self.tree.entries[0][0]
+        destination = os.path.join(self.local_images, id_code + ".png")
+        with mock.patch("shutil.copyfile", side_effect=OSError(errno.EACCES, "boom")):
+            with self.assertRaises(OSError):
+                self.stage()
+        self.assertFalse(os.path.exists(destination))
+        leftovers = [n for n in (os.listdir(self.local_images)
+                                 if os.path.isdir(self.local_images) else []) if ".tmp-" in n]
+        self.assertEqual(leftovers, [])
+
+    def test_a_dead_mount_stops_the_copy_and_is_reported_not_mistaken_for_absence(self):
+        with mock.patch("os.stat", side_effect=OSError(errno.ENOTCONN, "transport endpoint")):
+            result = self.stage()
+        self.assertTrue(result["drive_unreachable"])
+        self.assertEqual(result["missing_at_source"], [])
+        self.assertEqual(result["copied"], 0)
+
+    def test_insufficient_space_refuses_before_copying_anything(self):
+        with mock.patch.object(jcs, "_free_bytes", return_value=1):
+            with self.assertRaises(jcs.InsufficientLocalSpaceError):
+                self.stage()
+        self.assertEqual(os.listdir(self.local_images) if os.path.isdir(self.local_images) else [],
+                         [])
+
+    def test_planning_which_entries_need_a_raw_image_touches_no_drive_path(self):
+        for i, (id_code, _) in enumerate(self.tree.entries):
+            _write_entry(self.tree.local, self.tree.local_racaf, id_code, seed=i)
+        with mock.patch.object(jtd, "_persistent_exists",
+                               side_effect=AssertionError("persistent path probed")):
+            missing = jcs.entries_missing_local_cache(
+                self.tree.entries, self.tree.local, self.tree.local_racaf)
+        self.assertEqual(missing, [])
+
+    def test_renderer_runs_on_a_real_result(self):
+        jcs.print_raw_image_staging(self.stage())
+
 # =====================================================================
 # Planning -- measure before copying
 # =====================================================================

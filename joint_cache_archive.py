@@ -68,6 +68,16 @@ _ARTIFACT_CHANNELS = {"vessel": 1, "lesion": 4, "rgb": 3}
 # roughly an hour to refine a rounding error. Actual bytes are measured when each file is copied.
 NOMINAL_RELIABILITY_BYTES = 518
 
+# Local free space that must remain AFTER extraction. `/content` is not a scratch disk: the
+# runtime itself, pip's cache and any temp file a library writes all land there, and a full
+# `/content` fails in ways that look like unrelated bugs. Checkpoints and TensorBoard logs go to
+# Drive (`experiment_manager` resolves `experiment.root` under the Drive mount), so the training
+# run's own local footprint is small -- this margin exists for the runtime, not for training
+# outputs. Extraction itself needs NO headroom beyond the final size: each shard is streamed into
+# a staging dir on the SAME filesystem and its members are `os.replace`d into place, which is a
+# rename, so peak usage equals final usage.
+DEFAULT_RUNTIME_MARGIN_BYTES = 5 * 1024 ** 3
+
 
 def expected_artifact_bytes(artifact, image_size):
     """Exact on-disk size of one artifact, derived rather than stat'ed. `reliability` is a small
@@ -224,6 +234,94 @@ def build_archive(entries, persistent_cache_dir, persistent_racaf_cache_dir, arc
 # Extract -- stream shards from Drive straight into the local cache
 # =====================================================================
 
+def _free_bytes(path):
+    """Free space on the filesystem `path` will live on. Walks up to the nearest existing parent:
+    on a fresh runtime `/content/cache/local_feature_extraction` does not exist yet, and
+    `shutil.disk_usage` on a missing path raises. Same convention as
+    `joint_cache_staging._free_bytes` (restated rather than imported -- that module imports this
+    one)."""
+    resolved = os.path.abspath(path)
+    while resolved and not os.path.exists(resolved):
+        parent = os.path.dirname(resolved)
+        if parent == resolved:
+            break
+        resolved = parent
+    return shutil.disk_usage(resolved).free
+
+
+def plan_extraction(archive_dir, cache_dir, racaf_cache_dir,
+                    runtime_margin_bytes=DEFAULT_RUNTIME_MARGIN_BYTES, shards=None):
+    """Measures whether this runtime has the disk to extract the archive, BEFORE a byte is read.
+
+    Costs one directory listing plus one `os.stat` per shard on Drive (8 operations for the real
+    8-shard archive), and two local listings -- not a per-file scan of either side.
+
+    The budget is deliberately stated in terms of what is actually on this disk right now:
+
+        required = total shard bytes            (what a full extraction writes)
+                 - bytes already in the local cache dirs   (a resumed/partial extraction)
+                 + runtime_margin_bytes         (headroom `/content` must keep)
+
+    Extraction adds no transient peak above the final size (see `DEFAULT_RUNTIME_MARGIN_BYTES`),
+    and the raw APTOS dataset is deliberately NOT part of this budget -- the cache-backed path
+    does not stage it (`joint_cache_staging.stage_raw_images_for_uncached_entries`).
+
+    Returns a dict; `fits` is the answer. Raises `PersistentCacheUnavailableError` if the archive
+    directory itself cannot be listed, rather than reporting an empty archive."""
+    if shards is None:
+        try:
+            shards = sorted(name for name in os.listdir(archive_dir)
+                            if name.startswith("cache_shard_") and ".building" not in name)
+        except OSError as error:
+            raise jtd.PersistentCacheUnavailableError(None, None, archive_dir, error) from error
+
+    plan = {
+        "archive_dir": archive_dir,
+        "shards": len(shards),
+        "shard_names": list(shards),
+        "archive_bytes": 0,
+        "local_cache_bytes": 0,
+        "local_files": 0,
+        "runtime_margin_bytes": runtime_margin_bytes,
+        "required_bytes": 0,
+        "free_bytes": 0,
+        "free_after_bytes": 0,
+        "shortfall_bytes": 0,
+        "fits": False,
+        "drive_unreachable": False,
+        "drive_error": None,
+    }
+    for shard in shards:
+        try:
+            plan["archive_bytes"] += os.stat(os.path.join(archive_dir, shard)).st_size
+        except OSError as error:
+            if getattr(error, "errno", None) in jtd._TRANSIENT_FUSE_ERRNOS:
+                plan["drive_unreachable"] = True
+                plan["drive_error"] = repr(error)
+                return plan
+            raise
+
+    for directory in (cache_dir, racaf_cache_dir):
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            try:
+                if os.path.isfile(path):
+                    plan["local_cache_bytes"] += os.stat(path).st_size
+                    plan["local_files"] += 1
+            except OSError:
+                continue
+
+    outstanding = max(0, plan["archive_bytes"] - plan["local_cache_bytes"])
+    plan["required_bytes"] = outstanding + runtime_margin_bytes
+    plan["free_bytes"] = _free_bytes(cache_dir)
+    plan["free_after_bytes"] = plan["free_bytes"] - outstanding
+    plan["fits"] = plan["free_bytes"] >= plan["required_bytes"]
+    plan["shortfall_bytes"] = max(0, plan["required_bytes"] - plan["free_bytes"])
+    return plan
+
+
 class ArchiveIntegrityError(RuntimeError):
     """A shard member did not survive extraction intact."""
 
@@ -273,7 +371,7 @@ def extract_archive(archive_dir, cache_dir, racaf_cache_dir, image_size=None,
               "bytes_extracted": 0, "validated": 0, "corrupt": [], "elapsed_seconds": 0.0,
               "drive_unreachable": False, "drive_error": None, "skipped_existing": 0}
     if min_free_bytes is not None:
-        free = shutil.disk_usage(cache_dir).free
+        free = _free_bytes(cache_dir)
         if free < min_free_bytes:
             raise RuntimeError("Refusing to extract: %.2f GiB free but %.2f GiB required."
                                % (free / 1024 ** 3, min_free_bytes / 1024 ** 3))
@@ -370,6 +468,33 @@ def print_build(result):
         print("  %d shard(s) still to build -- re-run this cell (in a new runtime if needed);"
               % remaining)
         print("  finished shards are skipped automatically.")
+
+
+def print_extraction_plan(plan):
+    print("=" * 78)
+    print("LOCAL DISK BUDGET FOR EXTRACTION (measured, before anything is read)")
+    print("=" * 78)
+    print("  archive shards            : %d (%s on Drive)" % (plan["shards"], _gib(plan["archive_bytes"])))
+    print("  already extracted locally : %d files (%s)" % (plan["local_files"], _gib(plan["local_cache_bytes"])))
+    print("  still to write            : %s" % _gib(max(0, plan["archive_bytes"] - plan["local_cache_bytes"])))
+    print("  runtime margin required   : %s" % _gib(plan["runtime_margin_bytes"]))
+    print("  ------------------------------------------------------------------")
+    print("  required free space       : %s" % _gib(plan["required_bytes"]))
+    print("  actually free now         : %s" % _gib(plan["free_bytes"]))
+    print("  free after extraction     : %s" % _gib(plan["free_after_bytes"]))
+    if plan["drive_unreachable"]:
+        print("")
+        print("  DRIVE UNREACHABLE -- the archive could not be measured: %s" % plan["drive_error"])
+        print("  Nothing was read, written or recomputed.")
+        return
+    print("")
+    if plan["fits"]:
+        print("  VERDICT: fits -- extraction is safe to run.")
+    else:
+        print("  VERDICT: DOES NOT FIT -- short by %s. Extraction MUST NOT run."
+              % _gib(plan["shortfall_bytes"]))
+        print("  Free space first (see JOINT_TRAINING_ARCHITECTURE.md Sec 45) -- do NOT delete the")
+        print("  persistent Drive cache, the archive, or the local cache that is already correct.")
 
 
 def print_extract(result):

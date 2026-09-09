@@ -2411,6 +2411,217 @@ class DriveFuseFailureSafetyTests(unittest.TestCase):
         self.assertEqual(sample["stage5_input"].shape, (*jtd.STAGE5_IMAGE_SIZE, 8))
 
 
+# =====================================================================
+# Sec 44 -- the raw APTOS dataset is not part of the cache-backed training path.
+#
+# The notebook no longer stages all 3,662 raw images (9.52 GiB, ~3,663 Drive file opens). These
+# tests hold the two halves of the claim that made that safe:
+#
+#   1. an entry with a complete LOCAL cache never reaches `lfed._load_raw_bgr`, so the raw image
+#      may be absent entirely -- proven by DELETING the image directory and running the real
+#      generator, not by reading the guard;
+#   2. an entry WITHOUT a complete local cache still needs its raw image, and the known empty-FOV
+#      entries are exactly that case: their canonical RGB is cached but vessel/lesion/reliability
+#      cannot be produced, so every epoch re-enters the compute branch and Stage 03 raises
+#      `EmptyFieldOfViewError`, which the generator catches. Take the raw image away and that
+#      graceful skip becomes a `FileNotFoundError` the generator does not catch -- which is why
+#      `joint_cache_staging.stage_raw_images_for_uncached_entries` still stages those.
+# =====================================================================
+
+class RawImagesAbsentWithCompleteCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("raw_a", 0), ("raw_b", 2), ("raw_c", 4)])
+        self.addCleanup(self.tree.cleanup)
+        jtd.precompute_joint_frozen_caches(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            vessel_model=self.vessel_model, stage4_model=self.stage4_model,
+        )
+        # Everything the training path needs is now cached locally. The raw images are not.
+        shutil.rmtree(self.tree.image_dir)
+
+    def build_ds(self, pairs=None):
+        return jtd._make_joint_dataset(
+            pairs if pairs is not None else self.tree.pairs, self.tree.image_dir,
+            self.tree.cache_dir, self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+            batch_size=1, shuffle=False, augment=False, seed=0,
+        )
+
+    def test_every_sample_is_still_produced_with_the_image_directory_deleted(self):
+        self.assertFalse(os.path.isdir(self.tree.image_dir))
+        batches = list(self.build_ds())
+        self.assertEqual(len(batches), len(self.tree.pairs))
+        for (stage5, stage6, reliability), grade in batches:
+            self.assertEqual(tuple(stage5.shape[1:]), (*jtd.STAGE5_IMAGE_SIZE, lfed.NUM_CHANNELS))
+            self.assertEqual(tuple(stage6.shape[1:]), (*jtd.STAGE6_IMAGE_SIZE, 3))
+            self.assertEqual(reliability.shape, (1,))
+            self.assertEqual(grade.shape, (1,))
+
+    def test_no_raw_read_and_no_stage3_or_stage4_inference_occurs(self):
+        with mock.patch.object(
+            lfed, "_load_raw_bgr", side_effect=AssertionError("raw image was read"),
+        ), mock.patch(
+            "joint_training_dataset.predict_vessel_mask",
+            side_effect=AssertionError("Stage 03 ran"),
+        ), mock.patch(
+            "joint_training_dataset.racaf.tta_views", side_effect=AssertionError("Stage 04 ran"),
+        ):
+            self.assertEqual(len(list(self.build_ds())), len(self.tree.pairs))
+
+    def test_the_samples_are_identical_to_those_built_while_the_images_were_present(self):
+        """The scope reduction must be numerically invisible: same cache, same arrays."""
+        without_images = [batch[0][0].numpy() for batch in self.build_ds()]
+        os.makedirs(self.tree.image_dir, exist_ok=True)
+        for i, (id_code, _diagnosis) in enumerate(self.tree.pairs):
+            Image.fromarray(_synthetic_fundus_image(seed=i)).save(
+                os.path.join(self.tree.image_dir, f"{id_code}.png"))
+        with_images = [batch[0][0].numpy() for batch in self.build_ds()]
+        for absent, present in zip(without_images, with_images):
+            np.testing.assert_array_equal(absent, present)
+
+    def test_validation_style_iteration_is_equally_raw_free(self):
+        """Validation uses the same `_make_joint_dataset`, only with shuffle/augment off -- so it
+        must be exactly as independent of the raw images as training is."""
+        ds = jtd._make_joint_dataset(
+            self.tree.pairs, self.tree.image_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+            self.vessel_model, self.stage4_model, batch_size=1, shuffle=False, augment=False,
+            seed=0,
+        )
+        with mock.patch.object(
+            lfed, "_load_raw_bgr", side_effect=AssertionError("raw image was read"),
+        ):
+            self.assertEqual(len(list(ds)), len(self.tree.pairs))
+
+    def test_no_persistent_path_is_probed_either(self):
+        with mock.patch.object(
+            jtd, "_persistent_exists", side_effect=AssertionError("Drive was probed"),
+        ):
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                batch_size=1, shuffle=False, augment=False, seed=0,
+                persistent_cache_dir=os.path.join(self.tree.root, "nonexistent_drive"),
+                persistent_racaf_cache_dir=os.path.join(self.tree.root, "nonexistent_drive_racaf"),
+            )
+            self.assertEqual(len(list(ds)), len(self.tree.pairs))
+
+
+class EmptyFovEntriesStillNeedTheirRawImageTests(unittest.TestCase):
+    """Why raw staging is narrowed rather than removed."""
+
+    EMPTY_ID = "raw_empty_fov"
+
+    def setUp(self):
+        self.vessel_model = _build_synthetic_vessel_model()
+        self.stage4_model = _build_synthetic_frozen_stage4_model()
+        self.tree = _SyntheticAPTOSTree([("raw_ok", 1), (self.EMPTY_ID, 3)])
+        self.addCleanup(self.tree.cleanup)
+        self._real_predict = jtd.predict_vessel_mask
+        self._current = {"id": None}
+
+    def _predict_with_one_empty_fov(self, image_array, *args, **kwargs):
+        if self._current["id"] == self.EMPTY_ID:
+            raise jtd.EmptyFieldOfViewError("no fundus disk detected")
+        return self._real_predict(image_array, *args, **kwargs)
+
+    def _build_sample_tagging_id(self, id_code, *args, **kwargs):
+        self._current["id"] = id_code
+        return self._real_build(id_code, *args, **kwargs)
+
+    def _populate_cache(self):
+        """Runs the real Phase 1 with one id always empty-FOV, one entry at a time so the id is
+        known. Leaves exactly the real production shape: the good entry fully cached, the
+        empty-FOV entry with ONLY its canonical RGB."""
+        with mock.patch("joint_training_dataset.predict_vessel_mask",
+                        side_effect=self._predict_with_one_empty_fov):
+            for id_code, diagnosis in self.tree.pairs:
+                self._current["id"] = id_code
+                jtd.precompute_joint_frozen_caches(
+                    [(id_code, diagnosis)], self.tree.image_dir, self.tree.cache_dir,
+                    self.tree.racaf_cache_dir, vessel_model=self.vessel_model,
+                    stage4_model=self.stage4_model,
+                )
+
+    def test_phase1_leaves_an_empty_fov_entry_with_rgb_only(self):
+        self._populate_cache()
+        self.assertTrue(os.path.exists(jtd._canonical_rgb_cache_path(
+            self.EMPTY_ID, self.tree.cache_dir, jtd.STAGE5_IMAGE_SIZE)))
+        for kind in ("vessel", "lesion"):
+            self.assertFalse(os.path.exists(
+                lfed._cache_path(self.tree.cache_dir, self.EMPTY_ID, kind, jtd.STAGE5_IMAGE_SIZE)))
+        self.assertFalse(os.path.exists(
+            racaf.reliability_cache_path(self.tree.racaf_cache_dir, self.EMPTY_ID)))
+
+    def test_with_its_raw_image_present_the_empty_fov_entry_is_skipped_and_the_rest_continue(self):
+        self._populate_cache()
+        self._real_build = jtd._build_joint_sample
+        with mock.patch("joint_training_dataset.predict_vessel_mask",
+                        side_effect=self._predict_with_one_empty_fov), \
+             mock.patch("joint_training_dataset._build_joint_sample",
+                        side_effect=self._build_sample_tagging_id):
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, self.tree.image_dir, self.tree.cache_dir,
+                self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+                batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            self.assertEqual(len(list(ds)), len(self.tree.pairs) - 1)
+
+    def test_removing_its_raw_image_turns_the_graceful_skip_into_a_hard_failure(self):
+        """The measured reason `stage_raw_images_for_uncached_entries` exists. The generator
+        catches `EmptyFieldOfViewError` only, so a missing raw image raises out of the whole
+        iteration instead of skipping one sample."""
+        self._populate_cache()
+        os.remove(os.path.join(self.tree.image_dir, f"{self.EMPTY_ID}.png"))
+        ds = jtd._make_joint_dataset(
+            [(self.EMPTY_ID, 3)], self.tree.image_dir, self.tree.cache_dir,
+            self.tree.racaf_cache_dir, self.vessel_model, self.stage4_model,
+            batch_size=1, shuffle=False, augment=False, seed=0,
+        )
+        with self.assertRaises(Exception) as caught:
+            list(ds)
+        self.assertIn("not found at", str(caught.exception))
+
+    def test_the_staging_helper_selects_exactly_the_entries_that_still_need_a_raw_image(self):
+        self._populate_cache()
+        sys.path.insert(0, _REPO_ROOT)
+        import joint_cache_staging as jcs
+
+        missing = jcs.entries_missing_local_cache(
+            self.tree.pairs, self.tree.cache_dir, self.tree.racaf_cache_dir)
+        self.assertEqual([id_code for id_code, _ in missing], [self.EMPTY_ID])
+        self.assertEqual(sorted(dict(missing)[self.EMPTY_ID]),
+                         ["lesion", "reliability", "vessel"])
+
+    def test_staging_only_those_entries_reproduces_todays_skip_behavior_exactly(self):
+        """End to end: a local image dir holding ONLY the staged empty-FOV image is enough for
+        the generator to behave exactly as it does with the full 3,662-image dataset present."""
+        self._populate_cache()
+        sys.path.insert(0, _REPO_ROOT)
+        import joint_cache_staging as jcs
+
+        staged_dir = os.path.join(self.tree.root, "staged_raw_images")
+        result = jcs.stage_raw_images_for_uncached_entries(
+            self.tree.pairs, cache_dir=self.tree.cache_dir,
+            racaf_cache_dir=self.tree.racaf_cache_dir,
+            source_image_dir=self.tree.image_dir, local_image_dir=staged_dir,
+        )
+        self.assertEqual(result["copied"], 1)
+        self.assertEqual(sorted(os.listdir(staged_dir)), [f"{self.EMPTY_ID}.png"])
+
+        self._real_build = jtd._build_joint_sample
+        with mock.patch("joint_training_dataset.predict_vessel_mask",
+                        side_effect=self._predict_with_one_empty_fov), \
+             mock.patch("joint_training_dataset._build_joint_sample",
+                        side_effect=self._build_sample_tagging_id):
+            ds = jtd._make_joint_dataset(
+                self.tree.pairs, staged_dir, self.tree.cache_dir, self.tree.racaf_cache_dir,
+                self.vessel_model, self.stage4_model,
+                batch_size=1, shuffle=False, augment=False, seed=0,
+            )
+            self.assertEqual(len(list(ds)), len(self.tree.pairs) - 1)
+
+
 class MemoryGrowthInitializationTests(unittest.TestCase):
     """§41: `check_gpu()` is called by several entry points in one session, so it must be a no-op
     once memory growth is already on -- not print a warning that reads like a failure."""

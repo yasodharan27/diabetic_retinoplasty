@@ -1734,7 +1734,9 @@ runtimes complete all 8. Every runtime after pays only extraction: 8 Drive opens
 sequential transfer plus ~3.8 min of local write. Fresh-runtime preparation goes from ~4 h to
 ~40 min end to end.
 
-**Immediate unblock.** `STAGING_MAX_ENTRIES` on the Phase 1c cell stages a subset — 400 train
+**Immediate unblock** (superseded by the real archive run and removed from the notebook in
+§44 — kept here as the record of what was decided at the time).
+`STAGING_MAX_ENTRIES` on the Phase 1c cell stages a subset — 400 train
 entries is ~1600 files, ~27 min — which is enough for the profiler (30 batches plus a 256-entry
 shuffle buffer touches ~316 entries). Stated caveat: a ~3.1 GiB working set page-caches in RAM
 where 28.56 GiB cannot, so subset profiling yields a trustworthy COMPUTE-side measurement and an
@@ -1760,3 +1762,169 @@ cache alone is sufficient and no recomputation occurs.
 
 **Still open.** This makes trustworthy profiling reachable. It does not explain the 2.44 -> 4.65
 s/step regression, which remains unmeasured.
+
+
+## 44. The raw APTOS dataset is not an input to the cache-backed training path — staged for 11 entries, not 3,662
+
+**Question.** With the archive extracted (14,604 files / 28.53 GiB in a measured 527 s, ending at
+3,651 fully local entries, 0 Drive fallback, 0 corrupt files), is the staged raw APTOS dataset
+still required? It costs 9.52 GiB of `/content` and ~3,663 Drive file opens per fresh runtime.
+
+**Traced, then measured — not inferred from the guard.** `_build_joint_sample` reads a raw image at
+exactly one place, [`joint_training_dataset.py:691`](joint_training_dataset.py#L691), behind
+`if not (frozen_outputs_cached and rgb_cached)`. Both flags are local-first with `or`
+short-circuiting, so a full local hit never stats a persistent path either. The proof is empirical:
+the real Phase 1 was run over 5 entries, the image directory was then **deleted**, and the real
+`_make_joint_dataset` generator was iterated.
+
+| measurement | result |
+|---|---|
+| samples yielded with the image directory deleted | 4 / 4 |
+| `lfed._load_raw_bgr` calls | 0 |
+| `predict_vessel_mask` (Stage 03) calls | 0 |
+| `racaf.tta_views` (Stage 04) calls | 0 |
+| `stage5_input` arrays vs the same run with images present | bit-identical |
+
+Validation goes through the same `_make_joint_dataset` with `shuffle=False, augment=False`, so it
+is exactly as raw-free. Nothing downstream needs the raw data either: `training/trainer.py`,
+`training/callbacks.py` and `colab/common/experiment_manager.py` contain no reference to
+`image_dir`, `train_images`, `APTOS` or `dataset_raw_dir`; checkpoints and TensorBoard logs are
+written under the Drive-resolved `experiment.root`; and the authoritative split comes from the
+git-tracked `dataset_splits/aptos2019_train_val_split.csv` (3,662 rows, 2,929/733), never from
+APTOS's own `train.csv`.
+
+**But removing it wholesale would have broken the empty-FOV path — also measured.** Phase 1 caches
+an empty-FOV entry's canonical RGB and nothing else (`test_empty_fov_entry_still_gets_its_rgb_
+cached`), so for those 11 entries `frozen_outputs_cached` is False every epoch, the compute branch
+is re-entered, the raw image is read, and Stage 03 raises `EmptyFieldOfViewError` — which
+`_make_joint_dataset` catches and skips. With the raw image absent, `_load_raw_bgr` raises
+`FileNotFoundError` instead, and the generator's `except EmptyFieldOfViewError` does not catch it:
+the whole run dies on the first such entry. Reproduced directly, wrapped in
+`tf.errors.UnknownError` exactly as it would surface inside `.fit()`.
+
+**Fix — narrow the scope, do not change the behavior.**
+`joint_cache_staging.stage_raw_images_for_uncached_entries()` copies the raw image for exactly the
+entries `entries_missing_local_cache()` reports — those whose LOCAL cache is incomplete across all
+four artifacts. Normally that is the 11 known empty-FOV images: ~25 MiB and ~11 Drive opens against
+9.52 GiB and ~3,663. Every entry still takes the identical code path it took before, whether it
+ends in a cache hit, a recomputation, or an empty-FOV skip; if the cache were ever incomplete for
+other entries, their images would be staged too and the old fallback would work unchanged. The
+selection is local `os.path.exists` only — no Drive probe. Copies are atomic (temp → size check →
+`os.replace`) with the module's existing bounded retry on transient FUSE errnos; the source is
+opened read-only; no model is loaded and no cache file is written, so nothing frozen can be
+regenerated here.
+
+**Notebook cleanup, each item justified by the trace above.**
+
+| cell | was | now | why |
+|---|---|---|---|
+| Dataset verification | ungated; `train.csv` count + 50 Drive image decodes + a 3,662-entry Drive listing | `VERIFY_RAW_DATASET = False` | its four variables have no consumer in any later cell; the split never reads `train.csv` |
+| Phase 1b flush | **ungated** | `RUN_FLUSH_TO_DRIVE = False` | `sync_missing_files` stats Drive once per LOCAL file; after extraction that is ~14,595 Drive operations on a "Run all", for a guaranteed-zero result |
+| Phase 1c per-file staging | 2 cells | removed | measured 1.007 s/file at 200 and 1.011 s/file at 400 → 14,595 files = 4.05 h against a ~3 h runtime. `joint_cache_staging.py` itself is kept — `verify_local_cache`, `sample_numerical_integrity` and the new raw staging all live there |
+| Dataset loading / Phase 2a | `dataset_staging.stage_dataset()` (full 9.52 GiB) | `stage_raw_images_for_uncached_entries()` | above |
+| Phase 1d archive | no disk check | `plan_extraction()` + hard abort | below |
+
+Phase 1 (`RUN_CACHE_PRECOMPUTATION`) and the Phase 1a diagnostic keep full `stage_dataset()`: both
+genuinely compute Stage 03/04 from raw images, and both are one-time/investigation paths.
+
+## 45. `/content` is not a scratch disk — the notebook measures its disk budget before extracting
+
+**Why.** With cache + dataset staged, a real runtime reported ~21.9 GiB free of ~113 GiB. Nothing
+in the notebook checked that before writing 28.53 GiB, and a full `/content` surfaces as unrelated
+failures hours into a run.
+
+**`joint_cache_archive.plan_extraction()`** measures rather than assumes, and costs 8 Drive stats
+plus two local listings — not a per-file scan of either side:
+
+```
+required = total shard bytes
+         - bytes already in the local cache dirs     (a resumed/partial extraction)
+         + DEFAULT_RUNTIME_MARGIN_BYTES (5 GiB)
+```
+
+No transient peak is budgeted, because there is none: each shard is streamed into a staging
+directory on the **same filesystem** and its members are `os.replace`d into place, which is a
+rename — peak usage equals final usage. The raw dataset is deliberately absent from the budget,
+which is what §44 buys. The notebook prints the plan and **raises before reading a byte** if it
+does not fit, and passes `required_bytes` to `extract_archive(min_free_bytes=...)` as a second,
+independent guard that holds even if the plan is edited out. A separate
+`MIN_FREE_FOR_TRAINING_BYTES = 3 GiB` floor aborts the dataset-loading cell up front rather than
+letting a 50-epoch run discover the problem at epoch 12.
+
+**Budget after cleanup**, from the reported figures (113 GiB total, ~53 GiB runtime base):
+
+| | before | after |
+|---|---|---|
+| local cache | 28.53 GiB | 28.53 GiB |
+| staged APTOS dataset | 9.52 GiB | **0** (~25 MiB of empty-FOV images) |
+| free during training | ~21.9 GiB | **~31.4 GiB** |
+| free at the extraction check | ~50 GiB | ~60 GiB vs 33.53 GiB required |
+
+## 46. Phase 2a's step split cannot be trusted as an attribution — Phase 2b measures with real synchronization
+
+**The reading that needs explaining.** The first clean, fully-local profiler run measured 4.125 s
+per batch with input wait at 1.3 ms and 0 Drive reads/stats/writes — so the step is model and
+optimizer time, not I/O, and §36-§45's cache work is done. Within that step it reported forward
+883.5 ms, backward 989.5 ms and **optimizer 2117.8 ms**, at 7% mean GPU utilization and 69% mean
+CPU. Adam over 43,292,970 parameters is a few hundred MB of traffic; ~2.1 s of *device* time for
+that is roughly two orders of magnitude off, so before any of it is believed, the measurement
+itself has to be audited.
+
+**The methodological hole.** TensorFlow eager execution is asynchronous: an op returns as soon as
+it is enqueued, and reading a tensor forces only that tensor's dependencies.
+`profile_compute_only` drains one tensor per boundary — `sync(grads[0])`, then
+`sync(model.trainable_variables[0])`. `grads[0]` belongs to the first trainable variable, which
+backprop produces *last*, so that drain happens to cover most of the backward pass — an accident of
+variable ordering, not a guarantee. `trainable_variables[0]` is updated near the *start* of
+`apply_gradients`, so draining it does **not** cover the other 392 updates. Whatever is still in
+flight at a boundary lands in whichever section drains next. Phase D is therefore fine as a
+magnitude, unsound as an attribution.
+
+**Phase 2b (`profile_optimizer_breakdown`)** measures the same work correctly:
+
+* **full drains.** `_drain()` builds one scalar via `tf.add_n` over per-tensor reductions, so a
+  single `.numpy()` cannot return until every tensor in the set is materialized. The drain's own
+  cost is measured separately on already-materialized tensors and reported, so it is subtractable
+  rather than silently included.
+* **enqueue vs drained.** `apply_gradients` is timed both as enqueue-only (host returns, device
+  work possibly still in flight) and drained. Enqueue time is host work — Python and op dispatch;
+  drain time is device work. That pair answers "CPU-bound or GPU-bound" directly.
+* **CPU vs wall.** `time.process_time()` beside `time.perf_counter()` for every section. cpu/wall
+  near 1.0 means the host is busy; near 0.0 means it is blocked on the device.
+* **an attribution cross-check.** The same work, drained **once** at the end. If the per-section
+  sum does not match, the report says so instead of presenting the split as fact.
+* **the compiled path.** `model.train_on_batch` runs inside a `tf.function`, which is what
+  `Trainer.fit()` → `model.fit()` actually executes; the eager tape loop is not. Both are measured.
+  The comparison is conservative — `train_on_batch` also computes the compiled QWK metric.
+* **per-section GPU telemetry**, sampled during each section from a background thread in the same
+  process.
+* **the inventory the numbers must be read against**: trainable tensor count and dtypes, gradient
+  tensor count/dtypes/bytes and any `None` gradients, optimizer slot variables and dtypes,
+  `clipnorm`/`clipvalue`/`global_clipnorm`/`use_ema`, `jit_compile`, XLA flags, `run_eagerly`,
+  `steps_per_execution`, and the model's real dtype policy.
+
+**One inventory finding is already in hand, and it is a fact about configuration, not a
+measurement of the regression.** Verified on Keras 3.15.1: a layer captures the dtype policy when
+it is **built**. The notebook builds and compiles `joint_model` before `Trainer.fit()` →
+`prepare()` → `enable_mixed_precision(True)` sets `mixed_float16`, so the policy is set after the
+model exists and does not apply to it. Confirmed on the real model: 393 trainable tensors, all
+`float32`; 393 gradient tensors, all `float32`; optimizer `Adam` with `loss_scale_factor=None`
+(no `LossScaleOptimizer`); 788 slot variables; `jit_compile=False`; no clipping configured.
+`MIXED_PRECISION = True` in the notebook is therefore not in effect for this graph.
+
+**Not claimed.** The 4.125 s/step is not explained here, and neither is the 2.44 → 4.65 s/step
+regression. Phase 2b exists to produce evidence for those, and nothing about the model, optimizer,
+batch size, loss, precision policy, JIT setting or training configuration has been changed. The
+diagnostic advances the optimizer's slot state, so the model construction cell must be re-run
+before a real training run; weights are snapshotted and restored bit-for-bit (asserted).
+
+**Regression tests.** `tests/test_joint_training.py` adds `RawImagesAbsentWithCompleteCacheTests`
+(5) and `EmptyFovEntriesStillNeedTheirRawImageTests` (5): every sample still produced with the
+image directory deleted, zero raw reads and zero Stage 03/04 calls, samples bit-identical to the
+images-present run, validation equally raw-free, no persistent probe, Phase 1 leaving an empty-FOV
+entry with RGB only, the skip preserved when its image is present, the hard failure when it is
+absent, the helper selecting exactly those entries, and the staged-subset directory reproducing
+today's skip behavior end to end. `tests/test_joint_cache_staging.py` adds
+`RawImageStagingTests` (12) and `tests/test_joint_cache_archive.py` adds `ExtractionPlanTests` (8),
+including that the plan opens no shard, that a dead mount is reported rather than read as zero
+bytes, and that a failed space check leaves both the local dirs empty and Drive byte-identical.

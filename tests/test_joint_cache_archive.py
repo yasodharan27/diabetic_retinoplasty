@@ -12,6 +12,7 @@ persistent path booby-trapped, to prove the extracted cache alone is sufficient.
 """
 
 import errno
+import io
 import os
 import shutil
 import sys
@@ -365,6 +366,103 @@ class ExtractTests(_ArchiveTestBase):
             handle.close()
         self.assertEqual(seeks["n"], 0)
 
+
+# =====================================================================
+# Disk budget -- refuse before reading a byte
+# =====================================================================
+
+class ExtractionPlanTests(_ArchiveTestBase):
+    def test_plan_measures_shards_local_state_and_free_space(self):
+        self.populate_drive()
+        self.build()
+        plan = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        shard_bytes = sum(os.path.getsize(os.path.join(self.archive, name))
+                          for name in os.listdir(self.archive) if name.startswith("cache_shard_"))
+        self.assertEqual(plan["archive_bytes"], shard_bytes)
+        self.assertEqual(plan["local_cache_bytes"], 0)
+        self.assertEqual(plan["local_files"], 0)
+        self.assertEqual(plan["required_bytes"],
+                         shard_bytes + jca.DEFAULT_RUNTIME_MARGIN_BYTES)
+
+    def test_an_already_extracted_cache_reduces_what_is_still_required(self):
+        self.populate_drive()
+        self.build()
+        empty = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        self.extract()
+        resumed = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        self.assertGreater(resumed["local_files"], 0)
+        self.assertLess(resumed["required_bytes"], empty["required_bytes"])
+
+    def test_plan_refuses_when_free_space_is_short_and_says_by_how_much(self):
+        self.populate_drive()
+        self.build()
+        Usage = __import__("collections").namedtuple("Usage", "total used free")
+        with mock.patch("shutil.disk_usage", return_value=Usage(100, 100, 1024)):
+            plan = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        self.assertFalse(plan["fits"])
+        self.assertGreater(plan["shortfall_bytes"], 0)
+
+    def test_extract_refuses_and_writes_nothing_when_min_free_bytes_is_not_met(self):
+        self.populate_drive()
+        self.build()
+        before = self.snapshot_drive()
+        Usage = __import__("collections").namedtuple("Usage", "total used free")
+        with mock.patch("shutil.disk_usage", return_value=Usage(100, 100, 1024)):
+            with self.assertRaises(RuntimeError):
+                self.extract(min_free_bytes=10 * 1024 ** 3)
+        self.assertEqual(os.listdir(self.local), [])
+        self.assertEqual(os.listdir(self.local_racaf), [])
+        self.assertEqual(self.snapshot_drive(), before)
+
+    def test_an_unlistable_archive_dir_raises_rather_than_reporting_an_empty_archive(self):
+        with mock.patch("os.listdir", side_effect=OSError(errno.ENOTCONN, "transport endpoint")):
+            with self.assertRaises(jtd.PersistentCacheUnavailableError):
+                jca.plan_extraction(self.archive, self.local, self.local_racaf)
+
+    def test_a_dead_mount_while_measuring_shards_is_reported_not_treated_as_zero_bytes(self):
+        self.populate_drive()
+        self.build()
+        with mock.patch("os.stat", side_effect=OSError(errno.ENOTCONN, "transport endpoint")):
+            plan = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        self.assertTrue(plan["drive_unreachable"])
+        self.assertFalse(plan["fits"])
+
+    def test_plan_reads_no_shard_content(self):
+        self.populate_drive()
+        self.build()
+        real_open = io.open
+
+        def refuse_shard(path, *args, **kwargs):
+            if isinstance(path, str) and "cache_shard_" in path:
+                raise AssertionError("plan_extraction opened a shard: %s" % path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("io.open", side_effect=refuse_shard):
+            plan = jca.plan_extraction(self.archive, self.local, self.local_racaf)
+        self.assertGreater(plan["archive_bytes"], 0)
+
+    def test_plan_works_on_a_fresh_runtime_where_the_cache_dir_does_not_exist_yet(self):
+        """`/content/cache/local_feature_extraction` does not exist before the first extraction,
+        and `shutil.disk_usage` raises on a missing path -- the plan must walk up to the nearest
+        existing parent instead of dying before it can report anything."""
+        self.populate_drive()
+        self.build()
+        fresh = os.path.join(self.root, "content", "nothing", "here", "yet")
+        fresh_racaf = os.path.join(self.root, "content", "nothing", "here", "racaf")
+        self.assertFalse(os.path.exists(fresh))
+        plan = jca.plan_extraction(self.archive, fresh, fresh_racaf)
+        self.assertGreater(plan["free_bytes"], 0)
+        self.assertEqual(plan["local_files"], 0)
+        self.assertFalse(os.path.exists(fresh))  # planning creates nothing
+
+    def test_renderer_runs_for_both_verdicts(self):
+        self.populate_drive()
+        self.build()
+        jca.print_extraction_plan(jca.plan_extraction(self.archive, self.local, self.local_racaf))
+        Usage = __import__("collections").namedtuple("Usage", "total used free")
+        with mock.patch("shutil.disk_usage", return_value=Usage(100, 100, 1024)):
+            jca.print_extraction_plan(
+                jca.plan_extraction(self.archive, self.local, self.local_racaf))
 
 class CompressedShardTests(_ArchiveTestBase):
     def test_a_compressed_archive_round_trips_byte_identically(self):
