@@ -3039,8 +3039,10 @@ class TrainerIntegrationTests(unittest.TestCase):
     def test_trainer_fit_runs_one_epoch_and_selects_best_checkpoint_by_val_qwk(self):
         from training import Trainer, TrainingConfig
 
-        model = jtm.build_joint_model()
-        jtm.compile_joint_model(model)
+        # Policy -> build -> compile, the order the notebook now uses. Building first and
+        # letting Trainer set the policy afterwards is the defect JOINT_TRAINING_ARCHITECTURE.md
+        # 48 records: on a GPU host it would silently train this model in float32.
+        model = jtm.build_and_compile_joint_model(mixed_precision=True, verbose=0)
 
         def make_dataset(seed):
             rng = np.random.RandomState(seed)
@@ -3061,6 +3063,7 @@ class TrainerIntegrationTests(unittest.TestCase):
         # experiment folder.
         config = TrainingConfig(
             run_dir=tmp_dir, epochs=1, monitor="val_QWK", mode="max", mixed_precision=True,
+            precision_check="error",
         )
         trainer = Trainer(config)
         history = trainer.fit(model, train_ds, val_ds)
@@ -3081,8 +3084,7 @@ class TrainerIntegrationTests(unittest.TestCase):
         training cell relies on -- not merely that the flag is accepted."""
         from training import Trainer, TrainingConfig
 
-        model = jtm.build_joint_model()
-        jtm.compile_joint_model(model)
+        model = jtm.build_and_compile_joint_model(mixed_precision=True, verbose=0)
 
         def make_dataset(seed):
             rng = np.random.RandomState(seed)
@@ -3098,11 +3100,13 @@ class TrainerIntegrationTests(unittest.TestCase):
         tmp_dir = tempfile.mkdtemp(prefix="trainer_resume_test_")
         self.addCleanup(shutil.rmtree, tmp_dir, True)
 
-        first_config = TrainingConfig(run_dir=tmp_dir, epochs=1, monitor="val_QWK", mode="max")
+        first_config = TrainingConfig(run_dir=tmp_dir, epochs=1, monitor="val_QWK", mode="max",
+                                      precision_check="error")
         Trainer(first_config).fit(model, train_ds, val_ds)
 
         resumed_config = TrainingConfig(
             run_dir=tmp_dir, epochs=2, monitor="val_QWK", mode="max", resume=True,
+            precision_check="error",
         )
         resumed_trainer = Trainer(resumed_config)
         resumed_trainer.prepare()  # resolve_initial_epoch() needs self.paths, normally set
@@ -3110,6 +3114,103 @@ class TrainerIntegrationTests(unittest.TestCase):
                                     # inspect it before running the second fit() call below.
         self.assertEqual(resumed_trainer.resolve_initial_epoch(), 1)
         resumed_trainer.fit(model, train_ds, val_ds)
+
+
+
+def _weight_digest(model):
+    """SHA256 over every weight tensor's raw bytes -- an exact-equality check that
+    does not depend on tensor ordering being printable."""
+    import hashlib
+    return hashlib.sha256(
+        b"".join(np.ascontiguousarray(v.numpy()).tobytes() for v in model.weights)
+    ).hexdigest()
+
+
+class JointModelCheckpointScaleTests(unittest.TestCase):
+    """`tests/test_checkpoint_resume.py` proves the checkpoint mechanism on a small
+    model, deliberately -- the format, the integrity protocol and the restore
+    ordering are all model-agnostic. This class pays the cost of doing it once at
+    the REAL scale (43.3M parameters, 409 trainable tensors, 820 optimizer
+    variables), because "the mechanism works" and "it works on THIS graph" are
+    different claims: the joint model embeds Swin layers with no `get_config()`,
+    an explicitly float32 RACAF output, and Stage 05's adaptive-fusion
+    projections, none of which a Sequential stand-in exercises."""
+
+    def test_real_joint_model_round_trips_through_a_checkpoint_generation(self):
+        import training.checkpointing as ckpt
+
+        tmp_dir = tempfile.mkdtemp(prefix="joint_ckpt_scale_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        checkpoint_dir = os.path.join(tmp_dir, "checkpoints")
+
+        model = jtm.build_and_compile_joint_model(mixed_precision=False, verbose=0)
+        # One real gradient step, so the optimizer holds non-zero moments and
+        # `iterations` is something a reset would visibly destroy.
+        rng = np.random.RandomState(0)
+        batch = (
+            [rng.rand(2, 512, 512, 8).astype("float32"),
+             rng.rand(2, 256, 256, 3).astype("float32"),
+             rng.rand(2, 1).astype("float32")],
+            np.array([1, 3], dtype="int32"),
+        )
+        model.train_on_batch(*batch)
+
+        iterations = int(tf.keras.backend.get_value(model.optimizer.iterations))
+        self.assertGreater(iterations, 0)
+        expected_weights = _weight_digest(model)
+        expected_optimizer = [round(float(np.abs(np.asarray(v)).sum()), 4)
+                              for v in model.optimizer.variables]
+        self.assertGreater(sum(1 for s in expected_optimizer if s > 0), 10)
+
+        generation_dir = ckpt.save_generation(
+            checkpoint_dir, model,
+            ckpt.TrainingState(experiment_id="joint-scale", completed_epoch=1,
+                               best_epoch=0, best_metric=0.5, config_hash="cfg-joint"),
+            staging_dir=os.path.join(tmp_dir, "_staging"),
+        )
+        self.assertTrue(ckpt.validate_generation(generation_dir).ok)
+
+        # `model.weights.h5` must hold model variables only. Keras 3 would otherwise
+        # fold the whole Adam state in as well once its slots exist, which measured
+        # 521,441,264 bytes against 173.4 MB of real model variables.
+        weights_size = os.path.getsize(
+            os.path.join(generation_dir, ckpt.MODEL_WEIGHTS_FILENAME))
+        parameters = sum(int(np.prod(v.shape)) for v in model.weights)
+        self.assertLess(weights_size, parameters * 4 * 1.5)
+
+        # A genuinely fresh graph -- the "rebuild the architecture, then load" path
+        # this project must use because Stage 06 has no get_config().
+        restored = jtm.build_and_compile_joint_model(mixed_precision=False, verbose=0)
+        self.assertNotEqual(_weight_digest(restored), expected_weights)
+        state = ckpt.restore_training_state(
+            restored, generation_dir, expected={"config_hash": "cfg-joint"}, verbose=0)
+
+        self.assertEqual(_weight_digest(restored), expected_weights)
+        self.assertEqual(int(tf.keras.backend.get_value(restored.optimizer.iterations)),
+                         iterations)
+        self.assertEqual(
+            [round(float(np.abs(np.asarray(v)).sum()), 4) for v in restored.optimizer.variables],
+            expected_optimizer)
+        self.assertEqual(state.completed_epoch, 1)
+        self.assertEqual(state.optimizer["variable_count"], len(model.optimizer.variables))
+
+    def test_resuming_the_joint_model_with_a_changed_configuration_is_refused(self):
+        import training.checkpointing as ckpt
+
+        tmp_dir = tempfile.mkdtemp(prefix="joint_ckpt_cfg_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        checkpoint_dir = os.path.join(tmp_dir, "checkpoints")
+
+        model = jtm.build_and_compile_joint_model(mixed_precision=False, verbose=0)
+        generation_dir = ckpt.save_generation(
+            checkpoint_dir, model,
+            ckpt.TrainingState(experiment_id="joint-scale", completed_epoch=1,
+                               config_hash="cfg-original"),
+            staging_dir=os.path.join(tmp_dir, "_staging"),
+        )
+        with self.assertRaises(ckpt.CheckpointCompatibilityError):
+            ckpt.restore_training_state(model, generation_dir,
+                                        expected={"config_hash": "cfg-changed"}, verbose=0)
 
 
 # =====================================================================

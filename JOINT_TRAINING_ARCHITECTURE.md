@@ -259,6 +259,11 @@ persists to Drive via `RACAF_CACHE_DIR` (§7.1), surviving a Colab VM restart.
 `(512, 512, 8)` = canonical-resolution processed RGB(3) + vessel(1) + lesion(4), all now at the
 same fixed 512×512 resolution before concatenation (§10). Unchanged in every other respect.
 
+Stage 5's own internal fusion was completed in §47: the three multi-kernel branches are now
+weighted per image and per channel before they are concatenated, which is what makes the block
+"adaptive" rather than merely multi-kernel. The `(512, 512, 8)` input and the `(32, 32, 256)`
+output are unchanged.
+
 ---
 
 ## 14. Stage 6 input
@@ -457,7 +462,10 @@ pure, path-parameterized (`path` is a required argument, no built-in default —
 notebook, §27) via the EXISTING, unmodified `experiment_manager.resolve_experiment()` +
 `colab_config.DRIVE.experiment_dir("FinalClassification")` infrastructure — this module makes no
 Drive/local assumption of its own. Resume support (`resume_from=...`, `Trainer`'s existing
-`epoch_state.json` mechanism), best/final checkpoint, and per-stage exported-weight slices (into
+`epoch_state.json` mechanism -- **superseded by §49's generation-based checkpoints, which
+additionally persist optimizer state, the global best `val_QWK`, and the stateful callbacks'
+counters; the weights-only FORMAT decision recorded here is unchanged and still in force**),
+best/final checkpoint, and per-stage exported-weight slices (into
 each stage's own `config.py` `MODEL_DIR`, §7.1, so each stage's own already-implemented
 `Stage.load()` keeps working independently) are all designed for but **not exercised** by this
 task — no real checkpoint has been generated, per this task's explicit "no training" constraint.
@@ -1928,3 +1936,358 @@ today's skip behavior end to end. `tests/test_joint_cache_staging.py` adds
 `RawImageStagingTests` (12) and `tests/test_joint_cache_archive.py` adds `ExtractionPlanTests` (8),
 including that the plan opens no shard, that a dead mount is reported rather than read as zero
 bytes, and that a failed space check leaves both the local dirs empty and Drive byte-identical.
+
+---
+
+## 47. Stage 5's fusion was multi-kernel but not adaptive — completed with per-image, per-channel branch weighting
+
+**What was there.** `local_feature_extraction_model._multi_kernel_block` ran three parallel
+branches at different effective receptive fields (3×3, 5×5, dilated 3×3 with `dilation_rate=3`),
+concatenated them, and fused them back to `filters` channels with a 1×1 convolution. That
+delivered the multi-scale half of the approved Stage 5 design, and §13's `(512,512,8) →
+(32,32,256)` contract, correctly.
+
+**What was missing.** A convolution kernel is a *fixed learned parameter*. Once trained, the 1×1
+fusion mixes the three branches in exactly the same proportion for every image in the dataset.
+The block was therefore multi-kernel but not adaptive, while the module, the model name
+(`local_feature_extraction_adaptive_multi_kernel_cnn`) and the approved design all say "Adaptive
+Multi-Kernel CNN". The design's own rationale is image-dependent: the scale carrying the signal
+differs per fundus — microaneurysms occupy a few pixels, hard/soft exudates occupy broad patches —
+so the branch mixture is exactly the thing that should not be constant.
+
+**What was added.** `AdaptiveBranchFusion`, one registered Keras layer, placed between the branches
+and the concatenation:
+
+```
+context   = GlobalAveragePooling2D(sum(branches))        -> (N, C)
+hidden    = Dense(max(C // 8, 8), relu)(context)
+logits    = Dense(3 * C)(hidden)                         -> (N, 3C)
+weights   = softmax(reshape(logits, (N, 3, C)), axis=1)  -> (N, 3, C)
+output[b] = branches[b] * weights[:, b, :]               broadcast over H, W
+```
+
+The branch structure, the concatenation, the 1×1 fusion convolution, every existing layer name and
+the output contract are unchanged; the layer only rescales the branches before they are
+concatenated. Properties, each pinned by a test rather than asserted here:
+
+* **Image-dependent** — the weights are a function of the sample's own pooled branch responses.
+  Nothing else enters: no label, no batch statistic, no cross-sample term, so a sample's weights
+  are identical alone or inside any batch (`test_a_sample_gets_the_same_weights_alone_as_inside_a_batch`).
+* **Normalized across branches** — `softmax(axis=1)` is over the branch axis, so for every
+  (sample, channel) the three weights are positive and sum to 1. "How much of this channel came
+  from which receptive field" is a well-defined proportion.
+* **Differentiable and trainable end to end**, through the same CORN ordinal loss as the rest of
+  the graph (§21). No auxiliary loss, no new supervision.
+* **Batch-size agnostic** (including `BATCH_SIZE = 2`) and shape-static, so XLA/`jit_compile` can
+  trace it.
+
+**Mixed precision.** The two projections and the softmax carry an explicit `dtype="float32"`; the
+resulting weights are cast back to the block's compute dtype before they multiply the branches.
+A three-way per-channel softmax is a normalized proportion, and computing it in float16 would put
+it at the mercy of fp16 rounding for no throughput gain — the projection is only `(N, C)` wide.
+The heavy convolutions are untouched and still run in float16. This puts Stage 5 in the same
+category as `racaf_output` and `fused_embedding`, which already carry deliberate float32
+overrides, and `training.trainer.precision_is_consistent` is written to treat such overrides as
+part of the design rather than as a policy mismatch.
+
+**Parameter cost — measured, not estimated.**
+
+| | trainable parameters | trainable tensors |
+|---|---|---|
+| Stage 5 before | 2,129,152 | — |
+| Stage 5 after | 2,174,688 | — |
+| Joint model before | 43,292,970 | 393 |
+| Joint model after | 43,338,506 | 409 |
+| Delta | **+45,536 (+0.105 %)** | +16 (4 stages × 2 `Dense` layers × kernel+bias) |
+
+Per stage: 1,128 / 2,248 / 8,592 / 33,568 for C = 32 / 64 / 128 / 256. The joint model's "before"
+figure computed this way reproduces the independently measured 43,292,970 exactly, which is the
+cross-check that the delta is entirely this change and nothing else.
+
+**Forward/backward cost — measured on a CPU host, batch 2, 512×512×8, median of 3 reps**, with the
+pre-change block reconstructed verbatim and timed in the same process so the comparison is like
+for like: forward 1.243 s → 0.976 s, forward+backward 5.817 s → 7.009 s (+20.5 %). These are CPU
+seconds and are **not** T4 figures; the transferable observation is that the adaptive path is a
+`(C → C/8 → 3C)` projection on a globally pooled vector, so its cost is independent of spatial
+resolution while the convolutions it sits between are not — on a GPU, where the convolutions are
+the dominant term and the projection is a handful of small GEMMs, the relative overhead is
+expected to be smaller than on CPU, not larger. The notebook's Phase 2c cell measures the real
+per-step cost on the T4; **no claim about T4 step time is made here.**
+
+**Scope.** This is branch selection inside one block. No spatial attention map, no query/key/value
+projection, no cross-stage gating, no auxiliary supervision, no change to RACAF (§16) and no change
+to Stages 1–4. The project's single research contribution remains RACAF (§30).
+
+**Tests.** `tests/test_local_feature_extraction_model.py` adds `AdaptiveBranchFusionTests` (18):
+build and shape, the reduced-units floor, weight normalization, per-sample variation, gradient flow
+into the weighting parameters, batch sizes 1 and 2, output reproducibility, `mixed_float16`
+execution, a compiled `jit_compile=True` train step (requirement 10 -- everything in the layer is
+shape-static, so XLA can trace it), config round-trip, serialization registration, rejection of a
+single-tensor input and of mismatched branch channel counts, one adaptive-fusion layer per stage,
+the parameter-growth bound, and the unchanged `(None, 32, 32, 256)` output contract. The regression guard the section exists
+for is `test_not_merely_one_globally_fixed_learned_fusion_vector`: it asserts both that four
+deliberately different samples in one batch receive different weights, and that the gradient of the
+weights with respect to the branch activations is non-zero — a constant that merely happened to
+vary would fail the second check.
+
+---
+
+## 48. `MIXED_PRECISION = True` was inert — the dtype policy was set after the model was built
+
+**The defect.** §46 recorded this as an inventory finding; it is now fixed. Keras 3 captures a
+layer's dtype policy in the layer's **constructor**, and decides whether to wrap the optimizer in a
+`LossScaleOptimizer` when the model is **compiled**. The notebook built and compiled `joint_model`
+in its construction cell, and the policy was only set later, inside `Trainer.prepare()` →
+`enable_mixed_precision(True)` — by which point it could no longer affect anything. `setup.setup()`
+does not set a policy either, so a clean top-to-bottom run of the notebook trained the whole joint
+model in float32, with a bare `Adam` and no loss scaling, while every configuration flag reported
+mixed precision as enabled.
+
+Reproduced directly on TF 2.21.0 / Keras 3.15.1 and pinned by
+`test_changing_the_global_policy_after_construction_does_not_change_the_model`:
+
+| order | model policy | optimizer |
+|---|---|---|
+| build+compile under float32, then set `mixed_float16` globally | `float32` | `Adam` |
+| set `mixed_float16` globally, then build+compile | `mixed_float16` | `LossScaleOptimizer(inner=Adam)` |
+
+**What is NOT a defect.** The Colab diagnostic's observation that "all 393 trainable tensors and
+gradients were float32 even though the policy is mixed_float16" is correct mixed-precision
+behaviour, not a symptom. `mixed_float16` is `compute_dtype=float16, variable_dtype=float32` by
+definition: master weights stay in float32 and the gradients applied to them are float32. Nothing
+was changed on account of that observation, and
+`test_mixed_float16_keeps_variables_in_float32_by_design` exists so nobody "fixes" it later.
+
+**The fix — the smallest one that is actually correct.**
+
+1. `joint_training_model.build_and_compile_joint_model(mixed_precision=...)` does policy → build →
+   compile in that order and raises if the result is not what was asked for (including: a
+   `mixed_float16` model that did not get a `LossScaleOptimizer`, which would mean float16
+   gradients underflowing to zero unnoticed).
+2. `training.trainer.verify_model_precision()` re-checks the model `Trainer.fit()` is actually
+   handed, so the notebook and the trainer can never silently disagree again.
+   `TrainingConfig.precision_check` governs the response: `"warn"` by default, which preserves
+   every existing caller's behaviour exactly; the joint notebook sets `"error"`.
+3. The notebook's model-construction cell now owns `MIXED_PRECISION` and sets it before the first
+   layer is constructed. The training-configuration cell no longer redefines it, and says why.
+
+`precision_is_consistent()` deliberately treats the two directions differently: under
+`mixed_float16`, individual `dtype="float32"` layer overrides (`racaf_output`, `fused_embedding`,
+`AdaptiveBranchFusion`'s branch-weight projection) are part of the design, so the requirement is
+that at least one weighted layer is genuinely float16 — mixed precision being *absent* is the
+fault. Under `float32`, no layer may be float16 at all.
+
+Nothing else about the training configuration was touched: batch size is still 2, the optimizer is
+still `Adam` with its default learning rate, the model, the loss, `jit_compile` and
+`steps_per_execution` are all unchanged.
+
+**The 4–5 s/step question is still open, and is not answered by this fix.** Phase 2b measured a
+compiled `train_on_batch` at ~78 ms against a ~4215 ms eager taped step on the same batch and GPU —
+a 54× gap that makes the eager number unusable as an attribution. The historical ~4–5 s/step was
+`model.fit()`, which runs the compiled `train_function`, so something outside that step accounts
+for it. **Phase 2c** (`joint_training_profiler.profile_fit_paths`, notebook cell "Phase 2c")
+measures the four paths that isolate it, over 20–30 steps with every artefact written to a local
+directory and nothing to Drive:
+
+| path | measures |
+|---|---|
+| A dataset only | the real `tf.data` pipeline, no model — the ceiling the input pipeline can sustain |
+| B compiled `train_on_batch` | one materialized batch, reused — the ceiling the GPU can sustain |
+| C `model.fit()`, minimal callbacks | the real compiled loop over the real pipeline |
+| D `model.fit()`, real callback stack | C plus TensorBoard histograms, CSV logging, a checkpoint write |
+
+`D − C` is callback overhead; `C − B` is what `fit()` adds around the compiled step; `A > B` means
+`prefetch` cannot hide the input pipeline. Phase 2a's "input wait 1.3 ms" could not rule that out,
+because it was measured against a 4.1 s eager consumer — a prefetching pipeline only has to beat
+whatever the consumer is, and that consumer was ~54× slower than the real one. **This section names
+no root cause.** Phase 2c has not been run on Colab in this task, and the report is written so that
+it says which surrounding operation accounts for the difference from measurements, or says the
+historical timing was not reproduced — never both.
+
+**Safety against a stale optimizer.** The diagnostics take real gradient steps. Weights are
+snapshotted and restored, but the optimizer's slots and `iterations` cannot be, so
+`profile_fit_paths` sets `model._dr_diagnostic_dirty` and `Trainer.fit()` refuses such a model with
+an explicit instruction to rebuild and recompile
+(`test_fit_refuses_a_model_left_dirty_by_a_diagnostic`).
+
+**Tests.** `tests/test_training_precision.py` (20): policy capture and the after-the-fact-change
+no-op, `LossScaleOptimizer` wrapping, float32 variables under `mixed_float16`, the asymmetric
+consistency rule, `verify_model_precision` in all three modes, `Trainer.prepare(model)` refusing a
+mismatch, the diagnostic-dirty refusal, and two tests that build the **real** joint model through
+`build_and_compile_joint_model` for both `mixed_precision=True` and `False`.
+
+---
+
+## 49. Checkpoint/resume rebuilt for a run that spans many sessions — generations, integrity, and a global best
+
+**Why §25 was not enough.** §25's weights-only checkpointing is correct about *format* — Stage 6's
+Swin classes have no `get_config()`, so full `.keras` serialization is not safe here, and that has
+not changed. What it did not cover is *state*. `ModelCheckpoint(save_weights_only=True)` persists
+model variables and nothing else, so a resumed session restarts with:
+
+* a freshly initialized optimizer — Adam's moment estimates back to zero, `iterations` back to 0;
+* `EarlyStopping.wait = 0` and `ReduceLROnPlateau.wait = 0`, both reset in their `on_train_begin`;
+* `ModelCheckpoint.best = None`, so the first epoch of every session always "improves".
+
+On this run's schedule — an epoch is ~1.67 h and a Colab session is ~3 h, so roughly one epoch per
+session — that is not a rounding error. With `patience=8` and `patience=4`, **EarlyStopping could
+never fire and the learning rate could never be reduced**: both counters reset before they could
+accumulate. And `best.weights.h5` would be overwritten by the first epoch of every new session
+regardless of its `val_QWK`. A three-process relay run against the pre-change code confirmed
+exactly this: `val_loss` 0.6268 was overwritten by 625.41 at a leg boundary, with
+`optimizer.iterations` back at 0.
+
+**The format.** `training/checkpointing.py`, one immutable numbered generation per epoch:
+
+```
+checkpoints/
+    gen_00012/
+        model.weights.h5   166.36 MiB   model variables incl. BatchNorm moving statistics
+        optimizer.npz      331.15 MiB   all 820 optimizer variables, in build order
+        state.json            852 B     the authoritative training state
+        manifest.json       1,029 B     per-file size + SHA256, plus compatibility metadata
+        READY                 194 B     written LAST
+    gen_00011/                          previous known-good, retained
+    best/                               globally best val_QWK epoch (delivery model)
+    latest.json                         pointer to the newest known-good generation
+```
+
+**The write protocol, and why it does not rely on `os.replace`.** Google Drive's FUSE mount makes
+no atomic-rename guarantee, and this project has already been bitten by that mount (§35, §41). So
+atomicity is supplied by a marker instead: build and validate the generation on **local** disk,
+copy it to the destination, **re-validate every file's size and SHA256 at the destination**, and
+only then write `READY` and update `latest.json`. A generation without `READY` is invisible to
+`find_resumable_generation()`, so a half-copied one is skipped rather than half-loaded. The
+previous known-good generation is pruned only after its replacement has validated at the
+destination, and the generation `latest.json` points at is never pruned.
+
+`READY` carries the manifest's own SHA256, so a manifest edited after the fact cannot vouch for
+itself.
+
+**Integrity failures and compatibility failures are handled differently, on purpose.**
+
+* *Integrity* (missing file, wrong size, wrong SHA256, no `READY`) means "this generation is
+  damaged": `find_resumable_generation()` skips it and falls back to the newest older generation
+  that validates. Losing one epoch is the correct price.
+* *Compatibility* (different `config_hash`, optimizer type, precision policy, or checkpoint format)
+  means "intact, but not this run": that **raises**. Falling back to an older generation of a
+  differently configured run would be worse than stopping. Git commit, TF/Keras/Python versions and
+  dataset version are *advisory* — pulling a new commit between Colab sessions is normal — and are
+  reported as warnings rather than refusals.
+
+**Restore order.** Validate integrity → validate compatibility → build the optimizer's slots →
+restore the optimizer → restore the model weights → return the state. Building the slots first is
+the single most important rule here: a freshly constructed Keras 3 optimizer owns only `iteration`
+and `learning_rate`, and the per-parameter momentum/velocity slots are created lazily on the first
+`apply_gradients`, so assigning into an unbuilt optimizer silently restores almost nothing. Any
+count/shape/dtype mismatch raises `CheckpointIntegrityError`; **no slot is ever left silently at
+its initial value**, because a resumed Adam with half its second moments zeroed takes large,
+wrongly scaled steps for hundreds of iterations.
+
+The optimizer is restored *before* the weights so that an architecture mismatch is reported as a
+named optimizer-variable shape error rather than as an opaque HDF5 failure.
+
+**LAST vs BEST.** `gen_NNNNN/` is LAST — the trajectory the next session continues from, written
+every epoch, model **and** optimizer. `best/` is BEST — the globally best `val_QWK` epoch across the
+whole experiment, weights and state only, the intended delivery model, never resumed from.
+`EarlyStopping(restore_best_weights=True)` rewinds the in-memory model in `on_train_end`; LAST is
+written in `on_epoch_end`, so LAST always holds the real end-of-epoch trajectory and the two never
+contaminate each other. BEST is copied out of the generation written for that epoch, so it is
+bit-identical to it rather than a second serialization.
+
+**Global best.** `TrainingStateCheckpoint` reads the best metric back from the previous
+generation's `state.json` in `on_train_begin` -- but only when the run is actually resuming
+(`Trainer` wires this from `TrainingConfig.resume`). A run that is not resuming must not inherit
+its predecessor's best, or a fresh run pointed at a populated directory would start from epoch 0
+with fresh weights while claiming a score it never achieved; it says so and starts clean, and the
+generation numbering still continues so nothing already on disk is overwritten. The state file is
+the authoritative record — not
+`ModelCheckpoint.best`, which is a per-process Keras internal. The monitor is `val_QWK`, mode
+`max` (§23, unchanged). Session A reaching 0.72 and session B reaching only 0.70 leaves the global
+best at 0.72; session C reaching 0.75 advances it.
+
+**Callback state.** The same callback restores `EarlyStopping`'s `best`/`wait`/`stopped_epoch` and
+`ReduceLROnPlateau`'s `best`/`wait`/`cooldown_counter` *after* their `on_train_begin` has reset
+them — which is why `build_callbacks()` places it after both, and why a test pins that ordering.
+`min_delta` is deliberately **not** restored: Keras mutates it in `_set_monitor_op()`
+(`min_delta *= -1` for `mode="min"`), so writing a persisted value back would double-apply the sign
+flip. The effective learning rate travels with the optimizer, so restoring the optimizer restores
+a reduced LR automatically.
+
+**Two duplication fixes found by measurement.** Keras 3's `save_weights` walks the model's tracked
+attributes, and once the optimizer's slots exist it is one of them — so a `.weights.h5` written
+after the first gradient step silently carries the entire Adam state as well. Measured on the real
+joint model: **521,441,264 bytes**, against 173.4 MB of actual model variables, i.e. the momentum
+and velocity slots duplicated inside a file whose whole purpose is model weights, on top of the
+331 MiB `optimizer.npz` that already holds them and is the strictly validated copy. Detaching the
+optimizer for the duration of the write (and of the read, which also removes a benign but
+alarming `Skipping variable loading for optimizer …` warning) brought the file to **174,441,224
+bytes** and the whole generation from 828.57 MiB to **497.51 MiB**, and save time from 36.1 s to
+15.8 s. Separately, `state.json` fell from 140,389 B to **852 B** by keeping the 820-entry
+optimizer variable list where it is actually used — inside `optimizer.npz`, validating the
+restore — and storing only its signature hash in the state file a human reads.
+
+**Measured cost (local disk, CPU host, real 43.3M-parameter joint model).**
+
+| | |
+|---|---|
+| save (build + local validation + copy + destination re-validation + seal) | 15.8 s |
+| integrity re-validation (SHA256 re-read) | 1.4 s |
+| restore (build slots → restore optimizer → restore weights) | 3.8 s |
+| `model.weights.h5` | 174,441,224 B (166.36 MiB) |
+| `optimizer.npz` | 347,235,278 B (331.15 MiB) |
+| `state.json` / `manifest.json` | 852 B / 1,029 B |
+| total per generation | 497.51 MiB |
+| two retained generations + BEST | ≈ 1.16 GiB |
+| local staging headroom needed | ≈ 500 MiB |
+
+Against a ~1.67 h epoch that is under 1 % overhead. **Drive/FUSE write cost is NOT measured** —
+the notebook's Phase 2d cell can repeat the measurement against a real Drive path
+(`CHECKPOINT_COST_ON_DRIVE = True`), and no crash-safety claim about Drive should be made until it
+has been. Everything below is what has actually been tested, and where.
+
+**What resume guarantees, and what it does not.** Restoring a generation reproduces the model, its
+BatchNorm moving statistics, the full Adam state, the effective learning rate, and every stateful
+callback counter. That is *statistically equivalent continuation*, **not** bit-for-bit reproduction
+of an uninterrupted run, and the difference is not fixable by any checkpoint format:
+
+* this project sets no global seed anywhere, so even two uninterrupted runs do not match;
+* GPU kernels are not deterministic;
+* Keras 3's dropout `SeedGenerator` state is not part of `.weights.h5`;
+* `model.fit(initial_epoch=N)` does not fast-forward the `tf.data` shuffle stream, so a resumed
+  session replays epoch 0's batch order.
+
+The last point is a real limitation of resume as implemented, deliberately left alone here rather
+than redesigning the data pipeline. It is recorded so it is not mistaken for a claim of exactness.
+The separate, pre-existing augmentation defect — `gen()` re-creates `rng =
+np.random.default_rng(seed)` on every dataset iteration, so every image receives an identical
+augmentation in every epoch — is **not** addressed by this work and is not caused by it.
+
+**Tests.** `tests/test_checkpoint_resume.py` (51) covers all twenty required areas: generation
+layout, same-process save/load, weight/BatchNorm persistence, optimizer `iterations` and Adam slot
+persistence, refusal on incomplete or shape-mismatched optimizer state, manifest sizes and SHA256s,
+truncated/corrupted/tampered detection, `READY` semantics, partial-write and corruption fallback to
+the previous known-good generation, pruning that never removes the pointer's target, config and
+metadata mismatch refusal, LAST vs BEST distinction, the global best surviving a worse resumed
+epoch, EarlyStopping and ReduceLROnPlateau counters accumulating across legs, and the weights-file
+and state-file size guards. `ThreeProcessRelayTests` spawns three real OS processes
+(`tests/checkpoint_relay_worker.py`) through the production `Trainer`: A trains epochs 0–1, B
+resumes for 2–3, C resumes for 4–5, and the test asserts that `optimizer.iterations` continues
+across both process boundaries, that the global best survives a leg that scores worse, that
+`EarlyStopping.wait` accumulates 0 → 2 → 0 across them, and that a reduced learning rate is the
+one the next process starts from.
+
+**Backwards compatibility.** `build_callbacks()` without a `CheckpointOptions` produces exactly the
+callback set it always did, `checkpoint_paths()` still returns `best_weights`/`last_weights`/
+`epoch_state`, and Stages 1–4 are untouched. `EpochStateLogger` now writes through a temporary file
+rather than truncating the live one, which is strictly safer and changes nothing about its
+contents. `extra_callbacks` now run first rather than last, so a caller-supplied callback can
+enrich the shared `logs` dict before the standard callbacks read it — nothing in the repository
+passed `extra_callbacks` before this change.
+
+**How to resume a previous experiment.** Set `RESUME_EXPERIMENT_DIR` in the notebook's
+training-configuration cell to the experiment's root
+(`/content/drive/MyDrive/DiabeticRetinopathy/experiments/FinalClassification/<timestamp>`) and run
+the notebook normally. `Trainer` finds the newest valid generation, refuses the resume if
+`config_hash` no longer matches, restores weights + optimizer + callbacks, and continues from
+`completed_epoch`. Nothing has to be copied by hand and no optimizer variable has to be edited.

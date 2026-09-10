@@ -41,6 +41,7 @@ Safety -- this must not perturb the run it is diagnosing:
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -1642,3 +1643,477 @@ def print_report(report):
     print("NOTE: this diagnostic took real gradient steps. Model weights were snapshotted and")
     print("restored, but the optimizer's slot/iteration state was advanced -- rebuild and")
     print("recompile the model (re-run the model construction cell) before the real training run.")
+
+
+# =====================================================================
+# PHASE G -- what does model.fit() ACTUALLY cost?
+#
+# Phases C-F all measure eager, hand-written steps. `model.fit()` does not run
+# an eager step: it runs a compiled `train_function` (`jit_compile`, XLA where
+# available, `steps_per_execution` batches per call). Phase F measured a
+# compiled `train_on_batch` at ~78 ms against a ~4215 ms eager taped step on the
+# same batch and the same GPU -- a 54x gap -- which means the eager number
+# cannot be read as "the training step costs 4.2 s", and no root cause may be
+# named from it.
+#
+# But the historical real run displayed ~4-5 s per step, and that WAS
+# `model.fit()`. Something outside the compiled step accounts for the
+# difference. This phase measures the four paths that between them isolate it:
+#
+#   A. dataset only        -- iterate the real tf.data pipeline, no model
+#   B. compiled step only  -- train_on_batch on ONE materialized batch, reused
+#   C. model.fit(), minimal callbacks
+#   D. model.fit(), the REAL callback stack, redirected to a LOCAL directory
+#
+#   D - C   = callback overhead (TensorBoard histograms, CSV, checkpoint writes)
+#   C - B   = what fit() adds around the compiled step, which for a prefetching
+#             pipeline is dominated by input starvation whenever A > B
+#   A       = the ceiling the input pipeline can sustain, measured against a
+#             consumer that is NOT artificially slow
+#
+# Safety: weights are snapshotted and restored; nothing is written outside the
+# caller-supplied local directory; the model is flagged
+# `_dr_diagnostic_dirty` afterwards so `training.Trainer.fit()` refuses it until
+# it has been rebuilt and recompiled.
+# =====================================================================
+
+DEFAULT_FIT_STEPS = 25
+
+
+class _StepTimer(tf.keras.callbacks.Callback):
+    """Per-batch wall time as `model.fit()` itself sees it. `on_train_batch_end`
+    fires after the compiled `train_function` returns, which under TensorFlow's
+    asynchronous execution means the batch has been ENQUEUED, not necessarily
+    finished -- so these are the same numbers Keras' own progress bar reports,
+    which is exactly the quantity under investigation."""
+
+    def __init__(self):
+        super().__init__()
+        self.batch_seconds = []
+        self.epoch_seconds = None
+        self._batch_start = None
+        self._epoch_start = None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._epoch_start = time.perf_counter()
+
+    def on_train_batch_begin(self, batch, logs=None):
+        self._batch_start = time.perf_counter()
+
+    def on_train_batch_end(self, batch, logs=None):
+        if self._batch_start is not None:
+            self.batch_seconds.append(time.perf_counter() - self._batch_start)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if self._epoch_start is not None:
+            self.epoch_seconds = time.perf_counter() - self._epoch_start
+
+    def summary(self):
+        times = self.batch_seconds
+        steady = times[1:] if len(times) > 1 else []
+        return {
+            "steps": len(times),
+            "first_step_seconds": times[0] if times else None,
+            "steady_mean_seconds": (sum(steady) / len(steady)) if steady else None,
+            "steady_max_seconds": max(steady) if steady else None,
+            "steady_min_seconds": min(steady) if steady else None,
+            "epoch_seconds": self.epoch_seconds,
+        }
+
+
+def _mean(values):
+    return (sum(values) / len(values)) if values else None
+
+
+def _fit_configuration(model):
+    steps_per_execution = getattr(model, "steps_per_execution", None)
+    if steps_per_execution is not None:
+        try:
+            steps_per_execution = int(tf.keras.backend.get_value(steps_per_execution))
+        except (TypeError, ValueError):
+            steps_per_execution = None
+    optimizer = getattr(model, "optimizer", None)
+    inner = getattr(optimizer, "inner_optimizer", None)
+    return {
+        "jit_compile": getattr(model, "jit_compile", None),
+        "run_eagerly": getattr(model, "run_eagerly", None),
+        "steps_per_execution": steps_per_execution,
+        "optimizer": type(optimizer).__name__ if optimizer is not None else None,
+        "inner_optimizer": type(inner).__name__ if inner is not None else None,
+        "loss_scaled": inner is not None,
+        "model_dtype_policy": getattr(getattr(model, "dtype_policy", None), "name", None),
+        "global_dtype_policy": tf.keras.mixed_precision.global_policy().name,
+        "trainable_tensors": len(model.trainable_variables),
+        "trainable_parameters": int(sum(int(np.prod(v.shape)) for v in model.trainable_variables)),
+    }
+
+
+def profile_dataset_only(dataset, roots, steps=DEFAULT_FIT_STEPS):
+    """PATH A -- pull `steps` batches from the real pipeline with no model
+    attached, recording every filesystem operation. This is the number Phase E's
+    1.3 ms "input wait" could not reveal: with `prefetch`, input wait only shows
+    the pipeline is faster than the CONSUMER, and Phase E's consumer was a 4.1 s
+    eager step."""
+    recorder = jcd._Recorder(roots)
+    telemetry = _TelemetrySampler().start()
+    per_batch = []
+    iterator = iter(dataset)
+    start_all = time.perf_counter()
+    with jcd._instrument(recorder):
+        for _ in range(steps):
+            start = time.perf_counter()
+            try:
+                next(iterator)
+            except StopIteration:
+                break
+            per_batch.append(time.perf_counter() - start)
+    total = time.perf_counter() - start_all
+    steady = per_batch[1:] if len(per_batch) > 1 else []
+    return {
+        "steps": len(per_batch),
+        "total_seconds": total,
+        "first_batch_seconds": per_batch[0] if per_batch else None,
+        "steady_mean_seconds": _mean(steady),
+        "steady_max_seconds": max(steady) if steady else None,
+        "per_batch_seconds": per_batch,
+        "telemetry": telemetry.stop(),
+        "recorder": recorder,
+    }
+
+
+def profile_compiled_step(model, batch, steps=DEFAULT_FIT_STEPS):
+    """PATH B -- the COMPILED training step, via `train_on_batch`, on one
+    already-materialized batch reused every iteration. Zero dataset work, and
+    the same `train_function` `model.fit()` calls."""
+    inputs, labels = batch
+    # A multi-input model expects a LIST; `tf.data` hands the inputs over as a tuple.
+    if isinstance(inputs, tuple):
+        inputs = list(inputs)
+    telemetry = _TelemetrySampler().start()
+
+    warm_start = time.perf_counter()
+    model.train_on_batch(inputs, labels)          # builds/compiles train_function
+    warmup_seconds = time.perf_counter() - warm_start
+
+    per_step = []
+    start_all = time.perf_counter()
+    for _ in range(steps):
+        start = time.perf_counter()
+        model.train_on_batch(inputs, labels)
+        per_step.append(time.perf_counter() - start)
+    total = time.perf_counter() - start_all
+    steady = per_step[1:] if len(per_step) > 1 else []
+    return {
+        "steps": len(per_step),
+        "warmup_seconds": warmup_seconds,
+        "total_seconds": total,
+        "first_step_seconds": per_step[0] if per_step else None,
+        "steady_mean_seconds": _mean(steady),
+        "per_step_seconds": per_step,
+        "telemetry": telemetry.stop(),
+        "tf_gpu_memory": tf_gpu_memory(),
+    }
+
+
+def profile_fit(model, dataset, roots, steps=DEFAULT_FIT_STEPS, callbacks=None, label="fit"):
+    """PATH C / D -- one short `model.fit()` over the real pipeline.
+
+    `steps_per_epoch=steps` and `epochs=1` keep it to the requested handful of
+    batches. No validation data is passed: validation is a separate cost, and
+    mixing it in would make the per-step figure unattributable."""
+    recorder = jcd._Recorder(roots)
+    timer = _StepTimer()
+    telemetry = _TelemetrySampler().start()
+    start = time.perf_counter()
+    with jcd._instrument(recorder):
+        model.fit(
+            dataset,
+            epochs=1,
+            steps_per_epoch=steps,
+            callbacks=list(callbacks or []) + [timer],
+            verbose=0,
+        )
+    total = time.perf_counter() - start
+    summary = timer.summary()
+    summary.update({
+        "label": label,
+        "total_seconds": total,
+        "per_step_seconds": timer.batch_seconds,
+        "telemetry": telemetry.stop(),
+        "recorder": recorder,
+    })
+    return summary
+
+
+def profile_fit_paths(model, dataset, roots, steps=DEFAULT_FIT_STEPS,
+                      diagnostic_dir=None, monitor="val_QWK", mode="max",
+                      real_callbacks=True):
+    """Run paths A-D and return one comparable report.
+
+    Pass the SAME `tf.data.Dataset` the training cell built. Every path takes its
+    own fresh iterator -- `iter(dataset)` restarts the generator, and
+    `model.fit()` makes its own -- so no path inherits a partly consumed one.
+    Deliberately NOT a factory: `load_joint_training_datasets()` loads the frozen
+    Stage 03 (PyTorch) and Stage 04 (Keras) models on every call, so rebuilding
+    the pipeline per path would load them four times over for no benefit.
+
+    `diagnostic_dir` must be LOCAL (e.g. `/content/fit_diagnostic`). Nothing is
+    written to Drive: that is the point of redirecting the real callback stack
+    rather than pointing it at the experiment directory."""
+    diagnostic_dir = diagnostic_dir or os.path.join(
+        tempfile.gettempdir(), "joint_fit_diagnostic")
+    shutil.rmtree(diagnostic_dir, ignore_errors=True)
+    os.makedirs(diagnostic_dir, exist_ok=True)
+
+    configuration = _fit_configuration(model)
+    saved_weights = model.get_weights()
+    report = {"configuration": configuration, "steps_requested": steps,
+              "diagnostic_dir": diagnostic_dir}
+
+    try:
+        # --- A. dataset only ------------------------------------------------
+        report["dataset_only"] = profile_dataset_only(dataset, roots, steps=steps)
+
+        # --- B. compiled step only -----------------------------------------
+        batch = next(iter(dataset))
+        report["compiled_step"] = profile_compiled_step(model, batch, steps=steps)
+
+        # --- C. fit() with minimal callbacks --------------------------------
+        report["fit_minimal"] = profile_fit(
+            model, dataset, roots, steps=steps, callbacks=[], label="fit_minimal")
+
+        # --- D. fit() with the real callback stack, LOCAL output ------------
+        if real_callbacks:
+            from training.callbacks import build_callbacks
+            from training.checkpointing import CheckpointOptions
+
+            callbacks, callback_paths = build_callbacks(
+                checkpoint_dir=os.path.join(diagnostic_dir, "checkpoints"),
+                log_dir=os.path.join(diagnostic_dir, "logs"),
+                monitor=monitor, mode=mode,
+                checkpoint_options=CheckpointOptions(
+                    experiment_id="fit-diagnostic",
+                    staging_dir=os.path.join(diagnostic_dir, "_staging"),
+                    verbose=0,
+                ),
+            )
+            report["fit_real_callbacks"] = profile_fit(
+                model, dataset, roots, steps=steps, callbacks=callbacks,
+                label="fit_real_callbacks")
+            report["callback_paths"] = callback_paths
+    finally:
+        model.set_weights(saved_weights)
+        # The optimizer's slots and `iterations` were advanced by real gradient
+        # steps; weights alone are not enough to make the model safe to train.
+        setattr(model, "_dr_diagnostic_dirty", True)
+
+    report["comparison"] = _compare_fit_paths(report)
+    return report
+
+
+def _compare_fit_paths(report):
+    """Turn the four paths into the differences that actually answer the
+    question. Every entry is arithmetic on measured numbers -- no attribution
+    is asserted that the measurements do not support."""
+    dataset = (report.get("dataset_only") or {}).get("steady_mean_seconds")
+    compiled = (report.get("compiled_step") or {}).get("steady_mean_seconds")
+    minimal = (report.get("fit_minimal") or {}).get("steady_mean_seconds")
+    real = (report.get("fit_real_callbacks") or {}).get("steady_mean_seconds")
+
+    comparison = {
+        "dataset_only_seconds": dataset,
+        "compiled_step_seconds": compiled,
+        "fit_minimal_seconds": minimal,
+        "fit_real_callbacks_seconds": real,
+        "callback_overhead_seconds": (real - minimal) if (real and minimal) else None,
+        "fit_overhead_over_compiled_seconds": (minimal - compiled) if (minimal and compiled) else None,
+        "input_bound": (dataset is not None and compiled is not None and dataset > compiled),
+        "historical_slow_step_reproduced": (minimal is not None and minimal >= 3.0),
+    }
+
+    evidence = []
+    if dataset is not None and compiled is not None:
+        ratio = dataset / compiled if compiled else None
+        evidence.append(
+            "dataset-only %.0f ms/batch vs compiled step %.0f ms/batch (%s)"
+            % (dataset * 1000, compiled * 1000,
+               ("input pipeline is %.1fx slower -- prefetch cannot hide it" % ratio)
+               if ratio and ratio > 1 else "compute-bound"))
+    if minimal is not None and compiled is not None:
+        evidence.append(
+            "model.fit() %.0f ms/step vs compiled step %.0f ms/step -- fit() adds %.0f ms/step "
+            "outside the compiled train_function" % (minimal * 1000, compiled * 1000,
+                                                     (minimal - compiled) * 1000))
+    if real is not None and minimal is not None:
+        evidence.append(
+            "the real callback stack adds %.0f ms/step over minimal callbacks"
+            % ((real - minimal) * 1000))
+    if minimal is not None:
+        evidence.append(
+            "historical ~4-5 s/step %s in this run (model.fit() steady state %.2f s/step)"
+            % ("REPRODUCED" if minimal >= 3.0 else "NOT reproduced", minimal))
+    comparison["evidence"] = evidence
+    return comparison
+
+
+
+def drive_operation_counts(recorder):
+    """Persistent-root (Drive) filesystem operations a recorder observed. The
+    training path is required to stay at zero: any Drive read inside the loop is
+    a per-step FUSE round trip, and any write is the tripwire this profiler
+    exists to trip."""
+    return {
+        "stats": recorder.count(op="stat", is_persistent=True),
+        "reads": recorder.count(op="read", is_persistent=True),
+        "writes": recorder.count(op="write", is_persistent=True),
+        "mkdirs": recorder.count(op="mkdir", is_persistent=True),
+        "seconds": recorder.seconds(is_persistent=True),
+        "write_paths": [op.path for op in recorder.matching(op="write", is_persistent=True)],
+    }
+
+
+def print_fit_paths(report):
+    configuration = report.get("configuration") or {}
+    comparison = report.get("comparison") or {}
+    print("=" * 78)
+    print("PHASE G -- model.fit() vs the compiled step vs the dataset")
+    print("=" * 78)
+    print("Configuration (read off the live model, not assumed):")
+    print("  jit_compile=%s  run_eagerly=%s  steps_per_execution=%s"
+          % (configuration.get("jit_compile"), configuration.get("run_eagerly"),
+             configuration.get("steps_per_execution")))
+    print("  optimizer=%s%s  loss_scaled=%s"
+          % (configuration.get("optimizer"),
+             "(inner=%s)" % configuration["inner_optimizer"] if configuration.get("inner_optimizer") else "",
+             configuration.get("loss_scaled")))
+    print("  model dtype policy=%s  global dtype policy=%s"
+          % (configuration.get("model_dtype_policy"), configuration.get("global_dtype_policy")))
+    print("  trainable: %s tensors, %s parameters"
+          % (configuration.get("trainable_tensors"),
+             format(configuration.get("trainable_parameters") or 0, ",")))
+    print("")
+
+    header = "%-26s %10s %12s %12s %12s" % ("path", "steps", "first", "steady mean", "total")
+    print(header)
+    print("-" * len(header))
+    for key, label in (("dataset_only", "A. dataset only"),
+                       ("compiled_step", "B. compiled train_on_batch"),
+                       ("fit_minimal", "C. model.fit() minimal"),
+                       ("fit_real_callbacks", "D. model.fit() real cbs")):
+        section = report.get(key)
+        if not section:
+            continue
+        first = section.get("first_step_seconds") or section.get("first_batch_seconds")
+        print("%-26s %10s %12s %12s %12s"
+              % (label, section.get("steps"), _ms(first),
+                 _ms(section.get("steady_mean_seconds")), _ms(section.get("total_seconds"))))
+    print("")
+    print("Derived:")
+    print("  callback overhead (D - C)          : %s" % _ms(comparison.get("callback_overhead_seconds")))
+    print("  fit() overhead over compiled (C - B): %s" % _ms(comparison.get("fit_overhead_over_compiled_seconds")))
+    print("  input-bound (A > B)                : %s" % comparison.get("input_bound"))
+    print("  historical 4-5 s/step reproduced   : %s" % comparison.get("historical_slow_step_reproduced"))
+    print("")
+    print("Evidence:")
+    for line in comparison.get("evidence", []):
+        print("  - %s" % line)
+
+    print("")
+    print("Drive (persistent-root) operations, per path -- the training path must stay at zero:")
+    for key, label in (("dataset_only", "A"), ("fit_minimal", "C"), ("fit_real_callbacks", "D")):
+        section = report.get(key)
+        recorder = (section or {}).get("recorder")
+        if recorder is None:
+            continue
+        drive = drive_operation_counts(recorder)
+        print("  path %s: %d stat, %d read, %d write, %d mkdir (%.2f s total)"
+              % (label, drive["stats"], drive["reads"], drive["writes"], drive["mkdirs"],
+                 drive["seconds"]))
+        if drive["write_paths"]:
+            print("      WRITE TRIPWIRE FAILED -- wrote to: %s" % drive["write_paths"][:5])
+
+    print("")
+    print("Telemetry (mean/max where sampled):")
+    for key, label in (("compiled_step", "B"), ("fit_minimal", "C"), ("fit_real_callbacks", "D")):
+        section = report.get(key)
+        telemetry = (section or {}).get("telemetry") or {}
+        gpu = telemetry.get("gpu_util_percent") or {}
+        cpu = telemetry.get("cpu_percent") or {}
+        if gpu or cpu:
+            print("  path %s: GPU util mean=%s max=%s | CPU mean=%s max=%s"
+                  % (label, gpu.get("mean"), gpu.get("max"), cpu.get("mean"), cpu.get("max")))
+
+    print("")
+    print("NOTE: this diagnostic took real gradient steps. Model weights were restored, but the")
+    print("optimizer's slot/iteration state was advanced and the model is now flagged")
+    print("`_dr_diagnostic_dirty` -- training.Trainer.fit() will refuse it until the model is")
+    print("rebuilt and recompiled (joint_training_model.build_and_compile_joint_model(...)).")
+
+
+# =====================================================================
+# PHASE H -- what does one checkpoint actually cost?
+# =====================================================================
+
+def measure_checkpoint_cost(model, checkpoint_dir=None, staging_dir=None, restore=True):
+    """Time one full checkpoint save (weights + optimizer + state + manifest +
+    validation + seal) and one full restore, and report the byte sizes.
+
+    Deliberately writes to a LOCAL directory by default: this measures the
+    checkpoint machinery, not Drive latency. Drive cost has to be measured on
+    Colab against a real Drive path, and is reported separately as such."""
+    from training import checkpointing as ckpt
+
+    checkpoint_dir = checkpoint_dir or os.path.join(
+        tempfile.gettempdir(), "joint_checkpoint_cost", "checkpoints")
+    shutil.rmtree(os.path.dirname(checkpoint_dir), ignore_errors=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    state = ckpt.TrainingState(
+        experiment_id="checkpoint-cost", completed_epoch=1, best_epoch=0, best_metric=0.0,
+    )
+    start = time.perf_counter()
+    generation_dir = ckpt.save_generation(checkpoint_dir, model, state, staging_dir=staging_dir)
+    save_seconds = time.perf_counter() - start
+
+    sizes = ckpt.checkpoint_size_report(generation_dir)
+
+    start = time.perf_counter()
+    validation = ckpt.validate_generation(generation_dir)
+    validate_seconds = time.perf_counter() - start
+
+    restore_seconds = None
+    if restore:
+        start = time.perf_counter()
+        ckpt.restore_training_state(model, generation_dir, verbose=0)
+        restore_seconds = time.perf_counter() - start
+
+    return {
+        "generation_dir": generation_dir,
+        "save_seconds": save_seconds,
+        "validate_seconds": validate_seconds,
+        "restore_seconds": restore_seconds,
+        "validation_ok": validation.ok,
+        "sizes": sizes,
+        "trainable_parameters": int(sum(int(np.prod(v.shape)) for v in model.trainable_variables)),
+        "optimizer_variables": len(model.optimizer.variables) if model.optimizer else None,
+    }
+
+
+def print_checkpoint_cost(report):
+    print("=" * 78)
+    print("PHASE H -- checkpoint cost")
+    print("=" * 78)
+    print("  trainable parameters : %s" % format(report.get("trainable_parameters") or 0, ","))
+    print("  optimizer variables  : %s" % report.get("optimizer_variables"))
+    print("  save (build+validate+copy+seal): %s" % _ms(report.get("save_seconds")))
+    print("  validate (sha256 re-read)      : %s" % _ms(report.get("validate_seconds")))
+    print("  restore (slots+optimizer+weights): %s" % _ms(report.get("restore_seconds")))
+    print("  integrity validation           : %s" % ("PASS" if report.get("validation_ok") else "FAIL"))
+    sizes = report.get("sizes") or {}
+    for name, size in (sizes.get("files") or {}).items():
+        print("    %-24s %14s bytes (%8.2f MiB)" % (name, format(size, ","), size / 1024 ** 2))
+    total = sizes.get("total_bytes") or 0
+    print("    %-24s %14s bytes (%8.2f MiB)" % ("TOTAL", format(total, ","), total / 1024 ** 2))
+    print("")
+    print("Local disk only. Drive/FUSE write cost is NOT measured here and must be measured on")
+    print("Colab against a real Drive path before any crash-safety claim is made about Drive.")

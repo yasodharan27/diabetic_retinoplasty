@@ -109,6 +109,64 @@ def compile_joint_model(model, optimizer=None):
     return model
 
 
+def build_and_compile_joint_model(mixed_precision=True, optimizer=None, verbose=1):
+    """Establish the dtype policy, THEN build, THEN compile -- the only order in
+    which mixed precision actually takes effect. Use this instead of calling
+    `build_joint_model()` + `compile_joint_model()` by hand.
+
+    Keras 3 reads the global dtype policy in each layer's CONSTRUCTOR and decides
+    whether to wrap the optimizer in a `LossScaleOptimizer` when the model is
+    COMPILED. Setting the policy afterwards -- which is what happens when a model
+    is built first and only later handed to `training.Trainer`, whose `prepare()`
+    calls `enable_mixed_precision()` -- changes the global policy and nothing
+    about the model. Verified on TF 2.21.0 / Keras 3.15.1: a model built under
+    `float32` and then exposed to a `mixed_float16` global policy still reports
+    `compute=float32, variable=float32` on every weighted layer and still carries
+    a bare `Adam`, so the whole run trains in float32 with no loss scaling while
+    every configuration flag says otherwise.
+
+    `mixed_float16` keeps VARIABLES in float32 by design (`compute_dtype=float16`,
+    `variable_dtype=float32`) -- float32 trainable tensors and float32 gradients
+    are correct mixed-precision behaviour, not a symptom of a misconfiguration.
+    What distinguishes a working setup is that the layers' compute dtype is
+    float16 and the optimizer is a `LossScaleOptimizer`; both are asserted here.
+
+    Returns the compiled model. Raises if the resulting configuration is not the
+    one requested, rather than training a silently downgraded model."""
+    from training import enable_mixed_precision, model_precision_policies, expected_policy_name
+    from training.trainer import precision_is_consistent
+
+    policy = enable_mixed_precision(mixed_precision)
+    model = build_joint_model()
+    compile_joint_model(model, optimizer=optimizer)
+
+    expected = expected_policy_name(mixed_precision)
+    actual = model_precision_policies(model)
+    if not precision_is_consistent(expected, actual):
+        raise RuntimeError(
+            f"Joint model was built under {sorted(actual)} but the global policy is "
+            f"'{policy.name}' and this call requested '{expected}'. Something set the dtype "
+            "policy between enable_mixed_precision() and build_joint_model()."
+        )
+
+    resolved = model.optimizer
+    inner = getattr(resolved, "inner_optimizer", None)
+    if expected == "mixed_float16" and inner is None:
+        raise RuntimeError(
+            "Model is mixed_float16 but its optimizer was not wrapped in a LossScaleOptimizer. "
+            "Without loss scaling, float16 gradients underflow to zero and training silently "
+            "stops learning."
+        )
+
+    if verbose:
+        print(f"Joint model built under dtype policy '{expected}' "
+              f"(global '{policy.name}'), optimizer "
+              f"{type(resolved).__name__}{f'(inner={type(inner).__name__})' if inner else ''}.")
+        print(f"  trainable tensors: {len(model.trainable_variables)}  "
+              f"parameters: {sum(int(np.prod(v.shape)) for v in model.trainable_variables):,}")
+    return model
+
+
 # --- Checkpoint infrastructure -- weights-only, path is always caller-supplied. ---
 #
 # Deliberately takes no default path and makes no Drive/local assumption of its own: the actual

@@ -123,6 +123,235 @@ class MultiKernelBranchesPresentTests(unittest.TestCase):
         self.assertEqual(len(pool_layers), 4)
 
 
+class AdaptiveBranchFusionTests(unittest.TestCase):
+    """The "Adaptive" half of "Adaptive Multi-Kernel CNN": the branch mixture
+    must depend on the image, not be one fixed learned vector reused for every
+    sample. These tests inspect the real layer, not a docstring claim."""
+
+    def make_branches(self, batch=2, size=8, channels=4, seed=0):
+        rng = np.random.RandomState(seed)
+        return [tf.constant(rng.rand(batch, size, size, channels).astype("float32"))
+                for _ in range(3)]
+
+    def test_layer_builds_and_reports_its_shape(self):
+        layer = lfem.AdaptiveBranchFusion()
+        branches = self.make_branches(channels=64)
+        outputs = layer(branches)
+        self.assertTrue(layer.built)
+        self.assertEqual(layer.num_branches, 3)
+        self.assertEqual(layer.channels, 64)
+        self.assertEqual(layer.reduced_units, 8)  # max(64 // 8, 8)
+        self.assertEqual(len(outputs), 3)
+        for branch, output in zip(branches, outputs):
+            self.assertEqual(tuple(output.shape), tuple(branch.shape))
+
+    def test_reduced_units_never_collapse_below_the_floor(self):
+        layer = lfem.AdaptiveBranchFusion(reduction_ratio=8, min_reduced_units=8)
+        layer(self.make_branches(channels=4))
+        self.assertEqual(layer.reduced_units, 8)  # 4 // 8 == 0 would be degenerate
+
+    def test_branch_weights_are_normalized_across_branches(self):
+        layer = lfem.AdaptiveBranchFusion()
+        branches = self.make_branches(batch=3, channels=16)
+        layer(branches)
+        weights = np.asarray(layer.branch_weights(branches))
+
+        self.assertEqual(weights.shape, (3, 3, 16))  # (batch, branches, channels)
+        np.testing.assert_allclose(weights.sum(axis=1), np.ones((3, 16)), atol=1e-5)
+        self.assertTrue((weights >= 0).all())
+        self.assertTrue((weights <= 1).all())
+
+    def test_weights_vary_between_different_input_samples(self):
+        layer = lfem.AdaptiveBranchFusion()
+        first = self.make_branches(batch=1, channels=16, seed=1)
+        second = [tf.constant(np.asarray(b) * 4.0 + 2.0) for b in self.make_branches(
+            batch=1, channels=16, seed=99)]
+        layer(first)
+        w1 = np.asarray(layer.branch_weights(first))
+        w2 = np.asarray(layer.branch_weights(second))
+        self.assertGreater(float(np.abs(w1 - w2).max()), 1e-4,
+                           "branch weights did not respond to a different image")
+
+    def test_not_merely_one_globally_fixed_learned_fusion_vector(self):
+        """Regression guard for the defect this layer exists to fix.
+
+        A plain concat + 1x1 convolution mixes the branches with a kernel that
+        is the SAME for every image. Two checks together rule that out: the
+        weights differ across a batch of deliberately different samples, and the
+        gradient of the weights with respect to the branch activations is
+        non-zero (i.e. the weights are genuinely a function of the input, not a
+        constant that merely happens to differ)."""
+        layer = lfem.AdaptiveBranchFusion()
+        rng = np.random.RandomState(3)
+        base = rng.rand(4, 8, 8, 16).astype("float32")
+        # Four clearly distinct samples in one batch.
+        base[1] *= 5.0
+        base[2] = 1.0 - base[2]
+        base[3] += 3.0
+        branches = [tf.constant(base), tf.constant(base * 0.5), tf.constant(base * 2.0)]
+        layer(branches)
+
+        weights = np.asarray(layer.branch_weights(branches))
+        spread = np.abs(weights - weights.mean(axis=0, keepdims=True)).max()
+        self.assertGreater(spread, 1e-4,
+                           "every sample in the batch received the same branch weights -- the "
+                           "fusion is still globally fixed, not image-dependent")
+
+        variables = [tf.Variable(b) for b in branches]
+        with tf.GradientTape() as tape:
+            w = layer.branch_weights(variables)
+            probe = tf.reduce_sum(w[:, 0, :])  # depends ONLY on the weights
+        grads = tape.gradient(probe, variables)
+        self.assertTrue(all(g is not None for g in grads))
+        self.assertGreater(float(max(tf.reduce_max(tf.abs(g)) for g in grads)), 0.0,
+                           "the branch weights do not depend on the branch activations at all")
+
+    def test_a_sample_gets_the_same_weights_alone_as_inside_a_batch(self):
+        """The weights must come from the sample's own features only -- no batch
+        statistic, no cross-sample term."""
+        layer = lfem.AdaptiveBranchFusion()
+        rng = np.random.RandomState(11)
+        batch = rng.rand(4, 8, 8, 16).astype("float32")
+        branches = [tf.constant(batch), tf.constant(batch * 0.5), tf.constant(batch * 2.0)]
+        layer(branches)
+        batched = np.asarray(layer.branch_weights(branches))
+
+        single = [tf.constant(np.asarray(b)[2:3]) for b in branches]
+        alone = np.asarray(layer.branch_weights(single))
+        np.testing.assert_allclose(batched[2:3], alone, atol=1e-5)
+
+    def test_gradients_reach_the_adaptive_weighting_parameters(self):
+        model = lfem.build_local_feature_extractor(input_shape=(16, 16, 8), stage_filters=(4,))
+        fusion = model.get_layer("stage1_adaptive_fusion")
+        self.assertGreater(len(fusion.trainable_weights), 0)
+
+        x = np.random.RandomState(5).rand(2, 16, 16, 8).astype("float32")
+        with tf.GradientTape() as tape:
+            loss = tf.reduce_mean(tf.square(model(x, training=True)))
+        grads = tape.gradient(loss, fusion.trainable_weights)
+        self.assertTrue(all(g is not None for g in grads),
+                        "the adaptive weighting parameters received no gradient")
+        self.assertGreater(float(max(tf.reduce_max(tf.abs(g)) for g in grads)), 0.0)
+
+    def test_batch_size_two_matches_the_training_configuration(self):
+        model = lfem.build_local_feature_extractor(input_shape=(32, 32, 8), stage_filters=(4, 8))
+        x = np.random.RandomState(6).rand(2, 32, 32, 8).astype("float32")
+        y = model.predict(x, verbose=0)
+        self.assertEqual(y.shape, (2, 8, 8, 8))
+        self.assertTrue(np.isfinite(y).all())
+
+    def test_batch_size_one_still_works(self):
+        model = lfem.build_local_feature_extractor(input_shape=(32, 32, 8), stage_filters=(4, 8))
+        y = model.predict(np.random.RandomState(7).rand(1, 32, 32, 8).astype("float32"), verbose=0)
+        self.assertEqual(y.shape, (1, 8, 8, 8))
+
+    def test_deterministic_input_produces_reproducible_output(self):
+        model = lfem.build_local_feature_extractor(input_shape=(32, 32, 8), stage_filters=(4, 8))
+        x = np.random.RandomState(8).rand(2, 32, 32, 8).astype("float32")
+        first = model.predict(x, verbose=0)
+        second = model.predict(x, verbose=0)
+        np.testing.assert_allclose(first, second, atol=0)
+
+    def test_runs_under_mixed_float16(self):
+        """The block's convolutions run in float16 while the branch weights are
+        computed in float32 (see `AdaptiveBranchFusion`'s docstring); both the
+        forward pass and the gradients must stay finite."""
+        original = tf.keras.mixed_precision.global_policy()
+        try:
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+            model = lfem.build_local_feature_extractor(input_shape=(32, 32, 8),
+                                                       stage_filters=(4, 8))
+            fusion = model.get_layer("stage1_adaptive_fusion")
+            self.assertEqual(fusion.dtype_policy.name, "mixed_float16")
+            self.assertEqual(fusion.reduce.dtype_policy.name, "float32")
+            self.assertEqual(fusion.expand.dtype_policy.name, "float32")
+
+            x = np.random.RandomState(9).rand(2, 32, 32, 8).astype("float32")
+            with tf.GradientTape() as tape:
+                loss = tf.reduce_mean(tf.square(tf.cast(model(x, training=True), tf.float32)))
+            grads = tape.gradient(loss, model.trainable_variables)
+            self.assertTrue(np.isfinite(float(loss)))
+            self.assertTrue(all(g is not None for g in grads))
+            self.assertTrue(all(bool(tf.reduce_all(tf.math.is_finite(tf.cast(g, tf.float32))))
+                                for g in grads))
+        finally:
+            tf.keras.mixed_precision.set_global_policy(original)
+
+    def test_runs_under_xla_jit_compile(self):
+        """Requirement 10: the adaptive path must be traceable by the XLA/JIT
+        setting the joint training configuration uses (`jit_compile` resolves to
+        True on GPU). Everything in `AdaptiveBranchFusion` is shape-static --
+        pooling, two dense projections, a reshape, a softmax and a broadcast
+        multiply -- so a compiled train step must build and produce finite
+        gradients. Compiled here on whatever device this host has; XLA tracing,
+        not device throughput, is what is under test."""
+        model = lfem.build_local_feature_extractor(input_shape=(32, 32, 8), stage_filters=(4, 8))
+        wrapped = tf.keras.Model(model.input, tf.keras.layers.GlobalAveragePooling2D()(model.output))
+        wrapped.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse", jit_compile=True)
+        self.assertTrue(wrapped.jit_compile)
+
+        x = np.random.RandomState(12).rand(2, 32, 32, 8).astype("float32")
+        y = np.zeros((2, 8), dtype="float32")
+        loss = wrapped.train_on_batch(x, y)
+        self.assertTrue(np.isfinite(float(loss)))
+
+    def test_layer_configuration_round_trips(self):
+        layer = lfem.AdaptiveBranchFusion(reduction_ratio=4, min_reduced_units=2,
+                                          name="fusion_probe")
+        config_dict = layer.get_config()
+        self.assertEqual(config_dict["reduction_ratio"], 4)
+        self.assertEqual(config_dict["min_reduced_units"], 2)
+
+        clone = lfem.AdaptiveBranchFusion.from_config(config_dict)
+        self.assertEqual(clone.reduction_ratio, 4)
+        self.assertEqual(clone.min_reduced_units, 2)
+        self.assertEqual(clone.name, "fusion_probe")
+
+    def test_layer_is_registered_for_keras_serialization(self):
+        import keras
+        registered = keras.saving.get_registered_object(
+            "local_feature_extraction>AdaptiveBranchFusion")
+        self.assertIs(registered, lfem.AdaptiveBranchFusion)
+
+    def test_a_single_tensor_input_is_rejected(self):
+        layer = lfem.AdaptiveBranchFusion()
+        with self.assertRaises(ValueError):
+            layer(tf.zeros((2, 8, 8, 4)))
+
+    def test_mismatched_branch_channel_counts_are_rejected(self):
+        layer = lfem.AdaptiveBranchFusion()
+        with self.assertRaises(ValueError):
+            layer([tf.zeros((2, 8, 8, 4)), tf.zeros((2, 8, 8, 6)), tf.zeros((2, 8, 8, 4))])
+
+    def test_every_stage_has_an_adaptive_fusion_layer(self):
+        model = lfem.build_local_feature_extractor()
+        fusion = [l for l in model.layers if isinstance(l, lfem.AdaptiveBranchFusion)]
+        self.assertEqual(len(fusion), len(lfem.DEFAULT_STAGE_FILTERS))
+        for index, filters in enumerate(lfem.DEFAULT_STAGE_FILTERS, start=1):
+            layer = model.get_layer(f"stage{index}_adaptive_fusion")
+            self.assertEqual(layer.channels, filters)
+            self.assertEqual(layer.num_branches, 3)
+
+    def test_parameter_growth_is_small_and_intentional(self):
+        """Adaptivity must not smuggle in a second backbone: the whole mechanism
+        is a per-stage (C -> C/8 -> 3C) projection."""
+        model = lfem.build_local_feature_extractor()
+        added = sum(
+            int(np.prod(w.shape))
+            for layer in model.layers if isinstance(layer, lfem.AdaptiveBranchFusion)
+            for w in layer.weights
+        )
+        self.assertEqual(added, 45_536)
+        self.assertLess(added / model.count_params(), 0.03)
+
+    def test_output_contract_is_unchanged_by_adaptive_fusion(self):
+        """The one shape Stage 06/07/RACAF depend on."""
+        model = lfem.build_local_feature_extractor()
+        self.assertEqual(model.output_shape, (None, 32, 32, 256))
+        self.assertEqual(lfem.OUTPUT_SPATIAL_SIZE, 32)
+        self.assertEqual(lfem.OUTPUT_CHANNELS, 256)
+
+
 class StopGradientBoundaryTests(unittest.TestCase):
     """The frozen Stage 03/04 outputs entering this model must not receive
     gradient from anything downstream of this model -- verified directly

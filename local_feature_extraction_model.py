@@ -21,21 +21,31 @@ downstream CORN ordinal loss. Compiling it here with an invented loss
 would misrepresent that.
 
 Architecture: four "multi-kernel blocks" (parallel 3x3 / 5x5 / dilated-3x3
-convolution branches, concatenated and fused via a 1x1 conv), each
-followed by a 2x2 max-pool -- a direct, unmodified reuse of this
-project's existing conv-block idiom (`lesion_segmentation_model.py`'s
-`_conv_block`'s BatchNorm+ReLU convention), extended with parallel
-branches instead of a single kernel size per stage, per the approved
-Stage 05 design's explicit multi-scale requirement. No attention gates,
-no decoder, no skip connections -- those are Stage 04's own architecture,
-not reused or duplicated here.
+convolution branches, adaptively re-weighted per image, concatenated and
+fused via a 1x1 conv), each followed by a 2x2 max-pool -- a direct,
+unmodified reuse of this project's existing conv-block idiom
+(`lesion_segmentation_model.py`'s `_conv_block`'s BatchNorm+ReLU
+convention), extended with parallel branches instead of a single kernel
+size per stage, per the approved Stage 05 design's explicit multi-scale
+requirement. No attention gates, no decoder, no skip connections -- those
+are Stage 04's own architecture, not reused or duplicated here.
+
+What "Adaptive" means here: `AdaptiveBranchFusion` computes a per-sample,
+per-channel softmax over the three branches from the sample's own pooled
+branch responses, and scales each branch by its weight before the
+concatenation. Without it the block would be multi-kernel but not
+adaptive -- the 1x1 fusion convolution's kernel is a fixed learned
+parameter, so every image would be fused with an identical branch
+mixture. See `AdaptiveBranchFusion`'s docstring for the exact formulation,
+its mixed-precision handling, and why it is not a second research
+contribution (the project's single contribution remains RACAF).
 """
 
 import os
 
 import numpy as np
 import tensorflow as tf
-from keras import Input, Model, layers
+from keras import Input, Model, layers, ops
 from keras.saving import register_keras_serializable
 
 import config
@@ -44,6 +54,13 @@ from pipeline import FeatureExtractionStage
 DEFAULT_INPUT_SHAPE = (512, 512, 8)
 DEFAULT_STAGE_FILTERS = (32, 64, 128, 256)
 DEFAULT_MODEL_PATH = os.path.join(config.LOCAL_FEATURE_MODEL_DIR, "best_model.keras")
+
+# Adaptive branch-fusion sizing. The context projection is deliberately tiny: it
+# exists to weight three branches per channel, not to add representational
+# capacity of its own (see `AdaptiveBranchFusion`). At the default stage filters
+# it adds ~45.5k parameters in total, about 0.1% of the joint model.
+DEFAULT_BRANCH_REDUCTION_RATIO = 8
+DEFAULT_MIN_BRANCH_REDUCED_UNITS = 8
 
 # Fixed by the approved Stage 05 design: 4 downsampling stages applied to a
 # 512x512 input yields exactly this spatial resolution (512 / 2**4 = 32),
@@ -65,18 +82,162 @@ class _StopGradientBoundary(layers.Layer):
         return tf.stop_gradient(inputs)
 
 
-def _multi_kernel_block(x, filters, name):
+@register_keras_serializable(package="local_feature_extraction")
+class AdaptiveBranchFusion(layers.Layer):
+    """Per-sample, per-channel weighting of a multi-kernel block's parallel
+    branches -- the "adaptive" half of "Adaptive Multi-Kernel CNN".
+
+    WHY THIS EXISTS. The block already ran three kernels at different effective
+    receptive fields and fused them with a 1x1 convolution. But a convolution's
+    kernel is a *fixed learned parameter*: once trained, every image is fused
+    with exactly the same branch mixture. That is multi-kernel, not adaptive.
+    The approved Stage 05 design calls for the branch mixture to depend on the
+    image, because the scale that carries the signal differs per image -- a
+    fundus dominated by microaneurysms needs the 3x3 branch, one dominated by
+    exudate patches needs the dilated branch. This layer supplies exactly that
+    missing image-dependence, and nothing else.
+
+    HOW THE WEIGHTS ARE PRODUCED (and applied).
+
+        context   = GlobalAveragePooling2D(sum(branches))        -> (N, C)
+        hidden    = Dense(max(C // reduction_ratio, min_units), relu)(context)
+        logits    = Dense(num_branches * C)(hidden)              -> (N, B*C)
+        weights   = softmax(reshape(logits, (N, B, C)), axis=1)  -> (N, B, C)
+        output[b] = branches[b] * weights[:, b, :]               broadcast over H, W
+
+    Properties that follow directly, each pinned by a test in
+    `tests/test_local_feature_extraction_model.py`:
+
+    * **Image-dependent.** The weights are a function of the sample's own
+      pooled branch responses, so two different images generally receive
+      different mixtures. Nothing but the current sample's features enters --
+      no label, no batch statistic, no cross-sample term, so a sample's weights
+      are identical whether it is scored alone or inside any batch.
+    * **Normalized across branches.** `softmax(axis=1)` is over the branch
+      axis, so for every (sample, channel) the three branch weights are
+      positive and sum to 1. "How much of this channel comes from which
+      receptive field" is therefore a well-defined proportion.
+    * **Differentiable and trainable end-to-end**, through the same CORN
+      ordinal loss as the rest of the joint graph. No auxiliary loss.
+    * **Batch-size agnostic**, including BATCH_SIZE=2, and shape-static, so
+      XLA/`jit_compile` can trace it.
+
+    NUMERICS UNDER `mixed_float16`. The two projections and the softmax run in
+    float32 (`dtype="float32"` on both `Dense` layers) and the resulting weights
+    are cast back to the block's compute dtype before they multiply the
+    branches. Branch weights are a normalized proportion; computing them in
+    float16 would put a per-channel three-way softmax at the mercy of fp16
+    rounding for no throughput gain, since the projection is only (N, C) wide.
+    The heavy convolutions themselves are untouched and still run in float16.
+
+    SCOPE. This is branch selection inside one block, not a new research
+    component: no spatial attention map, no query/key/value projection, no
+    cross-stage gating, no auxiliary supervision. The project's single research
+    contribution remains RACAF, which this layer does not touch.
+    """
+
+    def __init__(self, reduction_ratio=DEFAULT_BRANCH_REDUCTION_RATIO,
+                 min_reduced_units=DEFAULT_MIN_BRANCH_REDUCED_UNITS, **kwargs):
+        super().__init__(**kwargs)
+        if reduction_ratio < 1:
+            raise ValueError(f"reduction_ratio must be >= 1, got {reduction_ratio}")
+        if min_reduced_units < 1:
+            raise ValueError(f"min_reduced_units must be >= 1, got {min_reduced_units}")
+        self.reduction_ratio = int(reduction_ratio)
+        self.min_reduced_units = int(min_reduced_units)
+        self.num_branches = None
+        self.channels = None
+        self.reduced_units = None
+
+    def build(self, input_shape):
+        if not isinstance(input_shape, (list, tuple)) or not input_shape or not isinstance(
+                input_shape[0], (list, tuple)):
+            raise ValueError(
+                "AdaptiveBranchFusion must be called on a LIST of branch tensors, e.g. "
+                f"layer([small, medium, large]); got a single input of shape {input_shape}."
+            )
+        shapes = [tuple(shape) for shape in input_shape]
+        if len(shapes) < 2:
+            raise ValueError(f"AdaptiveBranchFusion needs at least 2 branches, got {len(shapes)}.")
+        channels = shapes[0][-1]
+        if channels is None:
+            raise ValueError("AdaptiveBranchFusion requires a known channel dimension.")
+        if any(shape[-1] != channels for shape in shapes):
+            raise ValueError(
+                "Every branch must have the same channel count for a branch-wise softmax to be "
+                f"meaningful; got {[shape[-1] for shape in shapes]}."
+            )
+
+        self.num_branches = len(shapes)
+        self.channels = int(channels)
+        self.reduced_units = max(self.channels // self.reduction_ratio, self.min_reduced_units)
+
+        self.context_pool = layers.GlobalAveragePooling2D(
+            name="branch_context", dtype=self.dtype_policy)
+        self.reduce = layers.Dense(
+            self.reduced_units, activation="relu", name="branch_reduce", dtype="float32")
+        self.expand = layers.Dense(
+            self.num_branches * self.channels, name="branch_logits", dtype="float32")
+
+        self.context_pool.build(shapes[0])
+        self.reduce.build((shapes[0][0], self.channels))
+        self.expand.build((shapes[0][0], self.reduced_units))
+        super().build(input_shape)
+
+    def branch_weights(self, inputs):
+        """The `(N, num_branches, channels)` softmax weights for `inputs`.
+
+        Public so tests and any future analysis can inspect the mixture the
+        model actually chose for a given image, without re-deriving it."""
+        summed = inputs[0]
+        for branch in inputs[1:]:
+            summed = summed + branch
+        context = self.context_pool(summed)
+        logits = self.expand(self.reduce(ops.cast(context, "float32")))
+        logits = ops.reshape(logits, (-1, self.num_branches, self.channels))
+        return ops.softmax(logits, axis=1)
+
+    def call(self, inputs):
+        weights = self.branch_weights(inputs)
+        outputs = []
+        for index, branch in enumerate(inputs):
+            weight = ops.reshape(weights[:, index, :], (-1, 1, 1, self.channels))
+            outputs.append(branch * ops.cast(weight, branch.dtype))
+        return outputs
+
+    def compute_output_shape(self, input_shape):
+        return [tuple(shape) for shape in input_shape]
+
+    def get_config(self):
+        config_dict = super().get_config()
+        config_dict.update({
+            "reduction_ratio": self.reduction_ratio,
+            "min_reduced_units": self.min_reduced_units,
+        })
+        return config_dict
+
+
+def _multi_kernel_block(x, filters, name, reduction_ratio=DEFAULT_BRANCH_REDUCTION_RATIO,
+                        min_reduced_units=DEFAULT_MIN_BRANCH_REDUCED_UNITS):
     """Three parallel convolutional branches at different effective
     receptive fields -- a plain 3x3 (small), a plain 5x5 (medium), and a
     dilated 3x3 with dilation_rate=3 (large, effective receptive field 7x7
-    without the parameter cost of a literal 7x7 kernel) -- concatenated and
-    fused back down to `filters` channels via a 1x1 conv. This is what
-    makes the block "multi-kernel": every spatial position's output is
-    informed by three different receptive-field sizes at once, rather than
-    committing to a single one per stage (the approved design's explicit
-    rationale -- lesion classes span very different intrinsic scales, from
-    Microaneurysm's few-pixel footprint to Hard/Soft Exudate's broader
-    patches)."""
+    without the parameter cost of a literal 7x7 kernel) -- adaptively
+    re-weighted per image, concatenated, and fused back down to `filters`
+    channels via a 1x1 conv. This is what makes the block "multi-kernel":
+    every spatial position's output is informed by three different
+    receptive-field sizes at once, rather than committing to a single one per
+    stage (the approved design's explicit rationale -- lesion classes span very
+    different intrinsic scales, from Microaneurysm's few-pixel footprint to
+    Hard/Soft Exudate's broader patches).
+
+    `AdaptiveBranchFusion` sits between the branches and the concatenation and
+    is what makes the block "adaptive": it scales each branch by a per-sample,
+    per-channel softmax weight before they are concatenated, so the mixture
+    varies with the image instead of being one fixed learned kernel for the
+    whole dataset. The branch structure, the concatenation and the 1x1 fusion
+    convolution are otherwise unchanged, so the block's output shape and every
+    existing layer name are exactly as before."""
     small = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=f"{name}_k3_conv")(x)
     small = layers.BatchNormalization(name=f"{name}_k3_bn")(small)
     small = layers.Activation("relu", name=f"{name}_k3_relu")(small)
@@ -90,7 +251,12 @@ def _multi_kernel_block(x, filters, name):
     large = layers.BatchNormalization(name=f"{name}_dilated_bn")(large)
     large = layers.Activation("relu", name=f"{name}_dilated_relu")(large)
 
-    fused = layers.concatenate([small, medium, large], name=f"{name}_concat")
+    weighted = AdaptiveBranchFusion(
+        reduction_ratio=reduction_ratio, min_reduced_units=min_reduced_units,
+        name=f"{name}_adaptive_fusion",
+    )([small, medium, large])
+
+    fused = layers.concatenate(weighted, name=f"{name}_concat")
     fused = layers.Conv2D(filters, 1, padding="same", use_bias=False, name=f"{name}_fuse_conv")(fused)
     fused = layers.BatchNormalization(name=f"{name}_fuse_bn")(fused)
     fused = layers.Activation("relu", name=f"{name}_fuse_relu")(fused)
