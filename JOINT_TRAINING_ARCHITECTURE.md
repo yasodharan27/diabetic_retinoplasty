@@ -2291,3 +2291,43 @@ training-configuration cell to the experiment's root
 the notebook normally. `Trainer` finds the newest valid generation, refuses the resume if
 `config_hash` no longer matches, restores weights + optimizer + callbacks, and continues from
 `completed_epoch`. Nothing has to be copied by hand and no optimizer variable has to be edited.
+
+**A requested resume fails closed (fixed after the pre-training audit).** Originally, a resume that
+found no valid generation printed "starting from scratch" and returned epoch 0 -- and the first new
+epoch then "improved" on an empty best and replaced `best/` (reproduced: global best 0.81 overwritten
+by 0.10). Two situations make `find_resumable_generation()` return None, and only one of them is a
+fresh start, so `Trainer` now tells them apart before any epoch runs:
+
+* **The location is wrong.** `resume=True` with a `run_dir` that does not exist, or that has no
+  `checkpoints/` folder (so `experiment_manager.create_experiment()` did not make it), raises
+  `CheckpointResumeError` in `Trainer.prepare()` -- before `build_callbacks()` would otherwise have
+  created the directory and quietly trained a new experiment in it.
+* **Checkpoint state exists but none of it validates.** `checkpointing.checkpoint_evidence()` looks for
+  any `gen_NNNNN/` (sealed or not -- a crash during the first copy leaves just a partial one),
+  `latest.json`, `best/`, or a weights-only-format file. If any is present and no generation
+  validates, `Trainer.resolve_initial_epoch()` raises `CheckpointResumeError`, naming the directory,
+  the evidence, and each generation's rejection reason, and stating that training has not started.
+  Nothing on disk is modified; `best/` is untouched.
+* **Genuinely empty.** An existing experiment whose `checkpoints/` has never held checkpoint state (the
+  first session died before its first epoch finished) still starts at epoch 0, as the API has always
+  defined. `metrics.csv` is deliberately not evidence: `CSVLogger` creates it in `on_train_begin`,
+  before any checkpoint exists.
+
+`TrainingStateCheckpoint.on_train_begin` applies the same refusal when resuming, for callers that use
+`build_callbacks()` without `Trainer`. And when a resume legitimately falls back to an older
+generation because the newest was lost, that generation's `state.json` predates the epoch that earned
+the current `best/`; the global best is now taken from `best/` whenever `best/` validates and is ahead,
+so a merely-better-than-stale epoch can no longer overwrite a BEST it does not beat.
+
+**The checkpoint-cost diagnostic never deletes a caller's directory.** `measure_checkpoint_cost()`
+originally ran `shutil.rmtree(os.path.dirname(checkpoint_dir), ignore_errors=True)`: passing
+`<experiment>/checkpoints` would have deleted the whole experiment. It now treats `checkpoint_dir` as a
+location to measure AT: each call creates its own uniquely named `checkpoint_cost_<time>_<id>/` inside
+it (created exclusively, marked with an ownership token), writes the generation there, and removes
+exactly that workspace afterwards -- only after checking it is a direct child of the location, carries
+the prefix, and holds this invocation's token. Locations that are, or sit inside, an experiment or a
+checkpoint directory are refused, as are `/`, `/content`, `/content/drive`, `/content/drive/MyDrive`,
+the home directory and the repository. A cleanup failure raises `CheckpointCostCleanupError` instead
+of being ignored. The notebook's two call sites (`/content/checkpoint_cost/...` and
+`experiments/FinalClassification/_checkpoint_cost_probe/...`) are unchanged and remain valid.
+

@@ -257,7 +257,13 @@ class Trainer:
         inspect `self.paths` (checkpoint/log locations) beforehand.
 
         Passing `model` additionally verifies that the model was built under the
-        dtype policy this run is configured for -- see `verify_model_precision`."""
+        dtype policy this run is configured for -- see `verify_model_precision`.
+
+        A requested generation-based resume is checked FIRST, before
+        `build_callbacks()` creates the checkpoint directory: otherwise a mistyped
+        resume location would be quietly created and trained as a new experiment."""
+        if self.config.resume and self.config.robust_checkpointing:
+            ckpt.assert_resume_location(self.config.run_dir, self.config.checkpoint_dir)
         enable_mixed_precision(self.config.mixed_precision)
         if model is not None:
             self._verify_precision(model)
@@ -291,15 +297,31 @@ class Trainer:
         generation's `state.json` (`completed_epoch`), reached through
         `find_resumable_generation()`, so a damaged newest generation
         automatically falls back to the previous known-good one. Without it, the
-        original `epoch_state.json` + `last.weights.h5` pair is used unchanged."""
+        original `epoch_state.json` + `last.weights.h5` pair is used unchanged.
+
+        A requested resume that finds no valid generation FAILS CLOSED unless the
+        checkpoint directory has never held checkpoint state at all
+        (`checkpointing.checkpoint_evidence()`). Both cases make
+        `find_resumable_generation()` return None, but only a genuinely empty
+        experiment -- e.g. one whose first session died before its first epoch
+        finished -- can start at epoch 0 without losing anything. A directory with
+        generations, `latest.json` or `best/` that cannot be recovered raises
+        `CheckpointResumeError` instead of restarting and letting the first new
+        epoch overwrite the global BEST."""
         if not self.config.resume:
             return 0
 
         if self.config.robust_checkpointing:
-            generation_dir = ckpt.find_resumable_generation(self.paths["checkpoint_dir"])
+            checkpoint_dir = self.paths["checkpoint_dir"]
+            ckpt.assert_resume_location(self.config.run_dir, checkpoint_dir)
+            generation_dir = ckpt.find_resumable_generation(checkpoint_dir)
             if generation_dir is None:
-                print("resume=True but no resumable checkpoint generation was found; "
-                      "starting from scratch.")
+                evidence = ckpt.checkpoint_evidence(checkpoint_dir)
+                if evidence:
+                    raise ckpt.CheckpointResumeError(
+                        ckpt.unrecoverable_resume_message(checkpoint_dir, evidence))
+                print(f"resume=True: {checkpoint_dir} has never held checkpoint state (no "
+                      "generation, no latest.json, no best/); this experiment starts at epoch 0.")
                 return 0
             state = ckpt.read_state(generation_dir)
             self.resume_generation_dir = generation_dir

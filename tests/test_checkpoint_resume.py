@@ -735,6 +735,302 @@ class TrainingStateCheckpointCallbackTests(TempDirTestCase):
 
 
 # ===========================================================================
+# A1 -- a REQUESTED resume must fail closed. "No valid generation" is only a
+#       fresh start when the location has never held checkpoint state; when it
+#       has, the run must refuse rather than restart at epoch 0 and overwrite
+#       the global BEST.
+# ===========================================================================
+
+class ResumeFailsClosedTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.run_dir = os.path.join(self.tmp, "run")
+        self.run_checkpoints = os.path.join(self.run_dir, "checkpoints")
+
+    # -- helpers ------------------------------------------------------------
+
+    def _config(self, resume, epochs, scripted, run_dir=None):
+        return TrainingConfig(
+            run_dir=run_dir or self.run_dir, epochs=epochs, monitor="val_QWK", mode="max",
+            mixed_precision=False, resume=resume, reduce_lr_patience=9,
+            checkpoint_options=CheckpointOptions(
+                experiment_id="exp-1", config_hash="cfg-abc", dataset_version="ds-1",
+                staging_dir=os.path.join(self.tmp, "_staging"), verbose=0,
+            ),
+            extra_callbacks=[ScriptedMonitor(scripted)],
+        )
+
+    @staticmethod
+    def _datasets():
+        x, y = tiny_data()
+        return (tf.data.Dataset.from_tensor_slices((x, y)).batch(8),
+                tf.data.Dataset.from_tensor_slices((x[:16], y[:16])).batch(8))
+
+    def _fit(self, resume, epochs, scripted, run_dir=None):
+        model = build_tiny_model()
+        train_ds, val_ds = self._datasets()
+        trainer = Trainer(self._config(resume, epochs, scripted, run_dir))
+        trainer.prepare(model)
+        trainer.fit(model, train_ds, val_ds)
+        return trainer, model
+
+    def _resuming_trainer(self, epochs=4, run_dir=None):
+        return Trainer(self._config(True, epochs, [0.0] * epochs, run_dir))
+
+    @staticmethod
+    def _corrupt(path):
+        with open(path, "rb") as handle:
+            data = bytearray(handle.read())
+        data[len(data) // 2] ^= 0xFF
+        with open(path, "wb") as handle:
+            handle.write(bytes(data))
+
+    @staticmethod
+    def _snapshot(root):
+        """Every file under `root` -> its SHA256. The resume failure must leave
+        this mapping bit-identical."""
+        snapshot = {}
+        for directory, _dirs, files in os.walk(root):
+            for name in files:
+                path = os.path.join(directory, name)
+                snapshot[os.path.relpath(path, root)] = ckpt.sha256_file(path)
+        return snapshot
+
+    def _best_metric_on_disk(self):
+        with open(os.path.join(ckpt.best_dir(self.run_checkpoints), ckpt.STATE_FILENAME)) as h:
+            return json.load(h)["best_metric"]
+
+    # -- 1. populated, every generation invalid -> hard failure --------------
+
+    def test_resume_with_every_generation_invalid_fails_closed(self):
+        self._fit(False, 2, [0.60, 0.81])
+        for _number, path in ckpt.list_generations(self.run_checkpoints):
+            self._corrupt(os.path.join(path, ckpt.MODEL_WEIGHTS_FILENAME))
+        self.assertIsNone(ckpt.find_resumable_generation(self.run_checkpoints, verbose=False))
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        with self.assertRaises(ckpt.CheckpointResumeError) as caught:
+            trainer.resolve_initial_epoch()
+
+        message = str(caught.exception)
+        self.assertIn("resume", message.lower())
+        self.assertIn(self.run_checkpoints, message)
+        self.assertIn("NOT started", message)
+        self.assertIsNone(trainer.resume_generation_dir)
+
+    def test_fit_never_starts_an_epoch_when_resume_cannot_be_honoured(self):
+        self._fit(False, 2, [0.60, 0.81])
+        for _number, path in ckpt.list_generations(self.run_checkpoints):
+            self._corrupt(os.path.join(path, ckpt.OPTIMIZER_FILENAME))
+
+        model = build_tiny_model()
+        before = [v.numpy().copy() for v in model.weights]
+        train_ds, val_ds = self._datasets()
+        trainer = self._resuming_trainer()
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            trainer.fit(model, train_ds, val_ds)
+        self.assertIsNone(trainer.history, "model.fit() ran despite the refused resume")
+        after = [v.numpy() for v in model.weights]
+        self.assertTrue(all(np.array_equal(b, a) for b, a in zip(before, after)))
+
+    # -- 2. corrupt newest, valid previous -> previous resumes ---------------
+
+    def test_corrupt_newest_generation_resumes_from_the_previous_valid_one(self):
+        self._fit(False, 2, [0.60, 0.81])
+        generations = [p for _n, p in ckpt.list_generations(self.run_checkpoints)]
+        self._corrupt(os.path.join(generations[-1], ckpt.MODEL_WEIGHTS_FILENAME))
+
+        trainer = self._resuming_trainer(epochs=3)
+        trainer.prepare(build_tiny_model())
+        self.assertEqual(trainer.resolve_initial_epoch(), 1)
+        self.assertEqual(os.path.basename(trainer.resume_generation_dir),
+                         os.path.basename(generations[0]))
+
+    def test_falling_back_to_an_older_generation_does_not_regress_the_global_best(self):
+        """gen_00001 recorded best 0.60; epoch 1 then reached 0.81 and `best/`
+        holds it. If gen_00002 is lost and the run falls back to gen_00001, that
+        generation's state still says 0.60 -- so an epoch scoring 0.70 would look
+        like an improvement and overwrite a BEST it does not beat. The global best
+        must come from `best/` when `best/` is itself valid."""
+        self._fit(False, 2, [0.60, 0.81])
+        generations = [p for _n, p in ckpt.list_generations(self.run_checkpoints)]
+        self._corrupt(os.path.join(generations[-1], ckpt.MODEL_WEIGHTS_FILENAME))
+        best_weights = os.path.join(ckpt.best_dir(self.run_checkpoints),
+                                    ckpt.MODEL_WEIGHTS_FILENAME)
+        digest_before = ckpt.sha256_file(best_weights)
+
+        self._fit(True, 2, [0.0, 0.70])  # resumes at epoch 1, scores 0.70 < 0.81
+
+        self.assertAlmostEqual(self._best_metric_on_disk(), 0.81, places=6)
+        self.assertEqual(ckpt.sha256_file(best_weights), digest_before)
+        latest = ckpt.read_state(ckpt.find_resumable_generation(self.run_checkpoints,
+                                                                verbose=False))
+        self.assertAlmostEqual(latest.best_metric, 0.81, places=6)
+        self.assertEqual(latest.best_epoch, 1)
+
+    # -- 3. files present, no READY, nothing else valid -> hard failure ------
+
+    def test_only_generation_without_ready_fails_closed(self):
+        self._fit(False, 1, [0.60])
+        only = ckpt.list_generations(self.run_checkpoints)[0][1]
+        os.remove(os.path.join(only, ckpt.READY_FILENAME))
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            trainer.resolve_initial_epoch()
+
+    def test_an_unsealed_generation_alone_is_evidence_of_checkpoint_state(self):
+        """A crash during the very first checkpoint copy leaves just a partial
+        `gen_00001/` -- no `latest.json`, no `best/`. That is still an experiment
+        that trained; resuming it must not silently restart."""
+        os.makedirs(os.path.join(self.run_checkpoints, "gen_00001"))
+        with open(os.path.join(self.run_checkpoints, "gen_00001", ckpt.STATE_FILENAME), "w") as h:
+            json.dump({"completed_epoch": 1}, h)
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            trainer.resolve_initial_epoch()
+
+    # -- 4. unreadable latest.json, valid generation -> resumes --------------
+
+    def test_unreadable_latest_json_with_a_valid_generation_resumes(self):
+        self._fit(False, 2, [0.60, 0.81])
+        with open(os.path.join(self.run_checkpoints, ckpt.LATEST_FILENAME), "w") as h:
+            h.write('{"generation_name": "gen_0')  # truncated mid-write
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        self.assertEqual(trainer.resolve_initial_epoch(), 2)
+
+    # -- 5. the refusal leaves BEST (and everything else) untouched ----------
+
+    def test_refused_resume_leaves_best_and_the_experiment_untouched(self):
+        self._fit(False, 2, [0.60, 0.81])
+        for _number, path in ckpt.list_generations(self.run_checkpoints):
+            self._corrupt(os.path.join(path, ckpt.MODEL_WEIGHTS_FILENAME))
+        before = self._snapshot(self.run_dir)
+        self.assertIn(os.path.join("checkpoints", "best", ckpt.MODEL_WEIGHTS_FILENAME), before)
+
+        model = build_tiny_model()
+        train_ds, val_ds = self._datasets()
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            self._resuming_trainer().fit(model, train_ds, val_ds)
+
+        self.assertEqual(self._snapshot(self.run_dir), before)
+        self.assertAlmostEqual(self._best_metric_on_disk(), 0.81, places=6)
+
+    # -- 6. fresh starts keep working ---------------------------------------
+
+    def test_fresh_experiment_without_resume_is_unchanged(self):
+        trainer, _ = self._fit(False, 1, [0.50])
+        self.assertEqual(trainer.resolve_initial_epoch(), 0)
+        self.assertEqual([n for n, _ in ckpt.list_generations(self.run_checkpoints)], [1])
+
+    def test_resume_into_an_experiment_that_never_checkpointed_starts_at_epoch_zero(self):
+        """What `experiment_manager.create_experiment()` leaves behind: the
+        experiment layout exists but `checkpoints/` is empty (e.g. the first
+        session died before its first epoch finished). Nothing can be lost by
+        starting at 0, and the existing API has always defined this as valid."""
+        os.makedirs(self.run_checkpoints)
+        with open(os.path.join(self.run_dir, "metadata.json"), "w") as h:
+            json.dump({"timestamp": "2026-09-10T00:00:00"}, h)
+
+        trainer = self._resuming_trainer(epochs=1)
+        trainer.prepare(build_tiny_model())
+        self.assertEqual(trainer.resolve_initial_epoch(), 0)
+
+        trainer, _ = self._fit(True, 1, [0.40])
+        self.assertEqual([n for n, _ in ckpt.list_generations(self.run_checkpoints)], [1])
+
+    def test_metrics_csv_alone_is_not_treated_as_checkpoint_state(self):
+        """`CSVLogger` creates `metrics.csv` in `on_train_begin`, before any epoch
+        and before any checkpoint, so its presence proves nothing was saved."""
+        os.makedirs(self.run_checkpoints)
+        open(os.path.join(self.run_checkpoints, "metrics.csv"), "w").close()
+        self.assertEqual(ckpt.checkpoint_evidence(self.run_checkpoints), [])
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        self.assertEqual(trainer.resolve_initial_epoch(), 0)
+
+    # -- 7. wrong / nonexistent resume location -> refused, nothing created --
+
+    def test_nonexistent_resume_location_is_refused_and_not_created(self):
+        missing = os.path.join(self.tmp, "moved_or_mistyped_experiment")
+        trainer = self._resuming_trainer(run_dir=missing)
+        with self.assertRaises(ckpt.CheckpointResumeError) as caught:
+            trainer.prepare(build_tiny_model())
+        self.assertIn(missing, str(caught.exception))
+        self.assertFalse(os.path.exists(missing), "prepare() created the mistyped directory")
+
+    def test_fit_on_a_nonexistent_resume_location_is_refused(self):
+        missing = os.path.join(self.tmp, "no_such_experiment")
+        train_ds, val_ds = self._datasets()
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            self._resuming_trainer(run_dir=missing).fit(build_tiny_model(), train_ds, val_ds)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_existing_directory_without_a_checkpoints_folder_is_refused(self):
+        """Not an experiment this framework created -- `create_experiment()`
+        always makes `checkpoints/`. Refuse instead of adopting it."""
+        not_an_experiment = os.path.join(self.tmp, "some_other_folder")
+        os.makedirs(not_an_experiment)
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            self._resuming_trainer(run_dir=not_an_experiment).prepare(build_tiny_model())
+        self.assertFalse(os.path.exists(os.path.join(not_an_experiment, "checkpoints")))
+
+    # -- evidence and defence in depth ---------------------------------------
+
+    def test_checkpoint_evidence_recognises_every_kind_of_prior_state(self):
+        os.makedirs(self.run_checkpoints)
+        self.assertEqual(ckpt.checkpoint_evidence(self.run_checkpoints), [])
+        self.assertEqual(ckpt.checkpoint_evidence(os.path.join(self.tmp, "absent")), [])
+
+        for name in ("gen_00003", ckpt.BEST_DIRNAME):
+            os.makedirs(os.path.join(self.run_checkpoints, name))
+        for name in (ckpt.LATEST_FILENAME, "best.weights.h5", "last.weights.h5",
+                     "epoch_state.json"):
+            open(os.path.join(self.run_checkpoints, name), "w").close()
+        self.assertEqual(
+            sorted(ckpt.checkpoint_evidence(self.run_checkpoints)),
+            sorted(["gen_00003", ckpt.BEST_DIRNAME, ckpt.LATEST_FILENAME, "best.weights.h5",
+                    "last.weights.h5", "epoch_state.json"]))
+
+    def test_legacy_weights_only_checkpoints_are_not_silently_abandoned(self):
+        """An experiment written by the weights-only path, resumed with
+        generation-based options, has checkpoint state but no generation. That is
+        a format mismatch to resolve by hand, not a fresh start."""
+        os.makedirs(self.run_checkpoints)
+        open(os.path.join(self.run_checkpoints, "best.weights.h5"), "w").close()
+
+        trainer = self._resuming_trainer()
+        trainer.prepare(build_tiny_model())
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            trainer.resolve_initial_epoch()
+
+    def test_state_callback_refuses_to_start_over_existing_checkpoint_state(self):
+        """Defence in depth for callers that use `build_callbacks()` directly
+        rather than `Trainer`: a resuming `TrainingStateCheckpoint` that finds
+        checkpoint state it cannot recover must stop `fit()` before epoch 0, never
+        start fresh and let `save_best()` overwrite `best/`."""
+        self._fit(False, 2, [0.60, 0.81])
+        for _number, path in ckpt.list_generations(self.run_checkpoints):
+            os.remove(os.path.join(path, ckpt.READY_FILENAME))
+
+        callback = TrainingStateCheckpoint(
+            checkpoint_dir=self.run_checkpoints, monitor="val_QWK", mode="max",
+            options=CheckpointOptions(experiment_id="exp-1", verbose=0), restore_state=True,
+        )
+        callback.set_model(build_tiny_model())
+        with self.assertRaises(ckpt.CheckpointResumeError):
+            callback.on_train_begin()
+        self.assertAlmostEqual(self._best_metric_on_disk(), 0.81, places=6)
+
+
+# ===========================================================================
 # 9, 17, 19 -- fresh-process resume and the three-process relay
 # ===========================================================================
 

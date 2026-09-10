@@ -188,9 +188,41 @@ class TrainingStateCheckpoint(tf.keras.callbacks.Callback):
 
     # -- Keras hooks ------------------------------------------------------
 
+    def _adopt_best_from_best_dir(self):
+        """Let a valid `best/` raise the global best above the resumed generation's.
+
+        Normally they agree. They differ when the newest generation was lost and
+        the run fell back to an older one: that generation's `state.json` predates
+        the epoch that earned the current `best/`, so its `best_metric` is too low,
+        and an epoch that merely beat the stale figure would overwrite a BEST it
+        does not beat. `best/` is only consulted if it validates in full."""
+        directory = ckpt.best_dir(self.checkpoint_dir)
+        if not ckpt.validate_generation(directory, required=ckpt.BEST_REQUIRED_FILES).ok:
+            return
+        best_state = ckpt.read_state(directory)
+        if best_state.monitor != self.monitor or best_state.monitor_mode != self.mode:
+            return
+        candidate = _as_float(best_state.best_metric)
+        if candidate is not None and self._is_improvement(candidate, self.best_metric):
+            if self.options.verbose:
+                print(f"Global best taken from best/ ({self.monitor}={candidate} at epoch "
+                      f"{best_state.best_epoch}), which is ahead of the resumed generation's "
+                      f"record ({self.best_metric}).")
+            self.best_metric = candidate
+            self.best_epoch = best_state.best_epoch
+
     def on_train_begin(self, logs=None):
         generation_dir = ckpt.find_resumable_generation(self.checkpoint_dir)
         if generation_dir is None:
+            # A resuming run that finds checkpoint state it cannot recover must stop
+            # here, before epoch 0 -- never start fresh and let `save_best()` replace
+            # `best/`. `Trainer.resolve_initial_epoch()` refuses first; this covers
+            # callers that use `build_callbacks()` directly.
+            if self.restore_state:
+                evidence = ckpt.checkpoint_evidence(self.checkpoint_dir)
+                if evidence:
+                    raise ckpt.CheckpointResumeError(
+                        ckpt.unrecoverable_resume_message(self.checkpoint_dir, evidence))
             return
         if not self.restore_state:
             if self.options.verbose:
@@ -204,6 +236,7 @@ class TrainingStateCheckpoint(tf.keras.callbacks.Callback):
         self.completed_epoch = state.completed_epoch
         self.restored_from = generation_dir
         self.last_generation_dir = generation_dir
+        self._adopt_best_from_best_dir()
         self._restore_callback_counters(state)
         if self.options.verbose:
             print(f"Training state restored from {os.path.basename(generation_dir)}: "

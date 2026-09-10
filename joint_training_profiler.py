@@ -41,9 +41,11 @@ Safety -- this must not perturb the run it is diagnosing:
 import os
 import shutil
 import subprocess
+import posixpath
 import tempfile
 import threading
 import time
+import uuid
 
 import numpy as np
 import tensorflow as tf
@@ -2054,19 +2056,199 @@ def print_fit_paths(report):
 # PHASE H -- what does one checkpoint actually cost?
 # =====================================================================
 
-def measure_checkpoint_cost(model, checkpoint_dir=None, staging_dir=None, restore=True):
+CHECKPOINT_COST_WORKSPACE_PREFIX = "checkpoint_cost_"
+CHECKPOINT_COST_OWNER_MARKER = ".checkpoint_cost_owner"
+DEFAULT_CHECKPOINT_COST_LOCATION = os.path.join(tempfile.gettempdir(), "joint_checkpoint_cost")
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+#: Never a diagnostic location, whatever OS this runs on. Compared as POSIX
+#: strings so they are refused on a Windows host too, where `/content` would
+#: otherwise resolve to `<drive>:\content`.
+_PROTECTED_POSIX_PATHS = (
+    "/", "/content", "/content/drive", "/content/drive/MyDrive",
+    "/content/drive/Shareddrives", "/content/drive/.shortcut-targets-by-id",
+)
+
+#: `experiment_manager.create_experiment()`'s layout, repeated here so this
+#: measurement-only module does not import the Colab infrastructure.
+_EXPERIMENT_METADATA_FILENAME = "metadata.json"
+_EXPERIMENT_SUBFOLDERS = ("checkpoints", "logs", "tensorboard", "evaluation", "predictions")
+
+
+class UnsafeDiagnosticPathError(RuntimeError):
+    """A diagnostic was pointed at a location it must not write to or delete."""
+
+
+class CheckpointCostCleanupError(RuntimeError):
+    """The diagnostic's own workspace could not be removed. Raised, never
+    swallowed: a silent cleanup failure leaves ~500 MiB behind per run on Drive."""
+
+
+def _delete_tree(path):
+    """The single deletion primitive in this diagnostic. No `ignore_errors`:
+    a failure must reach the caller (see `CheckpointCostCleanupError`)."""
+    shutil.rmtree(path)
+
+
+def _canonical(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _is_same_or_ancestor(ancestor, path):
+    return path == ancestor or path.startswith(ancestor.rstrip(os.sep) + os.sep)
+
+
+def _protected_reason(path):
+    """Why `path` is a system-critical location, or None."""
+    raw = str(path).replace("\\", "/")
+    if raw and posixpath.normpath(raw) in _PROTECTED_POSIX_PATHS:
+        return f"{path} is a protected system/Drive root"
+    canonical = _canonical(path)
+    if os.path.dirname(canonical) == canonical:
+        return f"{path} is a filesystem root"
+    home = _canonical(os.path.expanduser("~"))
+    if _is_same_or_ancestor(canonical, home):
+        return f"{path} is the home directory or one of its ancestors"
+    repo = _canonical(_REPO_ROOT)
+    if _is_same_or_ancestor(canonical, repo) or _is_same_or_ancestor(repo, canonical):
+        return f"{path} is the repository root, inside it, or one of its ancestors"
+    return None
+
+
+def _experiment_reason(path):
+    """Why `path` belongs to an experiment or holds checkpoint state, or None.
+
+    Walks `path` and every existing ancestor for the `create_experiment()`
+    layout, so `<experiment>/checkpoints`, `<experiment>` itself and anything
+    nested inside an experiment are all refused -- even an experiment that has not
+    written its first checkpoint yet. Also refuses a bare checkpoint directory
+    (generations / `latest.json` / `best/`) with no experiment around it."""
+    from training import checkpointing as ckpt
+
+    current = _canonical(path)
+    while True:
+        if (os.path.isfile(os.path.join(current, _EXPERIMENT_METADATA_FILENAME))
+                and any(os.path.isdir(os.path.join(current, sub))
+                        for sub in _EXPERIMENT_SUBFOLDERS)):
+            return f"{current} is an experiment directory (metadata.json + experiment subfolders)"
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    evidence = ckpt.checkpoint_evidence(path)
+    if evidence:
+        return f"{path} already holds checkpoint state ({', '.join(evidence)})"
+    return None
+
+
+def _assert_safe_workspace_location(location):
+    reason = _protected_reason(location) or _experiment_reason(location)
+    if reason:
+        raise UnsafeDiagnosticPathError(
+            f"Refusing to run the checkpoint-cost diagnostic at {location}: {reason}. Point it at "
+            "a dedicated location such as /content/checkpoint_cost, or "
+            "experiments/FinalClassification/_checkpoint_cost_probe for a Drive measurement -- "
+            "never at an experiment, a checkpoint directory, or a system root. Nothing was "
+            "created or deleted."
+        )
+
+
+def _remove_owned_workspace(workspace, location, token):
+    """Delete `workspace`, and only if every ownership check passes.
+
+    It must be a direct child of `location`, carry this module's prefix, hold
+    the ownership marker written by THIS invocation (matching `token`), and not
+    be a protected path. Anything else is refused -- so no bug or bad argument
+    upstream can turn cleanup into deleting a caller's directory."""
+    reason = _protected_reason(workspace)
+    if reason:
+        raise UnsafeDiagnosticPathError(f"Refusing to delete {workspace}: {reason}.")
+    if os.path.dirname(_canonical(workspace)) != _canonical(location):
+        raise UnsafeDiagnosticPathError(
+            f"Refusing to delete {workspace}: it is not a direct child of the diagnostic "
+            f"location {location}.")
+    if not os.path.basename(workspace).startswith(CHECKPOINT_COST_WORKSPACE_PREFIX):
+        raise UnsafeDiagnosticPathError(
+            f"Refusing to delete {workspace}: it is not a checkpoint-cost workspace.")
+    marker = os.path.join(workspace, CHECKPOINT_COST_OWNER_MARKER)
+    if not os.path.isfile(marker):
+        raise UnsafeDiagnosticPathError(
+            f"Refusing to delete {workspace}: it has no ownership marker, so this invocation "
+            "did not create it.")
+    with open(marker) as handle:
+        if handle.read().strip() != token:
+            raise UnsafeDiagnosticPathError(
+                f"Refusing to delete {workspace}: it belongs to a different invocation.")
+    try:
+        _delete_tree(workspace)
+    except OSError as error:
+        raise CheckpointCostCleanupError(
+            f"Could not remove the checkpoint-cost workspace {workspace}: {error}. Nothing "
+            "outside that workspace was touched; remove it by hand.") from error
+    if os.path.exists(workspace):
+        raise CheckpointCostCleanupError(
+            f"The checkpoint-cost workspace {workspace} still exists after deletion.")
+
+
+def measure_checkpoint_cost(model, checkpoint_dir=None, staging_dir=None, restore=True,
+                            cleanup=True):
     """Time one full checkpoint save (weights + optimizer + state + manifest +
     validation + seal) and one full restore, and report the byte sizes.
 
     Deliberately writes to a LOCAL directory by default: this measures the
     checkpoint machinery, not Drive latency. Drive cost has to be measured on
-    Colab against a real Drive path, and is reported separately as such."""
+    Colab against a real Drive path, and is reported separately as such.
+
+    `checkpoint_dir` is the LOCATION to measure at, not a directory this
+    function owns. It is never deleted, and neither is anything above it or
+    beside the workspace: every call creates a fresh, uniquely named
+    `checkpoint_cost_<time>_<id>/` inside it (created exclusively, so it cannot
+    be a pre-existing directory), marks it with an ownership token, writes the
+    generation there, and -- with `cleanup=True` -- removes exactly that
+    workspace afterwards. Locations that are, or sit inside, an experiment or a
+    checkpoint directory are refused, as are system roots, the home directory and
+    the repository. A cleanup failure raises `CheckpointCostCleanupError`."""
     from training import checkpointing as ckpt
 
-    checkpoint_dir = checkpoint_dir or os.path.join(
-        tempfile.gettempdir(), "joint_checkpoint_cost", "checkpoints")
-    shutil.rmtree(os.path.dirname(checkpoint_dir), ignore_errors=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    requested = checkpoint_dir or DEFAULT_CHECKPOINT_COST_LOCATION
+    # Check the caller's own spelling BEFORE abspath(): on a Windows host
+    # abspath("/content") becomes "<drive>:\content", which no longer matches the
+    # protected POSIX roots. Then check the absolute form too. Both run before
+    # anything is created.
+    _assert_safe_workspace_location(requested)
+    location = os.path.abspath(requested)
+    _assert_safe_workspace_location(location)
+    os.makedirs(location, exist_ok=True)
+
+    token = uuid.uuid4().hex
+    workspace = os.path.join(
+        location, f"{CHECKPOINT_COST_WORKSPACE_PREFIX}{time.strftime('%Y%m%d-%H%M%S')}_{token[:8]}")
+    os.makedirs(workspace)                           # exist_ok=False: this call created it
+    with open(os.path.join(workspace, CHECKPOINT_COST_OWNER_MARKER), "w") as handle:
+        handle.write(token)
+
+    try:
+        report = _measure_checkpoint_cost_in(model, os.path.join(workspace, "checkpoints"),
+                                             staging_dir, restore)
+    except BaseException:
+        if cleanup:
+            try:
+                _remove_owned_workspace(workspace, location, token)
+            except Exception as cleanup_error:  # noqa: BLE001 -- reported, original re-raised
+                print(f"WARNING: the measurement failed AND its workspace {workspace} could not "
+                      f"be removed ({cleanup_error}). Remove it by hand.")
+        raise
+
+    report.update({"workspace": workspace, "workspace_location": location, "cleaned_up": False})
+    if cleanup:
+        _remove_owned_workspace(workspace, location, token)
+        report["cleaned_up"] = True
+    return report
+
+
+def _measure_checkpoint_cost_in(model, checkpoint_dir, staging_dir, restore):
+    from training import checkpointing as ckpt
 
     state = ckpt.TrainingState(
         experiment_id="checkpoint-cost", completed_epoch=1, best_epoch=0, best_metric=0.0,
@@ -2109,6 +2291,8 @@ def print_checkpoint_cost(report):
     print("  validate (sha256 re-read)      : %s" % _ms(report.get("validate_seconds")))
     print("  restore (slots+optimizer+weights): %s" % _ms(report.get("restore_seconds")))
     print("  integrity validation           : %s" % ("PASS" if report.get("validation_ok") else "FAIL"))
+    print("  workspace                      : %s (%s)"
+          % (report.get("workspace"), "removed" if report.get("cleaned_up") else "kept"))
     sizes = report.get("sizes") or {}
     for name, size in (sizes.get("files") or {}).items():
         print("    %-24s %14s bytes (%8.2f MiB)" % (name, format(size, ","), size / 1024 ** 2))

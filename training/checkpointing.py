@@ -144,6 +144,13 @@ class CheckpointCompatibilityError(CheckpointError):
     """The checkpoint is intact but belongs to a different configuration."""
 
 
+class CheckpointResumeError(CheckpointError):
+    """A resume was explicitly requested and cannot be honoured safely: the
+    location does not exist, is not an experiment this framework created, or
+    holds checkpoint state of which nothing validates. Always raised BEFORE any
+    epoch runs, so the experiment on disk -- including `best/` -- is untouched."""
+
+
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
@@ -698,6 +705,96 @@ def find_resumable_generation(checkpoint_dir, required=REQUIRED_FILES, verbose=T
         if verbose and os.path.exists(path):
             print(f"Skipping unusable checkpoint -- {result.reason}")
     return None
+
+
+#: What the original weights-only path (`training.callbacks.build_callbacks()`
+#: without a `CheckpointOptions`) leaves in a checkpoint directory.
+LEGACY_CHECKPOINT_FILES = (
+    "best.weights.h5", "last.weights.h5", "best.keras", "last.keras", "epoch_state.json",
+)
+
+
+def checkpoint_evidence(checkpoint_dir):
+    """Names in `checkpoint_dir` proving checkpointed training happened there.
+
+    This is what separates "a genuinely new experiment" from "a checkpointed
+    experiment whose checkpoints are all unusable" -- both of which make
+    `find_resumable_generation()` return None, and only the first of which may
+    ever be treated as a fresh start. Evidence is any generation directory
+    (sealed or not: a half-copied `gen_00001/` is exactly what a crash during the
+    first checkpoint leaves), `latest.json`, `best/`, or a weights-only-format
+    checkpoint file.
+
+    `metrics.csv` is deliberately NOT evidence: `CSVLogger` creates it in
+    `on_train_begin`, before any epoch and before any checkpoint, so it exists in
+    directories that have never held a single saved epoch."""
+    if not os.path.isdir(checkpoint_dir):
+        return []
+    evidence = []
+    for name in sorted(os.listdir(checkpoint_dir)):
+        path = os.path.join(checkpoint_dir, name)
+        if os.path.isdir(path) and (generation_number(name) is not None or name == BEST_DIRNAME):
+            evidence.append(name)
+        elif os.path.isfile(path) and (name == LATEST_FILENAME or name in LEGACY_CHECKPOINT_FILES):
+            evidence.append(name)
+    return evidence
+
+
+def _not_started(where):
+    return (f"Training has NOT started: no epoch ran and nothing under {where} was modified "
+            "-- `best/` included.")
+
+
+def assert_resume_location(run_dir, checkpoint_dir):
+    """Refuse a resume whose location cannot be an experiment this framework
+    created, before anything is written there.
+
+    `training.callbacks.build_callbacks()` creates the checkpoint directory, so
+    without this check a mistyped or moved `RESUME_EXPERIMENT_DIR` would be
+    silently turned into a brand-new empty experiment and trained from epoch 0.
+    `experiment_manager.create_experiment()` always creates `checkpoints/`, so its
+    absence under an existing directory means the directory is not one."""
+    if not os.path.isdir(run_dir):
+        raise CheckpointResumeError(
+            f"Resume was requested, but the experiment directory {run_dir} does not exist "
+            "(moved, renamed, mistyped, or Drive not mounted). No checkpoint generation can be "
+            f"recovered from a location that is not there. {_not_started(run_dir)} Point "
+            "RESUME_EXPERIMENT_DIR at the existing experiment root, or set it to None to start a "
+            "new experiment."
+        )
+    if not os.path.isdir(checkpoint_dir):
+        raise CheckpointResumeError(
+            f"Resume was requested, but {run_dir} has no checkpoints/ folder ({checkpoint_dir} "
+            "does not exist), so it is not an experiment created by "
+            f"experiment_manager.create_experiment(). {_not_started(run_dir)} Point "
+            "RESUME_EXPERIMENT_DIR at the experiment ROOT (the folder holding metadata.json and "
+            "checkpoints/), or set it to None to start a new experiment."
+        )
+
+
+def unrecoverable_resume_message(checkpoint_dir, evidence):
+    """The error text for a resume that found checkpoint state but no generation
+    it could use: where, what was found, and why each generation was rejected."""
+    lines = [
+        "Resume was requested, but no valid checkpoint generation could be recovered from "
+        f"{checkpoint_dir}.",
+        f"This directory DOES hold checkpoint state ({', '.join(evidence)}), so it is not a new "
+        "experiment and will not be treated as one: starting at epoch 0 would overwrite the "
+        "global BEST with whatever the first new epoch scores.",
+    ]
+    generations = sorted(list_generations(checkpoint_dir), reverse=True)
+    if generations:
+        lines.append("Generations examined, newest first:")
+        for _number, path in generations:
+            result = validate_generation(path)
+            lines.append(f"  {os.path.basename(path)}: {result.reason or 'valid'}")
+    else:
+        lines.append("No gen_NNNNN directory exists; the state found is not in the "
+                     "generation-based format this run resumes from.")
+    lines.append(_not_started(checkpoint_dir))
+    lines.append("Inspect the generations above (a Drive copy may still be in progress), or "
+                 "set RESUME_EXPERIMENT_DIR = None to start a separate new experiment.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
