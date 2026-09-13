@@ -79,7 +79,17 @@ changes:
 
 1. RACAF was the **only** consumer of the per-image reliability scalar `r`, so the model no longer
    sees reliability at all. The `reliability` input remains *declared* so the dataset pipeline is
-   byte-for-byte unchanged; it is verifiably inert (identical output for `r = 0.0` and `r = 1.0`).
+   byte-for-byte unchanged.
+
+   Because Keras' Functional API rejects a declared Input that does not reach the output
+   (`` `inputs` not connected to `outputs` ``), reliability is connected through a single
+   **parameter-free** layer, `InertReliabilityConnection`, which adds zeros derived from the
+   reliability tensor: `logits + cast(zeros_like(r[:, :1]))`. The graph edge is real, so the model
+   is constructible, but the added value is exact zero — `x + 0.0` is exact in IEEE 754 — so the
+   logits are bit-for-bit unchanged and the prediction cannot depend on reliability. Verified on
+   the real model: `r = 0.0` and `r = 1.0` give **bit-identical logits, max |diff| = 0.0**, with
+   **0 trainable parameters and 0 trainable tensors** added, so the delta against the reference
+   remains exactly RACAF.
 2. RACAF's `GAP(G) → Dense` readout was the **only** second, direct Stage 06 → classifier path.
    Global information now reaches CORN solely through Stage 07's cross-attention.
 
