@@ -1,0 +1,476 @@
+"""Fast, CPU-only unit tests for multiseed_runs.py.
+
+Uses tiny synthetic models and temp directories throughout -- never the real 43M-parameter joint
+model (that is exercised in tests/test_no_racaf_model.py) and never real images/caches.
+"""
+import json
+import os
+import shutil
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
+import numpy as np
+import tensorflow as tf
+
+import multiseed_runs as msr
+from training import checkpointing as ckpt
+
+
+def _tiny_model():
+    model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])
+    model.compile(optimizer=tf.keras.optimizers.Adam(0.01), loss="mse")
+    return model
+
+
+class TempDirTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="msr_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class DirectoryLayoutTests(TempDirTestCase):
+    def test_run_dir_layout(self):
+        path = msr.run_dir(self.tmp, "exp1", "RACAF", 42)
+        self.assertEqual(path, os.path.join(self.tmp, "exp1", "RACAF", "seed_42"))
+
+    def test_rejects_unknown_arm(self):
+        with self.assertRaises(ValueError):
+            msr.run_dir(self.tmp, "exp1", "BOTH", 42)
+
+    def test_rejects_unknown_seed(self):
+        with self.assertRaises(ValueError):
+            msr.run_dir(self.tmp, "exp1", "RACAF", 999)
+
+    def test_all_run_ids_is_six_matched_pairs(self):
+        ids = msr.all_run_ids()
+        self.assertEqual(len(ids), 6)
+        self.assertEqual({arm for arm, _ in ids}, set(msr.ARMS))
+        self.assertEqual({seed for _, seed in ids}, set(msr.RUN_SEEDS))
+
+    def test_ensure_run_dir_is_idempotent(self):
+        path = msr.run_dir(self.tmp, "exp1", "RACAF", 42)
+        msr.ensure_run_dir(path)
+        marker = os.path.join(path, "checkpoints", "marker.txt")
+        with open(marker, "w") as handle:
+            handle.write("keep me")
+        msr.ensure_run_dir(path)  # must not delete existing content
+        self.assertTrue(os.path.exists(marker))
+
+
+class RunConfigHashTests(unittest.TestCase):
+    def test_hash_is_stable(self):
+        a = msr.run_config_hash("exp1", "RACAF", 42, "deadbeef")
+        b = msr.run_config_hash("exp1", "RACAF", 42, "deadbeef")
+        self.assertEqual(a, b)
+
+    def test_hash_differs_by_arm(self):
+        a = msr.run_config_hash("exp1", "RACAF", 42, "deadbeef")
+        b = msr.run_config_hash("exp1", "NO_RACAF", 42, "deadbeef")
+        self.assertNotEqual(a, b)
+
+    def test_hash_differs_by_seed(self):
+        a = msr.run_config_hash("exp1", "RACAF", 42, "deadbeef")
+        b = msr.run_config_hash("exp1", "RACAF", 123, "deadbeef")
+        self.assertNotEqual(a, b)
+
+    def test_hash_differs_by_experiment_id(self):
+        a = msr.run_config_hash("exp1", "RACAF", 42, "deadbeef")
+        b = msr.run_config_hash("exp2", "RACAF", 42, "deadbeef")
+        self.assertNotEqual(a, b)
+
+    def test_config_mapping_never_contains_a_run_seed_named_split_seed_field_confusion(self):
+        mapping = msr.run_config_mapping("exp1", "RACAF", 123, "deadbeef")
+        self.assertEqual(mapping["run_seed"], 123)
+        self.assertEqual(mapping["split_seed"], msr.SPLIT_SEED)
+        self.assertNotEqual(mapping["split_seed"], 123)  # split seed is NEVER the run seed
+
+
+class RunManifestTests(TempDirTestCase):
+    def test_write_then_verify_round_trips(self):
+        path = os.path.join(self.tmp, "run")
+        os.makedirs(path)
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        config_hash = ckpt.config_hash(mapping)
+        msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, config_hash)
+        verified = msr.verify_run_manifest(path, mapping, config_hash, allow_code_drift=True)
+        self.assertEqual(verified["arm"], "RACAF")
+
+    def test_refuses_to_overwrite_an_existing_manifest(self):
+        path = os.path.join(self.tmp, "run")
+        os.makedirs(path)
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        manifest_path = os.path.join(path, msr.RUN_MANIFEST_FILENAME)
+        msr.write_run_manifest(manifest_path, mapping, "hash1")
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.write_run_manifest(manifest_path, mapping, "hash2")
+
+    def test_verify_rejects_hash_mismatch(self):
+        path = os.path.join(self.tmp, "run")
+        os.makedirs(path)
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, "hash1")
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.verify_run_manifest(path, mapping, "hash2", allow_code_drift=True)
+
+    def test_verify_rejects_seed_mismatch(self):
+        path = os.path.join(self.tmp, "run")
+        os.makedirs(path)
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        config_hash = ckpt.config_hash(mapping)
+        msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, config_hash)
+        other_mapping = msr.run_config_mapping("exp1", "RACAF", 123, "deadbeef")
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.verify_run_manifest(path, other_mapping, config_hash, allow_code_drift=True)
+
+    def test_initialize_run_is_idempotent(self):
+        path1, hash1 = msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        path2, hash2 = msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        self.assertEqual(path1, path2)
+        self.assertEqual(hash1, hash2)
+
+    def test_initialize_run_refuses_a_changed_configuration(self):
+        msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "different-split-hash")
+
+
+class PreregistrationTests(TempDirTestCase):
+    def test_write_then_load_round_trips(self):
+        path = os.path.join(self.tmp, "PREREGISTRATION.json")
+        written, sha_written = msr.write_preregistration(path, "exp1")
+        loaded, sha_loaded = msr.load_and_verify_preregistration(path)
+        self.assertEqual(written, loaded)
+        self.assertEqual(sha_written, sha_loaded)
+
+    def test_refuses_to_overwrite(self):
+        path = os.path.join(self.tmp, "PREREGISTRATION.json")
+        msr.write_preregistration(path, "exp1")
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.write_preregistration(path, "exp1")
+
+    def test_detects_hand_editing(self):
+        path = os.path.join(self.tmp, "PREREGISTRATION.json")
+        msr.write_preregistration(path, "exp1")
+        with open(path) as handle:
+            data = json.load(handle)
+        data["max_epochs"] = 999
+        with open(path, "w") as handle:
+            json.dump(data, handle)  # NOT the canonical indent=2, sort_keys=True form
+        with self.assertRaises(msr.RunConfigurationError):
+            msr.load_and_verify_preregistration(path)
+
+    def test_delta_definition_is_racaf_minus_no_racaf(self):
+        prereg = msr.build_preregistration("exp1")
+        self.assertIn("QWK_RACAF - QWK_NO_RACAF", prereg["delta_definition"])
+
+    def test_idrid_is_explicitly_out_of_scope(self):
+        prereg = msr.build_preregistration("exp1")
+        self.assertIn("out of scope", prereg["idrid_external_evaluation"])
+
+
+class LockTests(TempDirTestCase):
+    def test_acquire_then_release(self):
+        msr.acquire_lock(self.tmp, owner_id="me")
+        self.assertTrue(os.path.exists(msr._lock_path(self.tmp)))
+        msr.release_lock(self.tmp, owner_id="me")
+        self.assertFalse(os.path.exists(msr._lock_path(self.tmp)))
+
+    def test_same_owner_can_reacquire(self):
+        msr.acquire_lock(self.tmp, owner_id="me")
+        msr.acquire_lock(self.tmp, owner_id="me")  # must not raise
+
+    def test_different_owner_is_refused_while_fresh(self):
+        msr.acquire_lock(self.tmp, owner_id="runtime-a")
+        with self.assertRaises(msr.RunLockedError):
+            msr.acquire_lock(self.tmp, owner_id="runtime-b", ttl_seconds=3600)
+
+    def test_different_owner_allowed_after_stale_ttl(self):
+        msr.acquire_lock(self.tmp, owner_id="runtime-a")
+        msr.acquire_lock(self.tmp, owner_id="runtime-b", ttl_seconds=0)  # instantly stale
+
+    def test_force_overrides_a_fresh_lock(self):
+        msr.acquire_lock(self.tmp, owner_id="runtime-a")
+        msr.acquire_lock(self.tmp, owner_id="runtime-b", ttl_seconds=3600, force=True)
+
+    def test_heartbeat_refreshes_the_same_owner(self):
+        msr.acquire_lock(self.tmp, owner_id="me")
+        before = json.load(open(msr._lock_path(self.tmp)))["heartbeat"]
+        time.sleep(0.01)
+        msr.heartbeat_lock(self.tmp, owner_id="me")
+        after = json.load(open(msr._lock_path(self.tmp)))["heartbeat"]
+        self.assertGreater(after, before)
+
+    def test_heartbeat_raises_if_taken_over(self):
+        msr.acquire_lock(self.tmp, owner_id="runtime-a")
+        msr.acquire_lock(self.tmp, owner_id="runtime-b", ttl_seconds=0, force=False)  # stale takeover
+        with self.assertRaises(msr.RunLockedError):
+            msr.heartbeat_lock(self.tmp, owner_id="runtime-a")
+
+    def test_release_by_non_owner_does_nothing(self):
+        msr.acquire_lock(self.tmp, owner_id="runtime-a")
+        msr.release_lock(self.tmp, owner_id="runtime-b")
+        self.assertTrue(os.path.exists(msr._lock_path(self.tmp)))
+
+
+class StopDecisionTests(TempDirTestCase):
+    def test_none_when_absent(self):
+        self.assertIsNone(msr.read_stop_decision(self.tmp))
+
+    def test_write_then_read(self):
+        msr.write_stop_decision(self.tmp, 18, "early_stopping")
+        decision = msr.read_stop_decision(self.tmp)
+        self.assertEqual(decision["epoch"], 18)
+        self.assertEqual(decision["stop_reason"], "early_stopping")
+        self.assertTrue(decision["stop_decided"])
+
+    def test_rejects_unknown_reason(self):
+        with self.assertRaises(ValueError):
+            msr.write_stop_decision(self.tmp, 18, "because_i_felt_like_it")
+
+
+class EpochHistoryTests(TempDirTestCase):
+    def _state(self, epoch):
+        return ckpt.TrainingState(
+            experiment_id="exp1", completed_epoch=epoch, best_epoch=epoch, best_metric=0.5,
+            monitor="val_QWK", monitor_mode="max", learning_rate=1e-4,
+            extra={"epoch_logs": {"val_QWK": 0.5, "val_loss": 0.3}},
+        )
+
+    def test_write_then_read_history(self):
+        msr.write_epoch_history(self.tmp, self._state(1))
+        msr.write_epoch_history(self.tmp, self._state(2))
+        rows = msr.read_history(self.tmp)
+        self.assertEqual([r["epoch"] for r in rows], [1, 2])
+        self.assertEqual(rows[0]["val_QWK"], 0.5)
+
+    def test_rewriting_the_same_epoch_does_not_duplicate(self):
+        msr.write_epoch_history(self.tmp, self._state(1))
+        msr.write_epoch_history(self.tmp, self._state(1))
+        rows = msr.read_history(self.tmp)
+        self.assertEqual(len(rows), 1)
+
+
+class TwoSlotBestTests(TempDirTestCase):
+    def _generation(self, epoch, qwk):
+        model = _tiny_model()
+        state = ckpt.TrainingState(
+            experiment_id="exp1", completed_epoch=epoch, best_epoch=epoch, best_metric=qwk,
+            monitor="val_QWK", monitor_mode="max",
+        )
+        checkpoint_dir = os.path.join(self.tmp, "checkpoints")
+        return ckpt.save_generation(checkpoint_dir, model, state,
+                                    staging_dir=os.path.join(self.tmp, "staging")), state
+
+    def test_publish_then_read_best(self):
+        generation_dir, state = self._generation(1, 0.5)
+        slot_dir = msr.publish_best(self.tmp, generation_dir, state)
+        read_dir, pointer = msr.read_best(self.tmp)
+        self.assertEqual(read_dir, slot_dir)
+        self.assertEqual(pointer["val_QWK"], 0.5)
+
+    def test_none_before_any_publish(self):
+        slot_dir, pointer = msr.read_best(self.tmp)
+        self.assertIsNone(slot_dir)
+        self.assertIsNone(pointer)
+
+    def test_second_publish_uses_the_other_slot_and_first_slot_survives_until_flip(self):
+        gen1, state1 = self._generation(1, 0.5)
+        slot1 = msr.publish_best(self.tmp, gen1, state1)
+        self.assertTrue(os.path.basename(slot1) in ("best_a", "best_b"))
+
+        gen2, state2 = self._generation(2, 0.6)
+        slot2 = msr.publish_best(self.tmp, gen2, state2)
+        self.assertNotEqual(slot1, slot2)
+        # the FIRST slot must still physically exist and validate right up until best.json flips
+        # -- publish_best only ever deletes the currently-INACTIVE slot, never the active one.
+        self.assertTrue(os.path.isdir(slot1))
+
+        read_dir, pointer = msr.read_best(self.tmp)
+        self.assertEqual(read_dir, slot2)
+        self.assertEqual(pointer["val_QWK"], 0.6)
+
+    def test_a_corrupted_best_pointer_target_raises_not_none(self):
+        generation_dir, state = self._generation(1, 0.5)
+        slot_dir = msr.publish_best(self.tmp, generation_dir, state)
+        os.remove(os.path.join(slot_dir, ckpt.MODEL_WEIGHTS_FILENAME))
+        with self.assertRaises(ckpt.CheckpointIntegrityError):
+            msr.read_best(self.tmp)
+
+    def test_three_publishes_alternate_slots(self):
+        slots = []
+        for epoch, qwk in ((1, 0.4), (2, 0.5), (3, 0.6)):
+            generation_dir, state = self._generation(epoch, qwk)
+            slots.append(os.path.basename(msr.publish_best(self.tmp, generation_dir, state)))
+        self.assertEqual(slots, ["best_a", "best_b", "best_a"])
+
+
+class StatusTests(TempDirTestCase):
+    def test_not_started_when_no_manifest(self):
+        self.assertEqual(msr.run_status(self.tmp), msr.STATUS_NOT_STARTED)
+
+    def test_created_after_manifest_before_any_epoch(self):
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        msr.write_run_manifest(os.path.join(self.tmp, msr.RUN_MANIFEST_FILENAME), mapping, "h")
+        self.assertEqual(msr.run_status(self.tmp), msr.STATUS_CREATED)
+
+    def test_completed_when_stop_decision_present(self):
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        msr.write_run_manifest(os.path.join(self.tmp, msr.RUN_MANIFEST_FILENAME), mapping, "h")
+        msr.write_stop_decision(self.tmp, 30, "early_stopping")
+        self.assertEqual(msr.run_status(self.tmp), msr.STATUS_COMPLETED)
+
+    def test_running_when_a_fresh_lock_and_a_valid_generation_exist(self):
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        msr.write_run_manifest(os.path.join(self.tmp, msr.RUN_MANIFEST_FILENAME), mapping, "h")
+        model = _tiny_model()
+        state = ckpt.TrainingState(experiment_id="exp1", completed_epoch=1, monitor="val_QWK", monitor_mode="max")
+        ckpt.save_generation(os.path.join(self.tmp, "checkpoints"), model, state,
+                             staging_dir=os.path.join(self.tmp, "staging"))
+        msr.acquire_lock(self.tmp, owner_id="me")
+        self.assertEqual(msr.run_status(self.tmp), msr.STATUS_RUNNING)
+
+    def test_interrupted_when_generation_valid_but_lock_stale(self):
+        mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
+        msr.write_run_manifest(os.path.join(self.tmp, msr.RUN_MANIFEST_FILENAME), mapping, "h")
+        model = _tiny_model()
+        state = ckpt.TrainingState(experiment_id="exp1", completed_epoch=1, monitor="val_QWK", monitor_mode="max")
+        ckpt.save_generation(os.path.join(self.tmp, "checkpoints"), model, state,
+                             staging_dir=os.path.join(self.tmp, "staging"))
+        self.assertEqual(msr.run_status(self.tmp, lock_ttl_seconds=1800), msr.STATUS_INTERRUPTED)
+
+
+def _tiny_arm_model():
+    """A trivial 3-input, CORN-shaped (5-grade, 4-threshold) model -- stands in for
+    build_arm_model()'s real ~43M-parameter output so train_run()'s ORCHESTRATION (not the real
+    architecture, already covered by tests/test_no_racaf_model.py) can be exercised fast, on CPU,
+    with no cache/images/GPU models at all."""
+    import corn as corn_module
+    import weighted_corn as wc
+
+    stage5 = tf.keras.Input(shape=(3,), name="stage5_input")
+    stage6 = tf.keras.Input(shape=(2,), name="stage6_input")
+    reliability = tf.keras.Input(shape=(1,), name="reliability")
+    merged = tf.keras.layers.Concatenate()([stage5, stage6, reliability])
+    logits = tf.keras.layers.Dense(corn_module.NUM_THRESHOLDS, name="corn_logits")(merged)
+    model = tf.keras.Model([stage5, stage6, reliability], logits, name="tiny_arm_model")
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-2),
+                 loss=wc.make_weighted_corn_loss([1.0] * corn_module.NUM_GRADES),
+                 metrics=[corn_module.CORNQuadraticWeightedKappa()])
+    return model
+
+
+def _tiny_epoch_dataset(rng_seed):
+    rng = np.random.default_rng(rng_seed)
+    n = 6
+    stage5 = rng.normal(size=(n, 3)).astype(np.float32)
+    stage6 = rng.normal(size=(n, 2)).astype(np.float32)
+    reliability = rng.uniform(size=(n, 1)).astype(np.float32)
+    grades = rng.integers(0, 5, size=n).astype(np.int32)
+    return tf.data.Dataset.from_tensor_slices(((stage5, stage6, reliability), grades)).batch(2)
+
+
+class TrainRunResumeIntegrationTests(TempDirTestCase):
+    """The single most important property this module exists for: a run trained partway in one
+    `train_run()` call, then handed a FRESH model instance (simulating a brand-new process/
+    runtime rebuilding it) and resumed via a second `train_run()` call, continues from the
+    correct epoch -- never epoch 0 -- with no duplicated or skipped epoch in its history."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_dir = os.path.join(self.tmp, "run")
+        self.staging_dir = os.path.join(self.tmp, "staging")
+        self._patcher = mock.patch(
+            "improved_training_data.make_epoch_dataset",
+            side_effect=lambda entries, epoch, run_seed, **kw: _tiny_epoch_dataset(
+                run_seed * 1000 + epoch),
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def _train_run(self, model, **overrides):
+        kwargs = dict(
+            model=model, run_dir_path=self.run_dir, arm="RACAF", run_seed=42,
+            train_entries=[("a", 0), ("b", 1)], val_entries=[("c", 2)],
+            image_dir="x", cache_dir="x", racaf_cache_dir="x", vessel_model=None, stage4_model=None,
+            config_hash_value="testhash", batch_size=2, max_epochs=5,
+            early_stopping_patience=100, reduce_lr_patience=100, staging_dir=self.staging_dir,
+            precision_check="off", mixed_precision=False, verbose=0,
+        )
+        kwargs.update(overrides)
+        return msr.train_run(**kwargs)
+
+    def test_resumes_from_the_correct_epoch_with_a_brand_new_model_instance(self):
+        first_model = _tiny_arm_model()
+        first_outcome = self._train_run(first_model, session_epoch_budget=2)
+        self.assertFalse(first_outcome.stopped)
+        self.assertEqual(first_outcome.completed_epoch, 2)
+        self.assertEqual(first_outcome.epochs_trained_this_call, 2)
+        self.assertEqual([h["epoch"] for h in msr.read_history(self.run_dir)], [1, 2])
+
+        # A FRESH model instance -- a different Python object, freshly initialized weights,
+        # freshly built optimizer -- simulating a brand-new process/runtime that rebuilds the
+        # model from scratch before resuming. train_run() must restore weights+optimizer from
+        # the checkpoint and continue at epoch 2, never retrain epoch 1 or 2.
+        second_model = _tiny_arm_model()
+        second_outcome = self._train_run(second_model)
+        self.assertTrue(second_outcome.stopped)
+        self.assertEqual(second_outcome.stop_reason, "epoch_cap")
+        self.assertEqual(second_outcome.completed_epoch, 5)
+        self.assertEqual(second_outcome.epochs_trained_this_call, 3)   # epochs 3, 4, 5 only
+
+        history = msr.read_history(self.run_dir)
+        self.assertEqual([h["epoch"] for h in history], [1, 2, 3, 4, 5])   # no duplicate, no gap
+
+        # A third call after the run is already COMPLETED must train nothing further at all.
+        third_model = _tiny_arm_model()
+        third_outcome = self._train_run(third_model)
+        self.assertTrue(third_outcome.stopped)
+        self.assertEqual(third_outcome.epochs_trained_this_call, 0)
+        self.assertEqual(len(msr.read_history(self.run_dir)), 5)
+
+    def test_a_completed_run_stop_decision_survives_and_blocks_further_training(self):
+        model = _tiny_arm_model()
+        self._train_run(model, max_epochs=2)   # trains straight to the cap in one call
+        self.assertIsNotNone(msr.read_stop_decision(self.run_dir))
+        history_before = msr.read_history(self.run_dir)
+
+        model2 = _tiny_arm_model()
+        outcome = self._train_run(model2, max_epochs=2)
+        self.assertEqual(outcome.epochs_trained_this_call, 0)
+        self.assertEqual(msr.read_history(self.run_dir), history_before)
+
+    def test_best_is_published_during_a_resumed_run(self):
+        model = _tiny_arm_model()
+        self._train_run(model, session_epoch_budget=1)
+        slot_dir, pointer = msr.read_best(self.run_dir)
+        self.assertIsNotNone(slot_dir)   # the first epoch always "improves" over no BEST at all
+        self.assertEqual(pointer["epoch"], 0)   # 0-indexed epoch, matching TrainingState.best_epoch
+
+
+class BuildOptimizerTests(unittest.TestCase):
+    def test_excludes_bias_and_norm_params_on_a_small_model(self):
+        inputs = tf.keras.Input(shape=(4,))
+        x = tf.keras.layers.Dense(3, name="dense_a")(inputs)
+        x = tf.keras.layers.BatchNormalization(name="bn_a")(x)
+        x = tf.keras.layers.LayerNormalization(name="ln_a")(x)
+        outputs = tf.keras.layers.Dense(1, name="dense_b")(x)
+        model = tf.keras.Model(inputs, outputs)
+
+        optimizer = msr.build_optimizer()
+        variables = model.trainable_variables
+        for variable in variables:
+            use_decay = optimizer._use_weight_decay(variable)
+            if variable.path.endswith("kernel"):
+                self.assertTrue(use_decay, f"{variable.path} should NOT be excluded")
+            if variable.path.endswith("bias") or "gamma" in variable.path or "beta" in variable.path:
+                self.assertFalse(use_decay, f"{variable.path} should be excluded")
+
+
+if __name__ == "__main__":
+    unittest.main()
