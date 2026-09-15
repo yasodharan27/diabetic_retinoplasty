@@ -48,10 +48,10 @@ class DirectoryLayoutTests(TempDirTestCase):
             msr.run_dir(self.tmp, "exp1", "RACAF", 999)
 
     def test_all_run_ids_is_six_matched_pairs(self):
-        ids = msr.all_run_ids()
-        self.assertEqual(len(ids), 6)
-        self.assertEqual({arm for arm, _ in ids}, set(msr.ARMS))
-        self.assertEqual({seed for _, seed in ids}, set(msr.RUN_SEEDS))
+        self.assertEqual(msr.all_run_ids(), [("RACAF", 42), ("NO_RACAF", 42), ("RACAF", 123),
+                                             ("NO_RACAF", 123), ("RACAF", 2026), ("NO_RACAF", 2026)])
+        self.assertEqual(msr.SPLIT_SEED, 42)
+        self.assertEqual((msr.EXPECTED_TRAIN_COUNT, msr.EXPECTED_VAL_COUNT), (2929, 733))
 
     def test_ensure_run_dir_is_idempotent(self):
         path = msr.run_dir(self.tmp, "exp1", "RACAF", 42)
@@ -98,7 +98,7 @@ class RunManifestTests(TempDirTestCase):
         mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
         config_hash = ckpt.config_hash(mapping)
         msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, config_hash)
-        verified = msr.verify_run_manifest(path, mapping, config_hash, allow_code_drift=True)
+        verified = msr.verify_run_manifest(path, mapping, config_hash)
         self.assertEqual(verified["arm"], "RACAF")
 
     def test_refuses_to_overwrite_an_existing_manifest(self):
@@ -116,7 +116,7 @@ class RunManifestTests(TempDirTestCase):
         mapping = msr.run_config_mapping("exp1", "RACAF", 42, "deadbeef")
         msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, "hash1")
         with self.assertRaises(msr.RunConfigurationError):
-            msr.verify_run_manifest(path, mapping, "hash2", allow_code_drift=True)
+            msr.verify_run_manifest(path, mapping, "hash2")
 
     def test_verify_rejects_seed_mismatch(self):
         path = os.path.join(self.tmp, "run")
@@ -126,7 +126,7 @@ class RunManifestTests(TempDirTestCase):
         msr.write_run_manifest(os.path.join(path, msr.RUN_MANIFEST_FILENAME), mapping, config_hash)
         other_mapping = msr.run_config_mapping("exp1", "RACAF", 123, "deadbeef")
         with self.assertRaises(msr.RunConfigurationError):
-            msr.verify_run_manifest(path, other_mapping, config_hash, allow_code_drift=True)
+            msr.verify_run_manifest(path, other_mapping, config_hash)
 
     def test_initialize_run_is_idempotent(self):
         path1, hash1 = msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
@@ -138,6 +138,13 @@ class RunManifestTests(TempDirTestCase):
         msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
         with self.assertRaises(msr.RunConfigurationError):
             msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "different-split-hash")
+
+    def test_initialize_run_accepts_a_changed_git_commit_and_keeps_the_original_as_provenance(self):
+        with mock.patch.object(ckpt, "environment_fingerprint", return_value={"git_commit_hash": "aaa"}):
+            msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        with mock.patch.object(ckpt, "environment_fingerprint", return_value={"git_commit_hash": "bbb"}):
+            path, _hash = msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        self.assertEqual(msr.read_run_manifest(path)["environment"]["git_commit_hash"], "aaa")
 
 
 class PreregistrationTests(TempDirTestCase):
@@ -393,6 +400,25 @@ class TrainRunResumeIntegrationTests(TempDirTestCase):
         self._patcher.start()
         self.addCleanup(self._patcher.stop)
 
+        # The git commit and one extra fingerprint component are controlled per test; the rest of
+        # the fingerprint is the REAL one, computed from this repository's real sources.
+        self.commit = "commitA"
+        self.behavior_change = None
+        real_fingerprint = msr.training_behavior_fingerprint
+
+        def fingerprint(*args, **kwargs):
+            result = real_fingerprint(*args, **kwargs)
+            if self.behavior_change is None:
+                return result
+            components = dict(result["components"], test_behavior_change=self.behavior_change)
+            return {"training_behavior_hash": msr._canonical_hash(components), "components": components}
+
+        for name, replacement in (("_current_git_commit", lambda repo_dir=None: self.commit),
+                                  ("training_behavior_fingerprint", fingerprint)):
+            patcher = mock.patch.object(msr, name, side_effect=replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _train_run(self, model, **overrides):
         kwargs = dict(
             model=model, run_dir_path=self.run_dir, arm="RACAF", run_seed=42,
@@ -450,6 +476,188 @@ class TrainRunResumeIntegrationTests(TempDirTestCase):
         slot_dir, pointer = msr.read_best(self.run_dir)
         self.assertIsNotNone(slot_dir)   # the first epoch always "improves" over no BEST at all
         self.assertEqual(pointer["epoch"], 0)   # 0-indexed epoch, matching TrainingState.best_epoch
+
+    # --- training-behaviour fingerprint vs git commit -------------------------------------------
+
+    def _superseded(self):
+        return msr._superseded_dirs(self.run_dir)
+
+    @staticmethod
+    def _iterations(model):
+        return int(model.optimizer.iterations.numpy())
+
+    def test_git_commit_change_alone_resumes_normally(self):
+        self._train_run(_tiny_arm_model(), session_epoch_budget=2)
+        self.commit = "commitB"   # a normal non-training commit + a brand-new runtime/model
+        outcome = self._train_run(_tiny_arm_model(), session_epoch_budget=1)
+
+        self.assertEqual(outcome.training_behavior["action"], "resume")
+        self.assertEqual(outcome.completed_epoch, 3)
+        self.assertEqual([h["epoch"] for h in msr.read_history(self.run_dir)], [1, 2, 3])
+        self.assertEqual(self._superseded(), [])
+        record = msr.read_training_behavior(self.run_dir)
+        self.assertEqual(record["established_git_commit"], "commitA")
+        self.assertEqual(record["last_git_commit"], "commitB")
+        self.assertEqual(record["events"][-1]["event"], "git_commit_changed_resume_allowed")
+
+    def _assert_clean_restart(self, first_model_epochs=2):
+        old_record = msr.read_training_behavior(self.run_dir)
+        model = _tiny_arm_model()
+        outcome = self._train_run(model, session_epoch_budget=1)
+        decision = outcome.training_behavior
+
+        self.assertEqual(decision["action"], "restarted")
+        self.assertEqual(outcome.completed_epoch, 1)                      # epoch numbering restarted
+        self.assertEqual(self._iterations(model), 3)                      # one epoch of steps, not 6 + 3
+        self.assertEqual([h["epoch"] for h in msr.read_history(self.run_dir)], [1])   # old history not active
+        self.assertEqual(msr.read_best(self.run_dir)[1]["epoch"], 0)      # BEST belongs to the new trajectory
+
+        superseded = self._superseded()
+        self.assertEqual(len(superseded), 1)
+        old_generations = [n for n in os.listdir(os.path.join(superseded[0], "checkpoints"))
+                           if n.startswith("gen_")]
+        self.assertTrue(old_generations)                                 # old checkpoints preserved, not deleted
+        self.assertEqual(len(os.listdir(os.path.join(superseded[0], "history"))), first_model_epochs)
+        restart_json = json.load(open(os.path.join(superseded[0], "restart.json")))
+        self.assertTrue(restart_json["completed"])
+        self.assertEqual(restart_json["restart_reason"], decision["restart_reason"])
+
+        record = msr.read_training_behavior(self.run_dir)
+        self.assertEqual(record["active_training_behavior_hash"], decision["new_training_behavior_hash"])
+        self.assertNotEqual(decision["old_training_behavior_hash"], decision["new_training_behavior_hash"])
+        self.assertTrue(record["events"][-1]["training_behavior_changed"])
+        if old_record is not None:
+            self.assertEqual(decision["old_training_behavior_hash"], old_record["active_training_behavior_hash"])
+        return decision
+
+    def test_training_behavior_change_restarts_from_epoch_0_without_old_weights_or_optimizer(self):
+        self._train_run(_tiny_arm_model(), session_epoch_budget=2)
+        self.behavior_change = "augmentation changed"
+        decision = self._assert_clean_restart()
+        self.assertEqual(decision["restart_reason"], "training_behavior_fingerprint_changed")
+        self.assertEqual((decision["old_git_commit"], decision["new_git_commit"]), ("commitA", "commitA"))
+        self.assertIn("test_behavior_change", decision["changed_components"])
+
+    def test_git_commit_and_training_behavior_change_restarts_from_epoch_0(self):
+        self._train_run(_tiny_arm_model(), session_epoch_budget=2)
+        self.commit, self.behavior_change = "commitB", "optimizer changed"
+        decision = self._assert_clean_restart()
+        self.assertEqual((decision["old_git_commit"], decision["new_git_commit"]), ("commitA", "commitB"))
+
+    def test_a_trained_run_without_a_recorded_fingerprint_restarts(self):
+        self._train_run(_tiny_arm_model(), session_epoch_budget=2)
+        os.remove(os.path.join(self.run_dir, msr.TRAINING_BEHAVIOR_FILENAME))   # a pre-fingerprint run
+        decision = self._assert_clean_restart()
+        self.assertEqual(decision["restart_reason"], "training_behavior_fingerprint_missing")
+
+    def test_created_run_under_a_new_git_commit_initializes_normally(self):
+        with mock.patch.object(ckpt, "environment_fingerprint", return_value={"git_commit_hash": "commitA"}):
+            self.run_dir, _ = msr.initialize_run(self.tmp, "exp1", "RACAF", 42, "deadbeef")
+        self.commit = "commitB"
+        outcome = self._train_run(_tiny_arm_model(), session_epoch_budget=1)
+        self.assertEqual(outcome.training_behavior["action"], "established")
+        self.assertEqual(outcome.completed_epoch, 1)
+        self.assertEqual(self._superseded(), [])
+        self.assertEqual(msr.read_training_behavior(self.run_dir)["established_git_commit"], "commitB")
+
+    def test_completed_run_is_immutable_under_a_later_commit_and_changed_behavior(self):
+        self._train_run(_tiny_arm_model(), max_epochs=2)
+        record_before = msr.read_training_behavior(self.run_dir)
+        history_before = msr.read_history(self.run_dir)
+        best_before = msr.read_best(self.run_dir)[1]
+
+        self.commit, self.behavior_change = "commitB", "architecture changed"
+        outcome = self._train_run(_tiny_arm_model(), max_epochs=2)
+        self.assertTrue(outcome.stopped)
+        self.assertEqual(outcome.epochs_trained_this_call, 0)
+        self.assertIsNone(outcome.training_behavior)
+        self.assertEqual(self._superseded(), [])
+        self.assertEqual(msr.read_training_behavior(self.run_dir), record_before)
+        self.assertEqual(msr.read_history(self.run_dir), history_before)
+        self.assertEqual(msr.read_best(self.run_dir)[1], best_before)
+
+
+class TrainingBehaviorFingerprintTests(TempDirTestCase):
+    ENTRIES = ([("id_b", 1), ("id_a", 0), ("id_c", 4)], [("id_v", 2)])
+
+    def _copy_sources(self):
+        for relative_path, _symbols in msr.TRAINING_BEHAVIOR_SOURCES:
+            destination = os.path.join(self.tmp, *relative_path.split("/"))
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.copyfile(os.path.join(msr.REPO_ROOT, *relative_path.split("/")), destination)
+
+    def _edit(self, relative_path, old, new):
+        path = os.path.join(self.tmp, *relative_path.split("/"))
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(text.count(old), 1, f"test anchor not unique in {relative_path}: {old!r}")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text.replace(old, new))
+
+    def _fingerprint(self, repo_root=None, **overrides):
+        train, val = overrides.pop("entries", self.ENTRIES)
+        return msr.training_behavior_fingerprint("RACAF", 42, train, val,
+                                                 repo_root=repo_root or self.tmp, **overrides)
+
+    def test_deterministic_and_independent_of_entry_order(self):
+        self._copy_sources()
+        a = self._fingerprint()
+        b = self._fingerprint(entries=(list(reversed(self.ENTRIES[0])), self.ENTRIES[1]))
+        self.assertEqual(a, b)
+        self.assertEqual(a["components"]["configuration"]["split_seed"], 42)
+        self.assertEqual(a["components"]["configuration"]["split_sha256"], msr.EXPECTED_SPLIT_SHA256)
+
+    def test_the_cache_first_data_path_is_part_of_the_fingerprint(self):
+        sources = self._fingerprint(repo_root=msr.REPO_ROOT)["components"]["sources"]
+        for key in ("improved_training_data.py::load_cached_sample",
+                    "improved_training_data.py::make_epoch_dataset",
+                    "improved_training_data.py::epoch_training_order",
+                    "improved_training_data.py::per_image_augmentation_rng",
+                    "joint_training_dataset.py::_build_joint_sample",
+                    "joint_cache_diagnostics.py::artifact_paths",
+                    "multiseed_runs.py::build_arm_model", "weighted_corn.py", "racaf.py"):
+            self.assertIn(key, sources)
+        self.assertNotIn("improved_training_data.py::complete_local_cache", sources)
+        self.assertNotIn("multiseed_runs.py::train_run", sources)
+
+    def test_comments_docstrings_and_unrelated_code_do_not_change_the_fingerprint(self):
+        self._copy_sources()
+        before = self._fingerprint()
+        self._edit("improved_training_data.py", '"""One joint sample built from the LOCAL cache only',
+                   '"""EDITED documentation. One joint sample built from the LOCAL cache only')
+        self._edit("improved_training_data.py",
+                   "    missing = missing_local_artifacts(id_code, cache_dir, racaf_cache_dir, image_size)\n"
+                   "    if missing:",
+                   "    # an explanatory comment\n"
+                   "    missing = missing_local_artifacts(id_code, cache_dir, racaf_cache_dir, image_size)  # why\n"
+                   "\n    if missing:")
+        self._edit("improved_training_data.py",   # infrastructure: one-time cache completion
+                   '    report["already_local"] = len(entries) - len(not_local)\n',
+                   '    report["already_local"] = len(entries) - len(not_local)\n    report["note"] = 1\n')
+        self._edit("multiseed_runs.py", "def run_status(run_dir_path, lock_ttl_seconds=DEFAULT_LOCK_TTL_SECONDS):",
+                   "def run_status(run_dir_path, lock_ttl_seconds=DEFAULT_LOCK_TTL_SECONDS):  # infra")
+        self.assertEqual(self._fingerprint()["training_behavior_hash"], before["training_behavior_hash"])
+
+    def test_a_training_behavior_code_change_changes_the_fingerprint_and_names_the_component(self):
+        self._copy_sources()
+        before = self._fingerprint()
+        self._edit("improved_training_data.py", "        processed_dir=None, image_size=image_size,\n    )",
+                   "        processed_dir=None, image_size=(8, 8),\n    )")
+        after = self._fingerprint()
+        self.assertNotEqual(after["training_behavior_hash"], before["training_behavior_hash"])
+        self.assertEqual(msr.changed_behavior_components(before["components"], after["components"]),
+                         ["sources.improved_training_data.py::load_cached_sample"])
+
+    def test_configuration_and_population_changes_change_the_fingerprint(self):
+        self._copy_sources()
+        base = self._fingerprint()["training_behavior_hash"]
+        self.assertNotEqual(base, self._fingerprint(batch_size=4)["training_behavior_hash"])
+        self.assertNotEqual(base, msr.training_behavior_fingerprint(
+            "RACAF", 123, *self.ENTRIES, repo_root=self.tmp)["training_behavior_hash"])
+        self.assertNotEqual(base, msr.training_behavior_fingerprint(
+            "NO_RACAF", 42, *self.ENTRIES, repo_root=self.tmp)["training_behavior_hash"])
+        self.assertNotEqual(base, self._fingerprint(
+            entries=(self.ENTRIES[0][:2], self.ENTRIES[1]))["training_behavior_hash"])
 
 
 class BuildOptimizerTests(unittest.TestCase):

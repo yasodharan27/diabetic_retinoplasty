@@ -74,12 +74,15 @@ separate step alongside it. The legacy `checkpoints/best/` this produces is harm
 unused: `read_best()`/the evaluation and comparison code read only `best.json`.
 """
 
+import ast
 import hashlib
+import io
 import json
 import os
 import platform
 import shutil
 import time
+import tokenize
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -177,6 +180,8 @@ def _read_json(path):
 #     RACAF/seed_42/ seed_123/ seed_2026/
 #     NO_RACAF/seed_42/ seed_123/ seed_2026/
 #         run_manifest.json      -- immutable identity, written once
+#         training_behavior.json  -- active training-behaviour fingerprint + restart/commit events
+#         superseded/restart_NNN/ -- a previous trajectory, moved aside when training behaviour changed
 #         LOCK.json               -- heartbeat lease
 #         stop_decision.json      -- present only once EarlyStopping/the epoch cap has decided
 #         checkpoints/            -- gen_NNNNN/ (LAST), best_a/ best_b/ best.json (BEST)
@@ -201,8 +206,9 @@ def run_dir(experiments_root, experiment_id, arm, run_seed):
 
 
 def all_run_ids():
-    """Every (arm, run_seed) pair this experiment trains, in the pre-registered order."""
-    return [(arm, seed) for arm in ARMS for seed in RUN_SEEDS]
+    """Every (arm, run_seed) pair this experiment trains, in the pre-registered order: matched
+    pairs seed by seed -- RACAF 42, NO_RACAF 42, RACAF 123, NO_RACAF 123, RACAF 2026, NO_RACAF 2026."""
+    return [(arm, seed) for seed in RUN_SEEDS for arm in ARMS]
 
 
 def ensure_run_dir(path):
@@ -407,13 +413,15 @@ def read_run_manifest(run_dir_path):
     return _read_json(os.path.join(run_dir_path, RUN_MANIFEST_FILENAME))
 
 
-def verify_run_manifest(run_dir_path, expected_mapping, expected_hash, repo_dir=None,
-                        allow_code_drift=False):
+def verify_run_manifest(run_dir_path, expected_mapping, expected_hash):
     """Raises `RunConfigurationError` if the persisted run identity does not match what this
     session is configured for -- experiment id, arm, run seed, split hash, protocol version, or
-    the full config hash. By default also refuses if the repository's git commit has changed
-    since the run was created (`allow_code_drift=True` to proceed anyway, only after confirming
-    the change cannot materially affect training, e.g. a documentation-only commit)."""
+    the full config hash.
+
+    The git commit recorded in the manifest is provenance only and is never compared here: a
+    commit that does not change training behaviour must not block a run. Whether persisted
+    checkpoints may be resumed is decided by the training-behaviour fingerprint in `train_run()`
+    (`reconcile_training_behavior()`)."""
     manifest = read_run_manifest(run_dir_path)
     if manifest is None:
         raise RunConfigurationError(f"No {RUN_MANIFEST_FILENAME} at {run_dir_path} -- not initialized.")
@@ -428,15 +436,6 @@ def verify_run_manifest(run_dir_path, expected_mapping, expected_hash, repo_dir=
             raise RunConfigurationError(
                 f"{key} mismatch at {run_dir_path}: manifest has {manifest.get(key)!r}, this "
                 f"session has {expected_mapping.get(key)!r}."
-            )
-    if not allow_code_drift:
-        current_commit = ckpt.environment_fingerprint(repo_dir).get("git_commit_hash")
-        recorded_commit = (manifest.get("environment") or {}).get("git_commit_hash")
-        if recorded_commit and current_commit and recorded_commit != current_commit:
-            raise RunConfigurationError(
-                f"Repository commit changed since {run_dir_path} was created "
-                f"({recorded_commit} -> {current_commit}). Pass allow_code_drift=True only after "
-                "confirming the change cannot materially affect this run's training behaviour."
             )
     return manifest
 
@@ -453,8 +452,335 @@ def initialize_run(experiments_root, experiment_id, arm, run_seed, split_sha256,
     if not os.path.exists(manifest_path):
         write_run_manifest(manifest_path, mapping, config_hash_value, repo_dir=repo_dir)
     else:
-        verify_run_manifest(path, mapping, config_hash_value, repo_dir=repo_dir)
+        verify_run_manifest(path, mapping, config_hash_value)
     return path, config_hash_value
+
+
+# =====================================================================================
+# 5b. Training-behaviour fingerprint -- decides whether a run's checkpoints may be resumed.
+# =====================================================================================
+#
+# The git commit is provenance only. What decides whether persisted model + optimizer state may be
+# resumed is a hash of the code and configuration that materially determine how the model is
+# fitted: the model/loss/metric/callback/augmentation/data-path source listed below, the run's
+# training configuration, and the exact train/validation population. Source is normalised before
+# hashing -- comments, docstrings, blank lines and trailing whitespace are dropped -- so a comment
+# or docstring edit leaves the hash unchanged while any change to executable code in a listed
+# module or symbol changes it. No timestamp, path, git SHA or random value enters the hash.
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+TRAINING_BEHAVIOR_FILENAME = "training_behavior.json"
+SUPERSEDED_DIRNAME = "superseded"
+TRAINING_BEHAVIOR_FINGERPRINT_VERSION = 1
+WHOLE_MODULE = None
+
+#: `(repo-relative path, symbols)`. `WHOLE_MODULE` where every definition in the file belongs to
+#: the model, loss, metric or callbacks; an explicit symbol tuple where the file also holds
+#: infrastructure (cache generation/staging, locking, status, evaluation, checkpoint persistence)
+#: whose changes must NOT restart a run.
+TRAINING_BEHAVIOR_SOURCES = (
+    # Model architecture, both arms.
+    ("local_feature_extraction_model.py", WHOLE_MODULE),
+    ("swin_transformer.py", WHOLE_MODULE),
+    ("feature_fusion.py", WHOLE_MODULE),
+    ("racaf.py", WHOLE_MODULE),
+    ("corn.py", WHOLE_MODULE),
+    ("joint_training_model.py", WHOLE_MODULE),
+    ("no_racaf_model.py", ("InertReliabilityConnection", "build_no_racaf_joint_model",
+                           "build_no_racaf_joint_model_matched_init")),
+    # Loss, metric, optimizer, seeding + matched initialisation + compile.
+    ("weighted_corn.py", WHOLE_MODULE),
+    ("training/metrics.py", ("QuadraticWeightedKappa",)),
+    ("multiseed_runs.py", ("build_optimizer", "build_arm_model")),
+    # Early stopping, ReduceLROnPlateau, callback-counter restore; precision policy.
+    ("training/callbacks.py", WHOLE_MODULE),
+    ("training/trainer.py", ("enable_mixed_precision",)),
+    # Training inputs: cached-sample construction, augmentation and its RNG, epoch order.
+    ("local_feature_extraction_dataset.py", ("NUM_CHANNELS", "_cache_path", "_augment_spatial",
+                                             "_augment_intensity_rgb", "_resize_input")),
+    ("joint_training_dataset.py", ("STAGE5_IMAGE_SIZE", "STAGE6_IMAGE_SIZE", "_expected_cache_shape",
+                                   "_validate_cached_array", "_load_local_array",
+                                   "_canonical_rgb_cache_path", "_get_or_compute_canonical_rgb",
+                                   "_get_or_compute_joint_frozen_outputs", "_augment",
+                                   "_build_joint_sample")),
+    ("joint_cache_diagnostics.py", ("artifact_paths",)),
+    ("improved_training_data.py", ("_AUGMENTATION_TAG", "_ORDER_TAG", "_seed_from_key",
+                                   "per_image_augmentation_rng", "epoch_training_order",
+                                   "missing_local_artifacts", "locally_cached_entries",
+                                   "load_cached_sample", "make_epoch_dataset")),
+)
+
+
+def _char_col(line, byte_col):
+    """AST column offsets are UTF-8 byte offsets; tokenize's are character offsets."""
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def _strip_comments_and_docstrings(source):
+    """`(tree, lines)`: `source` with every comment and module/class/function docstring blanked
+    and trailing whitespace removed. Line numbering is preserved so AST line ranges still index
+    `lines`."""
+    tree = ast.parse(source)
+    lines = source.split("\n")
+    spans = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                doc = body[0]
+                spans.append((doc.lineno, _char_col(lines[doc.lineno - 1], doc.col_offset),
+                              doc.end_lineno, _char_col(lines[doc.end_lineno - 1], doc.end_col_offset)))
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT:
+            spans.append((token.start[0], token.start[1], token.end[0], token.end[1]))
+
+    cleaned = list(lines)
+    for start_line, start_col, end_line, end_col in sorted(spans, reverse=True):
+        if start_line == end_line:
+            text = cleaned[start_line - 1]
+            cleaned[start_line - 1] = text[:start_col] + text[end_col:]
+        else:
+            cleaned[start_line - 1] = cleaned[start_line - 1][:start_col]
+            for index in range(start_line, end_line - 1):
+                cleaned[index] = ""
+            cleaned[end_line - 1] = cleaned[end_line - 1][end_col:]
+    return tree, [line.rstrip() for line in cleaned]
+
+
+def _top_level_span(tree, symbol, relative_path):
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        if symbol in names:
+            start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            return start, node.end_lineno
+    raise RunConfigurationError(
+        f"Training-behaviour source {relative_path}::{symbol} no longer exists -- update "
+        "TRAINING_BEHAVIOR_SOURCES deliberately rather than fingerprinting less code silently.")
+
+
+def normalized_source_digests(relative_path, symbols=WHOLE_MODULE, repo_root=REPO_ROOT):
+    """`{component_key: sha256}` of the normalised source of `relative_path` -- one entry for the
+    whole module, or one `path::symbol` entry per listed top-level definition."""
+    with open(os.path.join(repo_root, *relative_path.split("/")), encoding="utf-8") as handle:
+        source = handle.read()
+    tree, lines = _strip_comments_and_docstrings(source)
+
+    def digest(selected):
+        text = "\n".join(line for line in selected if line.strip())
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    if symbols is WHOLE_MODULE:
+        return {relative_path: digest(lines)}
+    digests = {}
+    for symbol in symbols:
+        start, end = _top_level_span(tree, symbol, relative_path)
+        digests[f"{relative_path}::{symbol}"] = digest(lines[start - 1:end])
+    return digests
+
+
+def _canonical_hash(payload):
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def population_digest(entries):
+    """Order-independent digest of `(id_code, grade)` membership."""
+    rows = sorted((str(id_code), int(grade)) for id_code, grade in entries)
+    text = "\n".join(f"{id_code},{grade}" for id_code, grade in rows)
+    return {"count": len(rows), "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+
+def training_behavior_fingerprint(arm, run_seed, train_entries, val_entries, batch_size=BATCH_SIZE,
+                                  max_epochs=MAX_EPOCHS,
+                                  early_stopping_patience=EARLY_STOPPING_PATIENCE,
+                                  reduce_lr_patience=REDUCE_LR_PATIENCE,
+                                  reduce_lr_factor=REDUCE_LR_FACTOR, min_lr=MIN_LR,
+                                  monitor=MONITOR_METRIC, mode=MONITOR_MODE, mixed_precision=True,
+                                  repo_root=REPO_ROOT):
+    """`{"training_behavior_hash", "components"}` for one run. `components` is stored in full so
+    two fingerprints can be diffed component by component."""
+    configuration = run_config_mapping(None, arm, run_seed, EXPECTED_SPLIT_SHA256)
+    for label_only in ("experiment_id", "protocol_version"):
+        configuration.pop(label_only)
+    configuration.update({
+        "batch_size": int(batch_size), "max_epochs": int(max_epochs),
+        "early_stopping_patience": int(early_stopping_patience),
+        "reduce_lr_patience": int(reduce_lr_patience), "reduce_lr_factor": float(reduce_lr_factor),
+        "min_lr": float(min_lr), "monitor": monitor, "mode": mode,
+        "mixed_precision": bool(mixed_precision),
+    })
+    sources = {}
+    for relative_path, symbols in TRAINING_BEHAVIOR_SOURCES:
+        sources.update(normalized_source_digests(relative_path, symbols, repo_root))
+    components = {
+        "fingerprint_version": TRAINING_BEHAVIOR_FINGERPRINT_VERSION,
+        "configuration": configuration,
+        "train_population": population_digest(train_entries),
+        "validation_population": population_digest(val_entries),
+        "sources": sources,
+    }
+    return {"training_behavior_hash": _canonical_hash(components), "components": components}
+
+
+def changed_behavior_components(old_components, new_components):
+    """Which fingerprint components differ, e.g. `sources.improved_training_data.py::make_epoch_dataset`."""
+    if not old_components:
+        return ["<no recorded training-behaviour fingerprint>"]
+    changed = []
+    for section in sorted(set(old_components) | set(new_components)):
+        old, new = old_components.get(section), new_components.get(section)
+        if section in ("configuration", "sources") and isinstance(old, dict) and isinstance(new, dict):
+            changed += [f"{section}.{key}" for key in sorted(set(old) | set(new))
+                        if old.get(key) != new.get(key)]
+        elif old != new:
+            changed.append(section)
+    return changed
+
+
+def _current_git_commit(repo_dir=None):
+    return ckpt.environment_fingerprint(repo_dir).get("git_commit_hash")
+
+
+def read_training_behavior(run_dir_path):
+    return _read_json(os.path.join(run_dir_path, TRAINING_BEHAVIOR_FILENAME))
+
+
+def run_has_training_state(run_dir_path):
+    """True once any epoch of this run's trajectory has been persisted: a checkpoint generation,
+    `latest.json`, a BEST slot/pointer, or an epoch history file."""
+    checkpoint_dir = os.path.join(run_dir_path, "checkpoints")
+    if ckpt.checkpoint_evidence(checkpoint_dir):
+        return True
+    if os.path.isdir(checkpoint_dir) and any(
+            name in (BEST_POINTER_FILENAME,) + _BEST_SLOTS for name in os.listdir(checkpoint_dir)):
+        return True
+    return bool(read_history(run_dir_path))
+
+
+def _superseded_dirs(run_dir_path):
+    root = os.path.join(run_dir_path, SUPERSEDED_DIRNAME)
+    if not os.path.isdir(root):
+        return []
+    return sorted(os.path.join(root, name) for name in os.listdir(root) if name.startswith("restart_"))
+
+
+def _finalize_pending_supersede(run_dir_path):
+    for directory in _superseded_dirs(run_dir_path):
+        marker = os.path.join(directory, "restart.json")
+        payload = _read_json(marker)
+        if payload is not None and not payload.get("completed"):
+            payload["completed"] = True
+            _atomic_write_json(marker, payload)
+
+
+#: Moved aside in this order -- `checkpoints/` LAST, so a crash part-way leaves the checkpoints in
+#: place and the next session repeats the restart instead of treating the run as never trained.
+_TRAJECTORY_DIRS = ("history", "logs", "evaluation", "checkpoints")
+
+
+def _supersede_trajectory(run_dir_path, restart):
+    """Moves this run's current trajectory into `superseded/restart_NNN/` (never deleting it) and
+    returns that directory. Reuses a restart directory left incomplete by an interrupted attempt."""
+    pending = [d for d in _superseded_dirs(run_dir_path)
+               if not (_read_json(os.path.join(d, "restart.json")) or {}).get("completed")]
+    if pending:
+        target = pending[-1]
+    else:
+        target = os.path.join(run_dir_path, SUPERSEDED_DIRNAME,
+                              f"restart_{len(_superseded_dirs(run_dir_path)) + 1:03d}")
+        os.makedirs(target, exist_ok=True)
+    _atomic_write_json(os.path.join(target, "restart.json"), dict(restart, completed=False))
+    for name in _TRAJECTORY_DIRS:
+        source = os.path.join(run_dir_path, name)
+        if not os.path.isdir(source) or not os.listdir(source):
+            continue
+        destination, suffix = os.path.join(target, name), 1
+        while os.path.exists(destination):
+            destination, suffix = os.path.join(target, f"{name}_{suffix}"), suffix + 1
+        os.replace(source, destination)
+    return target
+
+
+def reconcile_training_behavior(run_dir_path, behavior, git_commit, verbose=1):
+    """Decides, BEFORE any checkpoint is read, whether this unfinished run may resume.
+
+      - same fingerprint as recorded        -> "resume" (a git commit change is only logged);
+      - no training state persisted yet     -> "established" (the current fingerprint becomes active);
+      - training state + different/missing fingerprint -> "restarted": the trajectory (checkpoints
+        incl. BEST, history, logs, evaluation) is moved to `superseded/restart_NNN/`, the run starts
+        again from epoch 0, and the event is recorded in `training_behavior.json` and `restart.json`.
+
+    Completed runs never reach this function (`train_run()` returns first)."""
+    path = os.path.join(run_dir_path, TRAINING_BEHAVIOR_FILENAME)
+    record = read_training_behavior(run_dir_path)
+    current_hash = behavior["training_behavior_hash"]
+    active_hash = record.get("active_training_behavior_hash") if record else None
+    now = _now()
+
+    if record is not None and active_hash == current_hash:
+        _finalize_pending_supersede(run_dir_path)
+        if record.get("last_git_commit") != git_commit:
+            record["events"].append({
+                "event": "git_commit_changed_resume_allowed", "training_behavior_hash": current_hash,
+                "old_git_commit": record.get("last_git_commit"), "new_git_commit": git_commit,
+                "recorded": now,
+            })
+            record["last_git_commit"] = git_commit
+            _atomic_write_json(path, record)
+        return {"action": "resume", "training_behavior_hash": current_hash}
+
+    environment = ckpt.environment_fingerprint(None)
+    environment["git_commit_hash"] = git_commit
+    events = list(record["events"]) if record else []
+
+    if not run_has_training_state(run_dir_path):
+        _finalize_pending_supersede(run_dir_path)
+        events.append({"event": "established", "training_behavior_hash": current_hash,
+                       "previous_training_behavior_hash": active_hash, "git_commit": git_commit,
+                       "environment": environment, "recorded": now})
+        decision = {"action": "established", "training_behavior_hash": current_hash}
+    else:
+        restart = {
+            "event": "restarted_from_epoch_0",
+            "training_behavior_changed": True,
+            "old_training_behavior_hash": active_hash,
+            "new_training_behavior_hash": current_hash,
+            "old_git_commit": record.get("last_git_commit") if record else None,
+            "new_git_commit": git_commit,
+            "restart_reason": ("training_behavior_fingerprint_changed" if record
+                               else "training_behavior_fingerprint_missing"),
+            "changed_components": changed_behavior_components(
+                record.get("active_components") if record else None, behavior["components"]),
+            "environment": environment,
+            "recorded": now,
+        }
+        superseded = _supersede_trajectory(run_dir_path, restart)
+        restart["superseded_dir"] = os.path.relpath(superseded, run_dir_path).replace(os.sep, "/")
+        ensure_run_dir(run_dir_path)
+        events.append(restart)
+        decision = dict(restart, action="restarted", training_behavior_hash=current_hash)
+        if verbose:
+            print(f"{run_dir_path}: training behaviour changed ({restart['restart_reason']}; "
+                  f"{restart['changed_components']}). The previous trajectory was moved to "
+                  f"{restart['superseded_dir']} and this run restarts from epoch 0.")
+
+    _atomic_write_json(path, {
+        "active_training_behavior_hash": current_hash,
+        "active_components": behavior["components"],
+        "established_git_commit": git_commit,
+        "last_git_commit": git_commit,
+        "events": events,
+    })
+    _finalize_pending_supersede(run_dir_path)
+    return decision
 
 
 # =====================================================================================
@@ -751,6 +1077,26 @@ class TrainRunOutcome:
     stopped: bool
     stop_reason: Optional[str]
     epochs_trained_this_call: int
+    #: `reconcile_training_behavior()`'s decision ("resume"/"established"/"restarted"), or None
+    #: when the run was already finished before that decision was needed.
+    training_behavior: Optional[Dict[str, Any]] = None
+
+
+def _sealed_stop(checkpoint_dir, max_epochs):
+    """`(epoch, reason)` if the last sealed generation already satisfies a stop condition, else
+    None -- read from its state.json only, without restoring anything. Closes the crash window
+    between sealing that generation and writing stop_decision.json."""
+    generation_dir = ckpt.find_resumable_generation(checkpoint_dir, verbose=False)
+    if generation_dir is None:
+        return None
+    state = ckpt.read_state(generation_dir)
+    early_stopping = state.early_stopping or {}
+    wait, patience = early_stopping.get("wait"), early_stopping.get("patience")
+    if wait is not None and patience is not None and wait >= patience:
+        return state.completed_epoch, "early_stopping"
+    if state.completed_epoch >= max_epochs:
+        return state.completed_epoch, "epoch_cap"
+    return None
 
 
 def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
@@ -790,6 +1136,26 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
                       "finished; no further epoch will be trained.")
             return TrainRunOutcome(existing_stop["epoch"], True, existing_stop["stop_reason"], 0)
 
+        # A run whose last sealed generation already reached its stop condition is finished --
+        # decided before any fingerprint comparison or restore, so a completed run is never
+        # restarted and never has weights loaded here.
+        sealed_stop = _sealed_stop(os.path.join(run_dir_path, "checkpoints"), max_epochs)
+        if sealed_stop is not None:
+            write_stop_decision(run_dir_path, sealed_stop[0], sealed_stop[1])
+            return TrainRunOutcome(sealed_stop[0], True, sealed_stop[1], 0)
+
+        # Resume only under the SAME training behaviour. Decided before the Trainer is built and
+        # before any weight/optimizer restore: a changed fingerprint moves this unfinished run's
+        # trajectory aside, so resolve_initial_epoch() below finds nothing and training starts at
+        # epoch 0 from the model exactly as build_arm_model() produced it.
+        behavior = training_behavior_fingerprint(
+            arm, run_seed, train_entries, val_entries, batch_size=batch_size, max_epochs=max_epochs,
+            early_stopping_patience=early_stopping_patience, reduce_lr_patience=reduce_lr_patience,
+            reduce_lr_factor=reduce_lr_factor, min_lr=min_lr, monitor=monitor, mode=mode,
+            mixed_precision=mixed_precision)
+        behavior_decision = reconcile_training_behavior(
+            run_dir_path, behavior, _current_git_commit(repo_dir), verbose=verbose)
+
         config = TrainingConfig(
             run_dir=run_dir_path, epochs=max_epochs, monitor=monitor, mode=mode,
             mixed_precision=mixed_precision,
@@ -812,26 +1178,7 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
 
         if initial_epoch >= max_epochs:
             write_stop_decision(run_dir_path, initial_epoch, "epoch_cap")
-            return TrainRunOutcome(initial_epoch, True, "epoch_cap", 0)
-
-        # Second, independent stop check -- reads the last SEALED generation's own state.json
-        # directly, never relying on stop_decision.json alone. This closes a narrow crash window:
-        # `ckpt.save_generation()` can succeed (the generation is fully sealed on Drive, including
-        # its `early_stopping` counters) an instant before this function would otherwise reach
-        # `write_stop_decision()` a few lines below -- a crash exactly there would leave a sealed
-        # generation whose OWN state already satisfies `wait >= patience`, with no
-        # stop_decision.json yet written. Without this check, a resumed session would then train
-        # one unwanted extra epoch before EarlyStopping had a chance to re-fire (requirement:
-        # "an early-stopped run must not train an extra epoch after resume").
-        if initial_epoch > 0:
-            _last_generation_dir = ckpt.find_resumable_generation(config.checkpoint_dir, verbose=False)
-            if _last_generation_dir is not None:
-                _last_state = ckpt.read_state(_last_generation_dir)
-                _es = _last_state.early_stopping or {}
-                _wait, _patience = _es.get("wait"), _es.get("patience")
-                if _wait is not None and _patience is not None and _wait >= _patience:
-                    write_stop_decision(run_dir_path, initial_epoch, "early_stopping")
-                    return TrainRunOutcome(initial_epoch, True, "early_stopping", 0)
+            return TrainRunOutcome(initial_epoch, True, "epoch_cap", 0, behavior_decision)
 
         early_stopping_cb = next(c for c in trainer.callbacks
                                  if isinstance(c, tf.keras.callbacks.EarlyStopping))
@@ -888,7 +1235,8 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
             if session_epoch_budget is not None and epochs_trained_this_call >= session_epoch_budget:
                 break
 
-        return TrainRunOutcome(completed_epoch, stopped, stop_reason, epochs_trained_this_call)
+        return TrainRunOutcome(completed_epoch, stopped, stop_reason, epochs_trained_this_call,
+                               behavior_decision)
     finally:
         release_lock(run_dir_path, owner_id=owner_id)
 

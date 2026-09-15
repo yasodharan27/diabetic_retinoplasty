@@ -80,6 +80,22 @@ resumed session never trains one epoch past a sealed EarlyStopping/epoch-cap dec
 immutable `run_manifest.json` per run, and a lightweight heartbeat lock so two runtimes cannot
 train the same run at once without an explicit override.
 
+**Resume compatibility: training-behaviour fingerprint, not git commit.** The experiment may span
+several repository commits. A run's persisted checkpoints are resumed only under the same
+*training behaviour*: `multiseed_runs.training_behavior_fingerprint()` hashes (canonical JSON,
+SHA-256) the run configuration (arm, seed, split, class weights, loss, optimiser, weight decay and
+its exclusions, LR schedule, batch size, epoch cap, early stopping, monitor, precision), the exact
+train/validation membership, and the normalised source (comments and docstrings removed) of the
+code that determines fitting — the architecture and matched initialisation, weighted CORN loss and
+QWK metric, callbacks, and the cache-first sample construction, augmentation and epoch ordering
+(`TRAINING_BEHAVIOR_SOURCES`). Infrastructure, documentation, notebook, cache-staging and
+evaluation code are excluded. The active fingerprint, its components, and every git-commit or
+restart event are recorded per run in `training_behavior.json`. Same fingerprint → resume, whatever
+the commit. Changed (or missing) fingerprint on an unfinished run with saved state → its
+checkpoints, BEST, history, logs and evaluation are moved to `superseded/restart_NNN/` (never
+deleted) and the run restarts from epoch 0 with no old weights, optimiser state or history.
+Completed runs are never restarted.
+
 ## 6. Per-run results
 
 *Filled in from each run's `evaluation/metrics_{best,last}.json` and `history/epoch_*.json` once
