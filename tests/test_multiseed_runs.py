@@ -397,8 +397,7 @@ class TrainRunResumeIntegrationTests(TempDirTestCase):
         kwargs = dict(
             model=model, run_dir_path=self.run_dir, arm="RACAF", run_seed=42,
             train_entries=[("a", 0), ("b", 1)], val_entries=[("c", 2)],
-            image_dir="x", cache_dir="x", racaf_cache_dir="x", vessel_model=None, stage4_model=None,
-            config_hash_value="testhash", batch_size=2, max_epochs=5,
+            cache_dir="x", racaf_cache_dir="x", config_hash_value="testhash", batch_size=2, max_epochs=5,
             early_stopping_patience=100, reduce_lr_patience=100, staging_dir=self.staging_dir,
             precision_check="off", mixed_precision=False, verbose=0,
         )

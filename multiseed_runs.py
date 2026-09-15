@@ -89,7 +89,6 @@ import tensorflow as tf
 
 import corn
 import downstream_split
-import joint_training_dataset as jtd
 import joint_training_model as jtm
 import no_racaf_model
 import weighted_corn
@@ -100,7 +99,6 @@ from training import (
 )
 from training import checkpointing as ckpt
 from training.trainer import precision_is_consistent
-from vessel_segmentation_inference import EmptyFieldOfViewError
 
 # =====================================================================================
 # 1. Fixed protocol constants -- the pre-registered configuration, not free parameters.
@@ -756,13 +754,10 @@ class TrainRunOutcome:
 
 
 def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
-             image_dir, cache_dir, racaf_cache_dir, vessel_model, stage4_model,
-             config_hash_value, batch_size=BATCH_SIZE, max_epochs=MAX_EPOCHS,
-             early_stopping_patience=EARLY_STOPPING_PATIENCE,
+             cache_dir, racaf_cache_dir, config_hash_value, batch_size=BATCH_SIZE,
+             max_epochs=MAX_EPOCHS, early_stopping_patience=EARLY_STOPPING_PATIENCE,
              reduce_lr_patience=REDUCE_LR_PATIENCE, reduce_lr_factor=REDUCE_LR_FACTOR,
              min_lr=MIN_LR, monitor=MONITOR_METRIC, mode=MONITOR_MODE,
-             processed_dir=jtd.DEFAULT_PROCESSED_DIR, persistent_cache_dir=None,
-             persistent_racaf_cache_dir=None, rgb_cache_dir=None,
              staging_dir="/content/checkpoint_staging", repo_dir=None,
              precision_check="error", mixed_precision=True,
              session_epoch_budget=None, owner_id=OWNER_ID, verbose=1):
@@ -776,7 +771,12 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
     this function does not build or seed the model itself, so a caller resuming a later session
     must rebuild it identically first (`build_arm_model` is itself deterministic given the same
     seed, so this is safe; the OPTIMIZER's actual values are then overwritten by the restored
-    checkpoint, only its structure/type need match)."""
+    checkpoint, only its structure/type need match).
+
+    `train_entries`/`val_entries` must already be cached locally under `cache_dir`/
+    `racaf_cache_dir` (`improved_training_data.locally_cached_entries()`, after the notebook's
+    one-time `complete_local_cache()`): every epoch reads that local cache only, so neither a
+    fresh run nor a resumed one ever runs Stage 02-04 or reads a raw image."""
     ensure_run_dir(run_dir_path)   # idempotent -- also protects a direct caller (e.g. a test) that
                                    # skips initialize_run() from Trainer.prepare()'s
                                    # assert_resume_location(), which requires checkpoints/ to exist.
@@ -839,11 +839,8 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
                                    if isinstance(c, TrainingStateCheckpoint))
 
         val_ds = itd.make_epoch_dataset(
-            val_entries, epoch=0, run_seed=run_seed, image_dir=image_dir, cache_dir=cache_dir,
-            racaf_cache_dir=racaf_cache_dir, vessel_model=vessel_model, stage4_model=stage4_model,
-            batch_size=batch_size, augment=False, processed_dir=processed_dir,
-            persistent_cache_dir=persistent_cache_dir,
-            persistent_racaf_cache_dir=persistent_racaf_cache_dir, rgb_cache_dir=rgb_cache_dir,
+            val_entries, epoch=0, run_seed=run_seed, cache_dir=cache_dir,
+            racaf_cache_dir=racaf_cache_dir, batch_size=batch_size, augment=False,
         )
 
         completed_epoch = initial_epoch
@@ -853,11 +850,8 @@ def train_run(model, run_dir_path, arm, run_seed, train_entries, val_entries,
         for epoch in range(initial_epoch, max_epochs):
             heartbeat_lock(run_dir_path, owner_id=owner_id)
             train_ds = itd.make_epoch_dataset(
-                train_entries, epoch=epoch, run_seed=run_seed, image_dir=image_dir,
-                cache_dir=cache_dir, racaf_cache_dir=racaf_cache_dir, vessel_model=vessel_model,
-                stage4_model=stage4_model, batch_size=batch_size, augment=True,
-                processed_dir=processed_dir, persistent_cache_dir=persistent_cache_dir,
-                persistent_racaf_cache_dir=persistent_racaf_cache_dir, rgb_cache_dir=rgb_cache_dir,
+                train_entries, epoch=epoch, run_seed=run_seed, cache_dir=cache_dir,
+                racaf_cache_dir=racaf_cache_dir, batch_size=batch_size, augment=True,
             )
             model.fit(train_ds, validation_data=val_ds, epochs=epoch + 1, initial_epoch=epoch,
                      callbacks=trainer.callbacks, verbose=verbose)
@@ -939,15 +933,12 @@ def experiment_status_table(experiments_root, experiment_id):
 #     own schema), for direct compatibility with the existing duplicate-audit tooling.
 # =====================================================================================
 
-def evaluate_arm_from_disk(model, entries, image_dir, cache_dir, racaf_cache_dir,
-                           vessel_model, stage4_model, processed_dir=jtd.DEFAULT_PROCESSED_DIR,
-                           persistent_cache_dir=None, persistent_racaf_cache_dir=None,
-                           rgb_cache_dir=None, batch_size=8):
+def evaluate_arm_from_disk(model, entries, cache_dir, racaf_cache_dir, batch_size=8):
     """Runs `model` (already loaded from disk by the caller) over `entries` deterministically
-    (no augmentation, manifest order), building each sample directly via `joint_training_dataset.
-    _build_joint_sample()` -- one at a time, batched only for `model.predict_on_batch()` -- so
-    each row can be tied back to its `image_id`, which `joint_training_dataset`'s own `tf.data`
-    output signature does not carry."""
+    (no augmentation, manifest order), building each sample from the LOCAL cache via
+    `improved_training_data.load_cached_sample()` -- one at a time, batched only for
+    `model.predict_on_batch()` -- so each row can be tied back to its `image_id`, which a
+    `tf.data` output signature does not carry. `entries` must already be cached locally."""
     ids, grades, s5, s6, rel = [], [], [], [], []
     all_logits, all_true, all_ids = [], [], []
 
@@ -961,15 +952,7 @@ def evaluate_arm_from_disk(model, entries, image_dir, cache_dir, racaf_cache_dir
         ids.clear(); grades.clear(); s5.clear(); s6.clear(); rel.clear()
 
     for id_code, diagnosis in entries:
-        try:
-            sample = jtd._build_joint_sample(
-                id_code, diagnosis, image_dir, cache_dir, racaf_cache_dir, vessel_model,
-                stage4_model, False, None, processed_dir=processed_dir,
-                persistent_cache_dir=persistent_cache_dir,
-                persistent_racaf_cache_dir=persistent_racaf_cache_dir, rgb_cache_dir=rgb_cache_dir,
-            )
-        except EmptyFieldOfViewError:
-            continue
+        sample = itd.load_cached_sample(id_code, diagnosis, cache_dir, racaf_cache_dir, False, None)
         ids.append(id_code)
         grades.append(int(diagnosis))
         s5.append(sample["stage5_input"])

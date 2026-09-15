@@ -47,7 +47,18 @@ Identical to every prior experiment in this project: APTOS2019, the committed
 Split file SHA-256 (LF-normalised): `bc80fd450340b09307fbd80a1b00553e70e34d64a3cdf94635162b6c1e99aca5`.
 Exact per-epoch training/validation yield (after empty-field-of-view exclusion, derived from the
 real, already-warm cache — never guessed) is pinned once in `experiment_manifest.json` at
-experiment creation and re-verified, cheaply, at the start of every session.
+experiment creation, together with the excluded empty-field-of-view ids, and re-verified at the
+start of every training/evaluation session.
+
+**Data path (cache-first, as in the finalized runs).** Training and evaluation read only the
+extracted Stage 02/03/04/RACAF cache: the Drive `cache_archive/` shards are extracted to local SSD
+once per runtime and shared by both arms and all three seeds. No raw image is read and no
+Stage 02–04 inference runs during training or resume. Augmentation (A) is applied to the cached
+8-channel Stage 05 tensor — the same representation the finalized runs augmented. The
+empty-field-of-view images, which have no cached representation, are excluded up front rather
+than rediscovered by Stage 03 every epoch; the evaluated population is unchanged. A genuinely
+missing cache entry would be generated once, by the existing Phase 1 generator, and persisted to
+Drive (`improved_training_data.complete_local_cache()`).
 
 ## 4. Seeds
 
