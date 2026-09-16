@@ -1293,7 +1293,17 @@ def evaluate_arm_from_disk(model, entries, cache_dir, racaf_cache_dir, batch_siz
     def flush():
         if not ids:
             return
-        logits = model.predict_on_batch([np.stack(s5), np.stack(s6), np.stack(rel)])
+        # `reliability` is fed as (N, 1), matching the model's own `Input(shape=(1,))`. It must NOT
+        # be the rank-1 (N,) that `np.stack` of per-sample scalars produces: `build_arm_model()`
+        # already traces this model's predict function with rank-2 (2, 1) probes for the NO_RACAF
+        # arm (`no_racaf_model.verify_no_racaf_model()`), and calling it afterwards with a
+        # different RANK makes TensorFlow relax the traced signature to an unknown TensorShape --
+        # after which the first static-shape-dependent op (e.g. Swin's window reshapes) fails with
+        # "as_list() is not defined on an unknown TensorShape". Keras adjusts either rank to the
+        # declared input spec, so this changes no predicted value (verified bit-identical).
+        logits = model.predict_on_batch(
+            [np.stack(s5), np.stack(s6), np.stack(rel).reshape(-1, 1)]
+        )
         all_logits.append(np.asarray(logits, dtype=np.float64))
         all_true.extend(grades)
         all_ids.extend(ids)

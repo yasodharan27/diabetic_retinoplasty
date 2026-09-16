@@ -16,6 +16,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 import numpy as np
 import tensorflow as tf
 
+import corn
 import multiseed_runs as msr
 from training import checkpointing as ckpt
 
@@ -658,6 +659,85 @@ class TrainingBehaviorFingerprintTests(TempDirTestCase):
             "NO_RACAF", 42, *self.ENTRIES, repo_root=self.tmp)["training_behavior_hash"])
         self.assertNotEqual(base, self._fingerprint(
             entries=(self.ENTRIES[0][:2], self.ENTRIES[1]))["training_behavior_hash"])
+
+
+class _StaticShapeConsumer(tf.keras.layers.Layer):
+    """Stands in for Swin's window reshapes (`swin_transformer.py:323` reads `x.shape[1]`/`[2]`):
+    it consumes a STATIC shape, so it raises "as_list() is not defined on an unknown TensorShape"
+    if the traced predict signature was relaxed by a rank change."""
+
+    def call(self, x):
+        dims = x.shape.as_list()
+        return tf.reshape(x, (-1, dims[1]))
+
+
+def _tiny_eval_model(arm):
+    """A tiny model with the SAME reliability contract as the real arms: `Input(shape=(1,))`,
+    consumed by the real `InertReliabilityConnection` (NO_RACAF) or by a `Dense` gate (RACAF's
+    `reliability_gate`)."""
+    import no_racaf_model as nrm
+
+    stage5 = tf.keras.Input(shape=(4,), name="stage5_input")
+    stage6 = tf.keras.Input(shape=(2,), name="stage6_input")
+    reliability = tf.keras.Input(shape=(1,), name="reliability")
+    merged = tf.keras.layers.Concatenate()([_StaticShapeConsumer()(stage5), stage6])
+    logits = tf.keras.layers.Dense(corn.NUM_THRESHOLDS, name="corn_logits")(merged)
+    if arm == "NO_RACAF":
+        outputs = nrm.InertReliabilityConnection(name="no_racaf_inert_reliability")(
+            [logits, reliability])
+    else:
+        gate = tf.keras.layers.Dense(1, activation="sigmoid", name="reliability_gate")(reliability)
+        outputs = tf.keras.layers.Multiply()([logits, gate])
+    return tf.keras.Model([stage5, stage6, reliability], outputs, name=f"tiny_{arm.lower()}")
+
+
+def _fake_cached_sample(id_code, diagnosis, cache_dir, racaf_cache_dir, augment, rng,
+                        image_size=None):
+    value = float(int(id_code[-1]))
+    return {"image_id": id_code, "stage5_input": np.full((4,), value, np.float32),
+            "stage6_input": np.full((2,), value, np.float32),
+            "reliability": np.float32(0.25 * value), "grade": int(diagnosis)}
+
+
+class EvaluationReliabilityRankTests(unittest.TestCase):
+    """Regression for the NO-RACAF evaluation crash: `evaluate_arm_from_disk()` must feed
+    `reliability` with the rank the model's `Input(shape=(1,))` declares.
+
+    `build_arm_model()` traces the NO_RACAF model's predict function with rank-2 `(2, 1)` probes
+    (`no_racaf_model.verify_no_racaf_model()`); evaluating afterwards with the rank-1 `(N,)` that
+    `np.stack` of per-sample scalars produces relaxed the traced signature to an unknown
+    TensorShape and crashed with "as_list() is not defined on an unknown TensorShape". With the
+    old `np.stack(rel)` this test fails (the NO_RACAF case raises; both cases see shape `(N,)`)."""
+
+    def _evaluate(self, arm, verification_probes):
+        model = _tiny_eval_model(arm)
+        if verification_probes:
+            # Exactly what verify_no_racaf_model() does at build time: rank-2 (B, 1) reliability.
+            probe5, probe6 = np.zeros((2, 4), np.float32), np.zeros((2, 2), np.float32)
+            model.predict_on_batch([probe5, probe6, np.zeros((2, 1), np.float32)])
+            model.predict_on_batch([probe5, probe6, np.ones((2, 1), np.float32)])
+
+        entries = [(f"id{i}", i % 5) for i in range(5)]
+        with mock.patch("improved_training_data.load_cached_sample",
+                        side_effect=_fake_cached_sample), \
+             mock.patch.object(model, "predict_on_batch", wraps=model.predict_on_batch) as spy:
+            rows = msr.evaluate_arm_from_disk(model, entries, "cache", "racaf_cache", batch_size=2)
+        reliability_shapes = [np.asarray(call.args[0][2]).shape for call in spy.call_args_list]
+        return rows, reliability_shapes
+
+    def test_no_racaf_evaluation_succeeds_after_the_rank_2_verification_probes(self):
+        rows, reliability_shapes = self._evaluate("NO_RACAF", verification_probes=True)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([shape[0] for shape in reliability_shapes], [2, 2, 1])  # batched 2/2/1
+        for shape in reliability_shapes:
+            self.assertEqual(len(shape), 2, f"reliability must be rank 2, got {shape}")
+            self.assertEqual(shape[1], 1, f"reliability must be (N, 1), got {shape}")
+
+    def test_racaf_evaluation_still_works_and_uses_the_same_rank(self):
+        rows, reliability_shapes = self._evaluate("RACAF", verification_probes=False)
+        self.assertEqual(len(rows), 5)
+        for shape in reliability_shapes:
+            self.assertEqual(shape[1:], (1,), f"reliability must be (N, 1), got {shape}")
 
 
 class BuildOptimizerTests(unittest.TestCase):
