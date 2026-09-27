@@ -12,7 +12,7 @@
 - `colab/notebooks/stage08_icdr_two_route_head.ipynb`: the Colab execution interface. It freezes the
   pre-registration, re-runs the test suite on the runtime, resumes per-seed E extraction after a
   disconnect, and prints the full report with a detailed analysis appendix. The run is single-use.
-- `tests/test_icdr_two_route_head.py`: 33 tests.
+- `tests/test_icdr_two_route_head.py`: 36 tests.
 
 **Naming.** The files are called `icdr_two_route_*` because `racaf_c1_control_model.py` already
 uses "C1" for the unrelated RACAF gate control.
@@ -74,12 +74,20 @@ has exactly 1,028 trainable parameters.
 
 ## 6. Training population and fitting
 
-- **Training population.** Only the authoritative APTOS training split: 2,929 images
-  (1444/296/799/154/236), split sha256 `bc80fd45…`, cached population checked against the
-  six-run pin.
-  - H1: all 2,929.
-  - H2 PDR route: all 2,929.
-  - H2 NPDR route: grades 0–3 only, **2,693**. Grade-4 images give no NPDR supervision.
+- **Training population.** Only the authoritative APTOS training split: 2,929 split entries
+  (1444/296/799/154/236), split sha256 `bc80fd45…`.
+  - As cached, the split excludes the empty field-of-view images that have no cached
+    representation: 11 over the whole split, 3 of them in validation (733 → 730). The images the
+    frozen backbones were trained on are the split minus these pinned ids. The run takes that
+    population from the six-run manifest (`n_train_yielded`, `empty_fov_ids`) rather than from a
+    hard-coded number, and stops on any other mismatch.
+  - H1: all cached training images.
+  - H2 PDR route: all cached training images.
+  - H2 NPDR route: the grade 0–3 cached training images only. Grade-4 images give no NPDR
+    supervision.
+  - The exact counts are printed and recorded by the run.
+- **Correction.** An earlier draft of this report stated 2,929 / 2,693. Those are split counts,
+  not the cached population. This was corrected before any data were touched.
 - **One shared fitter for every binary task of both heads.**
   - L2-regularised, class-weighted logistic regression.
   - Loss = Σ wᵢ·BCEᵢ / n_task + (L2/2)·‖β‖², with the bias unpenalised.

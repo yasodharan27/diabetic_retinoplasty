@@ -134,7 +134,7 @@ class Grade4ExclusionTests(unittest.TestCase):  # F
                          int((g <= 3).sum()))
         self.assertNotIn(4, base.task_info["npdr_task_0"]["grades_in_task"])
 
-    def test_route_population_counts_on_the_real_training_distribution(self):
+    def test_route_population_counts_on_the_split_grade_distribution(self):
         g = np.concatenate([np.full(n, k) for k, n in enumerate((1444, 296, 799, 154, 236))])
         tasks = dict((n, m) for n, m, _ in th.h2_tasks(g))
         self.assertEqual(int(tasks["pdr_route"].sum()), 2929)
@@ -180,6 +180,15 @@ class InputParityAndFitterTests(unittest.TestCase):  # G + fitter correctness
         for fitted in (th.fit_h1_corn_refit(e, g), th.fit_h2_two_route(e, g)):
             keras_logits = th.to_keras(fitted).predict(e, verbose=0)
             np.testing.assert_allclose(keras_logits, fitted.logits(e), atol=1e-3)
+
+    def test_convergence_record_reports_scipy_status_and_gradient(self):
+        rng = np.random.default_rng(9)
+        x = rng.normal(size=(200, 5))
+        y = (x[:, 0] > 0).astype(float)
+        _, _, info = th.fit_weighted_logistic(x, y, np.ones(200))
+        self.assertIn("scipy_success", info)
+        self.assertTrue(info["converged"])
+        self.assertLessEqual(info["final_grad_max_abs"], th.CONVERGED_GRAD_TOL)
 
     def test_tasks_need_both_classes(self):
         with self.assertRaises(ValueError):
@@ -355,8 +364,63 @@ class ResumeAndPersistenceTests(unittest.TestCase):
             self.assertIn("source_sha256", stored)
             stored["fitting"]["l2"] = 1e-3
             json.dump(stored, open(path, "w"))
+            open(os.path.join(out_dir, "E_seed_42.npz"), "wb").close()   # data already touched
             with self.assertRaises(RuntimeError):
                 exp.freeze_or_verify_preregistration(out_dir, self.REPO_ROOT, "c3")
+
+    def test_preregistration_is_refrozen_only_before_any_data_contact(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as out_dir:
+            exp.freeze_or_verify_preregistration(out_dir, self.REPO_ROOT, "c1")
+            path = os.path.join(out_dir, exp.PREREGISTRATION_FILENAME)
+            stored = json.load(open(path))
+            stored["source_sha256"]["icdr_two_route_head.py"] = "0" * 64   # an older code version
+            json.dump(stored, open(path, "w"))
+            open(os.path.join(out_dir, "run_status.json"), "w").close()     # not a data artifact
+            new, how = exp.freeze_or_verify_preregistration(out_dir, self.REPO_ROOT, "c2")
+            self.assertIn("re-frozen", how)
+            self.assertEqual(new["supersedes"][0]["changed_keys"], ["source_sha256"])
+            self.assertTrue(os.path.exists(os.path.join(out_dir, new["supersedes"][0]["file"])))
+            _, how = exp.freeze_or_verify_preregistration(out_dir, self.REPO_ROOT, "c3")
+            self.assertEqual(how, "verified")
+            self.assertEqual(exp.data_artifacts(out_dir), [])
+
+    def test_population_pin_uses_the_six_run_manifest_including_empty_fov_exclusions(self):
+        """The cached population is the split minus the pinned empty-FOV ids (8 train + 3
+        validation on the real data) -- it must pass, and any other mismatch must stop."""
+        import json
+        import tempfile
+        import types
+        counts = exp.SPLIT_TRAIN_COUNTS
+        train = [(f"t{g}_{i}", g) for g, n in enumerate(counts) for i in range(n)]
+        val = [(f"v{i}", i % 5) for i in range(733)]
+        empty = [train[i][0] for i in (0, 1, 2, 3, 1500, 1501, 1800, 1900)] + ["v0", "v1", "v2"]
+        fake_msr = types.SimpleNamespace(EXPECTED_SPLIT_SHA256="abc",
+                                         verify_split=lambda: (train, val, "abc"))
+        fake_itd = types.SimpleNamespace(
+            locally_cached_entries=lambda entries, *a: [e for e in entries if e[0] not in empty])
+        original = exp.ensure_local_cache
+        exp.ensure_local_cache = lambda config: "already_extracted"
+        try:
+            with tempfile.TemporaryDirectory() as six:
+                manifest = os.path.join(six, "experiment_manifest.json")
+                json.dump({"n_train_yielded": 2921, "n_val_yielded": 730, "empty_fov_ids": empty},
+                          open(manifest, "w"))
+                data = exp.prepare_population(None, fake_itd, fake_msr, six)
+                self.assertEqual(data["population"]["n_train"], 2921)
+                self.assertEqual(len(data["population"]["excluded_empty_fov_train"]), 8)
+                self.assertEqual(data["population"]["n_val"], 730)
+                json.dump({"n_train_yielded": 2929, "n_val_yielded": 730, "empty_fov_ids": empty},
+                          open(manifest, "w"))
+                with self.assertRaises(RuntimeError):
+                    exp.prepare_population(None, fake_itd, fake_msr, six)
+                json.dump({"n_train_yielded": 2921, "n_val_yielded": 730,
+                           "empty_fov_ids": empty[1:]}, open(manifest, "w"))
+                with self.assertRaises(RuntimeError):                 # unexplained exclusion
+                    exp.prepare_population(None, fake_itd, fake_msr, six)
+        finally:
+            exp.ensure_local_cache = original
 
     def test_embedding_status_from_disk(self):
         import tempfile

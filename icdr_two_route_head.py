@@ -74,6 +74,9 @@ PDR_DECISION_THRESHOLD = 0.5
 LBFGS_MAXITER = 20000
 LBFGS_GTOL = 1e-9
 LBFGS_FTOL = 1e-15
+#: A fit also counts as converged if scipy stops for a line-search reason while the objective's
+#: gradient is already at the optimum (max |grad| <= this). Numerical only: the optimum is unique.
+CONVERGED_GRAD_TOL = 1e-6
 SD_FLOOR = 1e-12
 
 #: Expected trainable-parameter count of BOTH heads: 256 * 4 + 4.
@@ -94,7 +97,8 @@ def fitting_configuration():
         "class_weight_policy": "weighted_corn.PREREGISTERED_CLASS_WEIGHTS (sqrt inverse "
                                "frequency, training counts 1444/296/799/154/236)",
         "standardisation": "training-split mean/SD only; folded into Dense kernel/bias",
-        "lbfgs": {"maxiter": LBFGS_MAXITER, "gtol": LBFGS_GTOL, "ftol": LBFGS_FTOL},
+        "lbfgs": {"maxiter": LBFGS_MAXITER, "gtol": LBFGS_GTOL, "ftol": LBFGS_FTOL,
+                  "converged_grad_tol": CONVERGED_GRAD_TOL},
         "pdr_decision_threshold": PDR_DECISION_THRESHOLD,
         "expected_head_parameters": EXPECTED_HEAD_PARAMETERS,
     }
@@ -169,9 +173,11 @@ def fit_weighted_logistic(x, y, w, l2=L2):
                       options={"maxiter": LBFGS_MAXITER, "gtol": LBFGS_GTOL,
                                "ftol": LBFGS_FTOL, "maxfun": LBFGS_MAXITER * 2})
     _, grad = objective(result.x)
-    info = {"converged": bool(result.success), "message": str(result.message),
+    grad_max = float(np.max(np.abs(grad)))
+    info = {"converged": bool(result.success or grad_max <= CONVERGED_GRAD_TOL),
+            "scipy_success": bool(result.success), "message": str(result.message),
             "iterations": int(result.nit), "final_objective": float(result.fun),
-            "final_grad_max_abs": float(np.max(np.abs(grad))), "n": int(n),
+            "final_grad_max_abs": grad_max, "n": int(n),
             "n_positive": int(y.sum())}
     return result.x[:d].copy(), float(result.x[d]), info
 

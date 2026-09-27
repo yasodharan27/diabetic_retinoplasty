@@ -53,10 +53,13 @@ NOT_SUPPORTIVE_MIN_NONPOSITIVE = 2
 GUARDRAILS = {"grade3_recall": ("min", -0.10), "auroc_ge3_g3_vs_g012": ("min", -0.03),
               "qwk": ("min", -0.02), "false_urgent_rate": ("max", 0.02)}
 
-EXPECTED_TRAIN_COUNTS = (1444, 296, 799, 154, 236)   # 2,929 -- weighted_corn pin
-EXPECTED_N_TRAIN = 2929
-EXPECTED_N_NPDR_ROUTE = 2693
-EXPECTED_N_VAL = 730
+# Population. The authoritative split has 2,929 train / 733 validation entries; the population
+# the frozen backbones were trained and evaluated on is that split MINUS the images with no cached
+# representation (empty field of view: 11 over the whole split, 3 of them in validation). That
+# yielded population is pinned in the six-run experiment manifest (`n_train_yielded`,
+# `n_val_yielded`, `empty_fov_ids`) and is what C1 uses -- it is never hard-coded here.
+SPLIT_TRAIN_COUNTS = (1444, 296, 799, 154, 236)      # split counts (weighted_corn pin, 2,929)
+EXPECTED_N_VAL = 730                                 # 733 minus the 3 pinned empty-FOV ids
 EXPECTED_PERSISTENT_FAILURES = 21                    # research record §15
 PARITY_LOGIT_TOLERANCE = 0.05                        # Phase-0 tolerance (mixed_float16)
 INFERENCE_BATCH = 8
@@ -81,10 +84,13 @@ def preregistration():
                   "H2": "two-route: PDR Dense(256->1) + NPDR CORN Dense(256->3) over grades 0-3 "
                         "(treatment); grade 4 excluded from NPDR supervision"},
         "fitting": th.fitting_configuration(),
-        "training_population": {"split": "authoritative APTOS train split", "n": EXPECTED_N_TRAIN,
-                                "grade_counts": list(EXPECTED_TRAIN_COUNTS),
-                                "npdr_route_n": EXPECTED_N_NPDR_ROUTE,
-                                "pdr_route_n": EXPECTED_N_TRAIN},
+        "training_population": {
+            "split": "authoritative APTOS train split (2,929 entries, grades "
+                     f"{list(SPLIT_TRAIN_COUNTS)}), as cached: minus the empty-field-of-view ids "
+                     "pinned in the six-run manifest; n = the manifest's n_train_yielded",
+            "h1_n": "all cached training images",
+            "pdr_route_n": "all cached training images",
+            "npdr_route_n": "cached training images of grades 0-3 (grade 4 excluded)"},
         "evaluation_population": {"split": "authoritative APTOS validation split",
                                   "n": EXPECTED_N_VAL, "used_for": "scoring once; never fitting"},
         "primary_endpoint": "per-seed Δ = AUROC(H2) − AUROC(H1), grade 4 vs grades 0–2, score = "
@@ -299,18 +305,24 @@ def run_analysis(results, embeddings, y_train, y_val, h0_by_seed, persistent, va
     h0_metrics = {}
     for seed in BACKBONE_SEEDS:
         e_train, e_val = embeddings[seed]
-        if strict:
-            assert e_train.shape[0] == EXPECTED_N_TRAIN and e_val.shape[0] == EXPECTED_N_VAL
+        if e_train.shape[0] != len(y_train) or e_val.shape[0] != len(y_val):
+            raise RuntimeError(f"seed {seed}: E rows do not match the population.")
+        if strict and len(y_val) != EXPECTED_N_VAL:
+            raise RuntimeError(f"validation n {len(y_val)} != {EXPECTED_N_VAL}")
         h1 = th.fit_h1_corn_refit(e_train, y_train)
         h2 = th.fit_h2_two_route(e_train, y_train)
         for fitted in (h1, h2):
             bad = {k: v for k, v in fitted.task_info.items() if not v["converged"]}
             if bad:
                 raise RuntimeError(f"seed {seed} {fitted.kind}: fit did not converge: {bad}")
-        if strict:
-            assert h2.task_info["pdr_route"]["n"] == EXPECTED_N_TRAIN
-            assert h2.task_info["npdr_task_0"]["n"] == EXPECTED_N_NPDR_ROUTE
-        assert 4 not in h2.task_info["npdr_task_0"]["grades_in_task"]
+        # routing invariants on the real fit: H1 and the PDR route use every training image;
+        # the NPDR route uses exactly the grade 0-3 images and never a grade-4 image.
+        if not (h1.task_info["corn_task_0"]["n"] == h2.task_info["pdr_route"]["n"] == len(y_train)
+                and h2.task_info["npdr_task_0"]["n"] == int(np.sum(np.asarray(y_train) <= 3))
+                and h1.task_info["corn_task_3"]["n"] == int(np.sum(np.asarray(y_train) >= 3))
+                and all(4 not in h2.task_info[f"npdr_task_{k}"]["grades_in_task"]
+                        for k in range(3))):
+            raise RuntimeError(f"seed {seed}: task routing invariant violated.")
         out1, out2 = h1.predict(e_val), h2.predict(e_val)
         h0 = h0_by_seed[seed]
         m0 = head_metrics(y_val, h0["predicted_grade"], h0["p_ge3"], h0["p_grade4"], persistent)
@@ -469,13 +481,37 @@ def freeze_or_verify_preregistration(out_dir, repo_dir, repo_commit):
         return stored, "written"
     with open(path) as fh:
         stored = json.load(fh)
-    comparable = {k: v for k, v in stored.items() if k not in PREREGISTRATION_SESSION_KEYS}
+    comparable = {k: v for k, v in stored.items()
+                  if k not in PREREGISTRATION_SESSION_KEYS + ("supersedes",)}
     if comparable != current:
         changed = sorted(k for k in set(comparable) | set(current)
                          if comparable.get(k) != current.get(k))
-        raise RuntimeError(f"The frozen pre-registration in {path} differs from the current code "
-                           f"in {changed}. The protocol cannot change mid-experiment.")
+        artifacts = data_artifacts(out_dir)
+        if artifacts:
+            raise RuntimeError(f"The frozen pre-registration in {path} differs from the current "
+                               f"code in {changed}, and data artifacts already exist "
+                               f"({artifacts[:5]}). The protocol cannot change mid-experiment.")
+        # No E has been extracted and nothing fitted or scored: the change happened before any
+        # contact with the data, so the pre-registration is re-frozen. The superseded file is kept.
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        superseded = f"PREREGISTRATION.superseded_{stamp}.json"
+        os.replace(path, posixpath.join(out_dir, superseded))
+        stored = dict(current, repo_commit=repo_commit,
+                      written=datetime.datetime.now().isoformat(timespec="seconds"),
+                      supersedes=list(stored.get("supersedes", [])) + [
+                          {"file": superseded, "changed_keys": changed}])
+        _atomic_json(path, stored)
+        return stored, (f"re-frozen before any data contact (changed {changed}; previous copy "
+                        f"kept as {superseded})")
     return stored, "verified"
+
+
+def data_artifacts(out_dir):
+    """Files that mean the experiment has touched data (E extracted, heads fitted or scored)."""
+    names = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+    return [n for n in names if n.startswith(("E_seed_", "backbone_seed_", "heads_seed_",
+                                              "per_seed_results", "per_sample_predictions",
+                                              "h2_minus_h1", REPORT_FILENAME, RESULTS_FILENAME))]
 
 
 def ensure_local_cache(config):
@@ -519,17 +555,37 @@ def prepare_population(config, itd, msr, six_run_dir):
     y_train = np.array([g for _, g in cached_train])
     y_val = np.array([g for _, g in cached_val])
     counts = tuple(int(c) for c in np.bincount(y_train, minlength=5))
-    population = {"split_sha256": split_sha, "n_train": len(cached_train),
-                  "n_val": len(cached_val), "train_grade_counts": list(counts),
+    split_counts = tuple(int(c) for c in np.bincount([int(g) for _, g in train_entries],
+                                                      minlength=5))
+    excluded_train = sorted({i for i, _ in train_entries} - set(train_ids))
+    excluded_val = sorted({i for i, _ in val_entries} - set(val_ids))
+    pinned_empty_fov = six_run_population.get("empty_fov_ids")
+    population = {"split_sha256": split_sha, "n_split_train": len(train_entries),
+                  "n_split_val": len(val_entries), "split_train_grade_counts": list(split_counts),
+                  "n_train": len(cached_train), "n_val": len(cached_val),
+                  "train_grade_counts": list(counts),
                   "val_grade_counts": np.bincount(y_val, minlength=5).tolist(),
-                  "six_run_pin": [six_run_population.get("n_train_yielded"),
-                                  six_run_population.get("n_val_yielded")],
+                  "excluded_empty_fov_train": excluded_train,
+                  "excluded_empty_fov_val": excluded_val,
+                  "six_run_pin": {"n_train_yielded": six_run_population.get("n_train_yielded"),
+                                  "n_val_yielded": six_run_population.get("n_val_yielded"),
+                                  "empty_fov_ids": pinned_empty_fov},
                   "train_val_overlap": len(set(train_ids) & set(val_ids))}
-    if (len(cached_train), len(cached_val)) != (EXPECTED_N_TRAIN, EXPECTED_N_VAL) \
-            or counts != EXPECTED_TRAIN_COUNTS or population["train_val_overlap"] != 0 \
-            or [len(cached_train), len(cached_val)] != [
-                int(six_run_population["n_train_yielded"]), int(six_run_population["n_val_yielded"])]:
-        raise RuntimeError(f"Population does not match the pre-registered pin: {population}")
+    problems = []
+    if split_counts != SPLIT_TRAIN_COUNTS:
+        problems.append(f"split train grade counts {split_counts} != {SPLIT_TRAIN_COUNTS}")
+    if [len(cached_train), len(cached_val)] != [int(six_run_population["n_train_yielded"]),
+                                                int(six_run_population["n_val_yielded"])]:
+        problems.append("cached population differs from the six-run manifest pin")
+    if len(cached_val) != EXPECTED_N_VAL:
+        problems.append(f"validation n {len(cached_val)} != {EXPECTED_N_VAL}")
+    if pinned_empty_fov is not None and not set(excluded_train + excluded_val) <= set(pinned_empty_fov):
+        problems.append("an excluded image is not one of the pinned empty-field-of-view ids")
+    if population["train_val_overlap"] != 0:
+        problems.append("train/validation overlap")
+    if problems:
+        raise RuntimeError(f"Population does not match the pre-registered pin ({problems}): "
+                           f"{population}")
     population["train_membership_sha256"] = hashlib.sha256(
         "\n".join(f"{i},{g}" for i, g in cached_train).encode("utf-8")).hexdigest()
     return {"cached_train": cached_train, "cached_val": cached_val, "train_ids": train_ids,
