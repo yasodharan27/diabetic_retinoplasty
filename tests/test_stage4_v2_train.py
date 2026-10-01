@@ -209,6 +209,36 @@ class SetupTests(unittest.TestCase):
             with self.assertRaises(s4.Stage4WeightsUnavailableError):
                 stage4_v2_setup.verify_encoder_weights(tmp, downloader=lambda *a: bad)
 
+    def test_cache_staging_survives_drive_drop_and_resumes(self):
+        import errno
+        from unittest import mock
+        import dataset_staging
+        with tempfile.TemporaryDirectory() as tmp:
+            drive, local = os.path.join(tmp, "drive"), os.path.join(tmp, "local")
+            _synthetic_cache(drive)
+            real_copy, calls, remounts = dataset_staging._copy_one, {"n": 0}, []
+
+            def flaky(src, dst, *a, **k):
+                calls["n"] += 1
+                if calls["n"] == 3:                      # the mount drops mid-copy, once
+                    raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+                return real_copy(src, dst, *a, **k)
+
+            with mock.patch.object(dataset_staging, "_copy_one", side_effect=flaky):
+                res = stage4_v2_setup.stage_training_cache(drive, local, remount=lambda: remounts.append(1),
+                                                           log=lambda *a: None)
+            self.assertEqual((res["copied"], res["skipped"], res["remounts"]), (8, 0, 1))
+            tc = data.TrainingCache(local, verify_files=True, require_complete=False)
+            self.assertEqual(len(tc.manifest["files"]), 8)
+            with open(os.path.join(drive, "manifest.json"), "rb") as a, open(os.path.join(local, "manifest.json"), "rb") as b:
+                self.assertEqual(a.read(), b.read())          # manifest copied byte-for-byte
+            again = stage4_v2_setup.stage_training_cache(drive, local, remount=lambda: None, log=lambda *a: None)
+            self.assertEqual((again["copied"], again["skipped"]), (0, 8))     # resume skips verified files
+            with open(os.path.join(local, "IDRiD__val__IDRiD_05.npz"), "ab") as fh:
+                fh.write(b"x")                                                # corrupt one local file
+            fixed = stage4_v2_setup.stage_training_cache(drive, local, remount=lambda: None, log=lambda *a: None)
+            self.assertEqual((fixed["copied"], fixed["skipped"]), (1, 7))
+
     def test_tjdr_env_points_at_drive_copy(self):
         class FakeColabConfig:
             DATASET_ROOT = "/content/drive/MyDrive/DiabeticRetinopathy/datasets"

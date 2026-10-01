@@ -60,6 +60,76 @@ def verify_datasets():
     return report
 
 
+def _remount_drive():
+    from google.colab import drive
+    import colab_config
+    drive.mount(colab_config.DRIVE_MOUNT_POINT, force_remount=True)
+
+
+def stage_training_cache(drive_dir, local_dir, max_remounts=6, remount=None, log=print):
+    """Copies the Stage-4 training cache from Drive to the local disk, robust to Drive FUSE drops
+    (`[Errno 107] Transport endpoint is not connected`):
+      * files listed in the Drive manifest are copied one by one (atomic temp + rename via
+        dataset_staging._copy_one, which also retries short hiccups);
+      * a local file whose SHA-256 already matches the manifest is skipped, so a rerun resumes;
+      * when the mount itself has dropped, Drive is remounted and the copy resumes
+        (up to `max_remounts` times);
+      * manifest.json is written LAST, so its presence means the copy finished.
+    Returns {"copied": n, "skipped": n, "remounts": n}."""
+    import json
+    import shutil
+    import dataset_staging
+    import stage34_cache_v2 as cache
+    remount = remount or _remount_drive
+    os.makedirs(local_dir, exist_ok=True)
+    remounts = 0
+    while True:
+        try:
+            with open(os.path.join(drive_dir, "manifest.json"), "rb") as fh:
+                manifest_bytes = fh.read()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            break
+        except OSError as exc:
+            if not dataset_staging._is_transient_os_error(exc) or remounts >= max_remounts:
+                raise
+            remounts += 1
+            log(f"  Drive dropped reading the manifest ({exc}); remount {remounts}/{max_remounts}")
+            remount()
+    names = sorted(manifest["files"])
+    copied = skipped = 0
+    i = 0
+    while i < len(names):
+        name = names[i]
+        dst = os.path.join(local_dir, name)
+        want = manifest["files"][name]["sha256"]
+        if os.path.exists(dst) and cache.sha256_file(dst) == want:
+            skipped += 1
+            i += 1
+            continue
+        try:
+            dataset_staging._copy_one(os.path.join(drive_dir, name), dst)
+        except OSError as exc:
+            if not dataset_staging._is_transient_os_error(exc) or remounts >= max_remounts:
+                raise
+            remounts += 1
+            log(f"  Drive dropped at {name} ({exc}); remount {remounts}/{max_remounts}, resuming")
+            remount()
+            continue
+        if cache.sha256_file(dst) != want:
+            os.remove(dst)
+            raise RuntimeError(f"{name}: copied file does not match the manifest SHA")
+        copied += 1
+        i += 1
+        if (copied + skipped) % 50 == 0:
+            log(f"  staged {copied + skipped}/{len(names)}")
+    tmp = os.path.join(local_dir, "manifest.json.tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(manifest_bytes)
+    shutil.move(tmp, os.path.join(local_dir, "manifest.json"))
+    log(f"  training cache staged: {copied} copied, {skipped} already present, {remounts} remounts")
+    return {"copied": copied, "skipped": skipped, "remounts": remounts}
+
+
 def setup_stage4_v2(fetch_weights=True):
     import setup as colab_setup
     info = colab_setup.setup()
