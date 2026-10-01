@@ -18,3 +18,9 @@ torchvision>=0.15.0
 # was removed in scikit-image 0.19, replaced by skimage.draw.disk.
 scikit-image>=0.19.0
 scipy>=1.10.0
+
+# Stage 4 v2 (research record §40) -- smp U-Net with the pinned ImageNet SE-ResNet-101 encoder
+# (fetched by stage4_v2.py from HF smp-hub at a fixed revision, SHA-256 verified). Pinned exactly:
+# the encoder registry / weight revision is part of the Stage-4 lineage. Pulls timm,
+# huggingface_hub and safetensors.
+segmentation-models-pytorch==0.5.0
