@@ -4,8 +4,8 @@
      requirements.txt (which pins segmentation-models-pytorch==0.5.0), and wires the dataset/cache env vars.
   2. TJDR_RAW_DIR / TJDR_PROCESSED_DIR -> the verified Drive copy (record §43).
   3. Verifies smp == 0.5.0 (installs exactly that version if not).
-  4. Downloads the pinned SE-ResNet-101 ImageNet weights (HF smp-hub, fixed revision) into a Drive cache
-     and verifies the exact size + SHA-256. On any failure it raises: there is no fallback encoder.
+  4. (training only) Downloads the pinned SE-ResNet-101 ImageNet weights (HF smp-hub, fixed revision) to
+     LOCAL disk and verifies the exact size + SHA-256. On any failure it raises: there is no fallback encoder.
   5. Verifies the TJDR raw copy (443/110 usable) and the IDRiD segmentation paths.
 """
 import os
@@ -173,8 +173,9 @@ def setup_stage4_v2(fetch_weights=True):
     info["tjdr_env"] = configure_tjdr_env(colab_config)
     info["smp"] = ensure_smp()
     if fetch_weights:
-        weights_dir = posixpath.join(colab_config.EXPORTED_MODELS_ROOT, "pretrained_weights", "smp_hub")
-        info["encoder_weights"] = verify_encoder_weights(weights_dir)
+        # Local disk only: Drive cannot hold the Hugging Face cache (no symlinks; FUSE copies fail with EIO).
+        # ~200 MB, a few seconds; the SHA/size check is what matters, not where it is cached.
+        info["encoder_weights"] = verify_encoder_weights("/content/hf_cache")
     info["datasets"] = verify_datasets()
     print("Stage-4 v2 setup complete:", {k: v for k, v in info.items() if k in ("tjdr_env", "smp", "datasets")})
     return info
