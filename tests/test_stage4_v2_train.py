@@ -172,11 +172,73 @@ class HashTests(unittest.TestCase):
         self.assertNotEqual(train.state_dict_sha256(sd), train.state_dict_sha256(changed))
 
     def test_legacy_checkpoint_hash_still_verifies(self):
-        sd = Toy().state_dict()
-        legacy = {"ema": sd, "model_weights_sha256": {"ema": train._legacy_serialized_sha256(sd, "cpu")}}
-        self.assertTrue(train.verify_ema_hash(legacy))
-        legacy["ema"] = {k: v + 1 for k, v in sd.items()}
-        self.assertFalse(train.verify_ema_hash(legacy))
+        """Faithful to checkpoints written before the content hash: the recorded value is sha256 of
+        torch.save(module.state_dict()) (an OrderedDict with _metadata), and verification happens after a
+        torch.save/torch.load round trip of the whole checkpoint."""
+        import io as _io
+        import hashlib
+        sd = s4.ModelEMA(Toy(), 0.999).module.state_dict()
+        raw = _io.BytesIO()
+        torch.save(sd, raw)
+        recorded = hashlib.sha256(raw.getvalue()).hexdigest()
+        buf = _io.BytesIO()
+        torch.save({"ema": sd, "model_weights_sha256": {"ema": recorded}}, buf)
+        buf.seek(0)
+        loaded = torch.load(buf, map_location="cpu", weights_only=False)
+        self.assertTrue(train.verify_ema_hash(loaded))
+        loaded["ema"]["decoder.bias"][0] += 1.0
+        self.assertFalse(train.verify_ema_hash(loaded))
+
+
+class ExportTests(unittest.TestCase):
+    def _checkpoint(self, tmp, recorded_ok, score_shift=0.0):
+        cdir, rdir = os.path.join(tmp, "cache"), os.path.join(tmp, "run")
+        _synthetic_cache(cdir)
+        torch.manual_seed(0)
+        model, _ = s4.build_stage4_model(v2cfg.STAGE4_V2A_CLASSES, pretrained=False)
+        sd = model.state_dict()
+        tc = data.TrainingCache(cdir, verify_files=False, require_complete=False)
+        score = train.validate(model, tc, "cpu", amp=False)["selection_score"]
+        rec = {"ema_content": train.state_dict_sha256(sd) if recorded_ok else "0" * 64}
+        os.makedirs(os.path.join(rdir, "checkpoints"))
+        torch.save({"ema": sd, "model_weights_sha256": rec, "best": {"score": score + score_shift, "step": 1000},
+                    "config": {}, "fingerprints": {}, "loss_weights": {}, "history": []},
+                   os.path.join(rdir, "checkpoints", "best_ema.pt"))
+        return cdir, rdir
+
+    def _export(self, tmp, rdir, cdir=None):
+        orig = data.TrainingCache.__init__
+
+        def lenient(self, directory, verify_files=True, require_complete=True):
+            orig(self, directory, verify_files, False)
+        data.TrainingCache.__init__ = lenient
+        try:
+            return train.export_best(rdir, export_root=os.path.join(tmp, "exported"), revalidate_cache_dir=cdir,
+                                     device="cpu")
+        finally:
+            data.TrainingCache.__init__ = orig
+
+    def test_hash_path_and_idempotence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir, rdir = self._checkpoint(tmp, recorded_ok=True)
+            rec = self._export(tmp, rdir)
+            self.assertEqual(rec["checkpoint_verification"]["method"], "hash")
+            self.assertEqual(s4.load_stage4_v2(rec["model_path"], expected_sha256=rec["model_sha256"],
+                                               classes=v2cfg.STAGE4_V2A_CLASSES).training, False)
+            self.assertEqual(self._export(tmp, rdir)["model_sha256"], rec["model_sha256"])   # no second export
+
+    def test_revalidation_fallback_accepts_identical_weights_and_refuses_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir, rdir = self._checkpoint(tmp, recorded_ok=False)
+            with self.assertRaises(RuntimeError):
+                self._export(tmp, rdir)                                       # no cache given -> refuse
+            rec = self._export(tmp, rdir, cdir)
+            self.assertEqual(rec["checkpoint_verification"]["method"], "revalidation")
+            self.assertLessEqual(rec["checkpoint_verification"]["abs_diff"], train.REVALIDATION_TOL)
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir, rdir = self._checkpoint(tmp, recorded_ok=False, score_shift=0.05)
+            with self.assertRaises(RuntimeError):
+                self._export(tmp, rdir, cdir)                                 # weights do not reproduce the best
 
 
 class GateTests(unittest.TestCase):

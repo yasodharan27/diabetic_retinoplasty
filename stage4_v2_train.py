@@ -269,7 +269,7 @@ def state_dict_sha256(state_dict):
         if isinstance(v, torch.Tensor):
             t = v.detach().to("cpu").contiguous()
             h.update(f"|{t.dtype}|{tuple(t.shape)}|".encode("utf-8"))
-            h.update(t.view(torch.uint8).numpy().tobytes() if t.numel() else b"")
+            h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes() if t.numel() else b"")
         else:
             h.update(repr(v).encode("utf-8"))
     return h.hexdigest()
@@ -278,9 +278,15 @@ def state_dict_sha256(state_dict):
 def _legacy_serialized_sha256(state_dict, device):
     """The hash written by checkpoints saved before the content hash existed: sha256 of torch.save() of the
     state dict with its tensors on the device they were saved from."""
+    import collections
+
     import torch
+    moved = collections.OrderedDict((k, v.to(device) if isinstance(v, torch.Tensor) else v)
+                                    for k, v in state_dict.items())
+    if hasattr(state_dict, "_metadata"):              # nn.Module.state_dict() carries per-module versions
+        moved._metadata = state_dict._metadata
     buf = io.BytesIO()
-    torch.save({k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in state_dict.items()}, buf)
+    torch.save(moved, buf)
     return hashlib.sha256(buf.getvalue()).hexdigest()
 
 
@@ -325,11 +331,14 @@ def save_checkpoint(path, *, step, model, ema, optimizer, scheduler, scaler, cfg
     return payload["model_weights_sha256"]
 
 
-def load_checkpoint(path):
+def load_checkpoint(path, allow_unverified=False):
+    """Loads a training checkpoint and verifies its EMA hash. `allow_unverified=True` returns it with
+    ckpt["_hash_verified"] = False instead of raising (export_best then verifies by re-validation)."""
     import torch
     cache.assert_not_legacy_path(path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if not verify_ema_hash(ckpt):
+    ckpt["_hash_verified"] = verify_ema_hash(ckpt)
+    if not ckpt["_hash_verified"] and not allow_unverified:
         raise RuntimeError(f"{path}: EMA weights do not match their recorded sha")
     return ckpt
 
@@ -410,7 +419,10 @@ def run(run_dir, cache_dir, cfg=None, device="cuda", model_factory=None, max_ste
     return {"step": step, "best": best, "run_dir": run_dir}
 
 
-def export_best(run_dir, export_root=v2cfg.STAGE4_V2_MODEL_ROOT):
+REVALIDATION_TOL = 2e-3
+
+
+def export_best(run_dir, export_root=v2cfg.STAGE4_V2_MODEL_ROOT, revalidate_cache_dir=None, device="cuda"):
     """Exports the best EMA weights as the Stage-4 v2 model (stage4_v2.save_stage4_v2 -> model.pt + manifest).
     The returned SHA names the Stage-4 cache generation."""
     record_path = os.path.join(run_dir, "exported_model.json")
@@ -419,9 +431,23 @@ def export_best(run_dir, export_root=v2cfg.STAGE4_V2_MODEL_ROOT):
         if cache.sha256_file(record["model_path"]) != record["model_sha256"]:
             raise RuntimeError(f"{record['model_path']} no longer matches its recorded SHA")
         return record
-    ck = load_checkpoint(os.path.join(run_dir, "checkpoints", "best_ema.pt"))
+    ck = load_checkpoint(os.path.join(run_dir, "checkpoints", "best_ema.pt"), allow_unverified=True)
     model, _ = s4.build_stage4_model(CLASSES, pretrained=False)
     model.load_state_dict(ck["ema"])
+    verification = {"method": "hash", "hash_verified": bool(ck["_hash_verified"])}
+    if not ck["_hash_verified"]:
+        # Independent identity check: the loaded EMA must reproduce the recorded best validation score.
+        if revalidate_cache_dir is None:
+            raise RuntimeError("best_ema.pt hash does not verify; pass revalidate_cache_dir (the local training "
+                               "cache) to verify the weights by re-validation instead")
+        report = validate(model.to(device), data.TrainingCache(revalidate_cache_dir, verify_files=False), device)
+        diff = abs(report["selection_score"] - ck["best"]["score"])
+        verification = {"method": "revalidation", "hash_verified": False, "recorded_score": ck["best"]["score"],
+                        "revalidated_score": report["selection_score"], "abs_diff": diff, "tol": REVALIDATION_TOL}
+        if not diff <= REVALIDATION_TOL:
+            raise RuntimeError(f"best_ema.pt re-validation {report['selection_score']:.5f} != recorded "
+                               f"{ck['best']['score']:.5f}; the checkpoint cannot be trusted")
+        model = model.to("cpu")
     stamp = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
     export_dir = os.path.join(export_root, stamp)
     sha = s4.save_stage4_v2(model, export_dir, {
@@ -429,7 +455,7 @@ def export_best(run_dir, export_root=v2cfg.STAGE4_V2_MODEL_ROOT):
         "fingerprints": ck["fingerprints"], "loss": s4.loss_spec(), "loss_weights": ck["loss_weights"],
         "validation": ck["history"][-1] if ck["history"] else None, "idrid_test_gate": "NOT RUN"})
     record = {"model_path": os.path.join(export_dir, "model.pt"), "model_sha256": sha, "export_dir": export_dir,
-              "source_run": run_dir, "best": ck["best"]}
+              "source_run": run_dir, "best": ck["best"], "checkpoint_verification": verification}
     _write_json(os.path.join(run_dir, "exported_model.json"), record)
     return record
 
