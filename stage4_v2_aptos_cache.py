@@ -248,12 +248,46 @@ def configure_determinism():
     return {"cudnn_deterministic": True, "cudnn_benchmark": False}
 
 
+def bounded_prefetch(keys, load, max_ahead=v2cfg.STAGE4_CACHE_PREFETCH, readers=v2cfg.STAGE4_CACHE_READERS):
+    """Yields (key, load(key)) in the order of `keys`, with at most `max_ahead` items resident at any time --
+    loading, loaded-and-waiting, or currently held by the consumer (a strict producer/consumer bound;
+    ThreadPoolExecutor.map would submit every key at once). A load exception is raised in the consumer at that key's position. On early exit the
+    not-yet-started loads are cancelled. The consumer should drop its reference to each item once used."""
+    import collections
+    if max_ahead < 1 or readers < 1:
+        raise ValueError("max_ahead and readers must be >= 1")
+    keys = list(keys)
+    window = collections.deque()
+    nxt = 0
+    pool = cf.ThreadPoolExecutor(max_workers=min(readers, max_ahead))
+    try:
+        while nxt < len(keys) and len(window) < max_ahead:
+            window.append((keys[nxt], pool.submit(load, keys[nxt])))
+            nxt += 1
+        while window:
+            key, fut = window.popleft()
+            item = fut.result()                         # re-raises a reader failure here, in order
+            del fut
+            yield key, item
+            del item                                    # the consumer is done with this image ...
+            if nxt < len(keys):                         # ... only then is one new read started, so queued +
+                window.append((keys[nxt], pool.submit(load, keys[nxt])))   # in-use images never exceed max_ahead
+                nxt += 1
+    finally:
+        for _, fut in window:
+            fut.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def generate_stage4_maps(model, model_sha256, ids, load_native, stage3_sha256, device="cuda", amp=True,
-                         roots=None, prefetch=8, writers=8, log=print, compute_maps=None):
+                         roots=None, prefetch=v2cfg.STAGE4_CACHE_PREFETCH, readers=v2cfg.STAGE4_CACHE_READERS,
+                         writers=v2cfg.STAGE4_CACHE_WRITERS, max_pending_writes=v2cfg.STAGE4_CACHE_MAX_PENDING_WRITES,
+                         log=print, compute_maps=None):
     """Stage-4 v2 inference for every id -> uint8 512x512x8 npz per image in the model's own generation.
     `load_native(id)` returns the native Stage-2 RGB uint8. Resumes a partial run of the SAME model; refuses
     a completed generation (immutable) and any directory whose progress names a different model.
-    Returns {id: file sha}."""
+    Memory is strictly bounded: at most `prefetch` native images ahead of the GPU (bounded_prefetch) and at most
+    `max_pending_writes` finished map arrays waiting to be written. Returns {id: file sha}."""
     import stage4_v2 as s4
     cache.assert_not_deny_listed(model_sha256)
     assert_aptos_ids(ids)
@@ -279,23 +313,33 @@ def generate_stage4_maps(model, model_sha256, ids, load_native, stage3_sha256, d
     _write_json(progress_path, progress)                   # ownership recorded before any map is written
     pending = []
 
-    def drain():
+    def drain(block_until=None):
+        """Record finished writes; with `block_until`, first wait until fewer than that many are pending."""
+        if block_until is not None:
+            running = [f for f in pending if not f.done()]
+            while len(running) >= block_until:
+                cf.wait(running, return_when=cf.FIRST_COMPLETED)
+                running = [f for f in running if not f.done()]
         for f in pending:
             if f.done() and f.exception() is None:
                 k, sha = f.result()
                 progress["files"][k] = sha
         errors = [f.exception() for f in pending if f.done() and f.exception() is not None]
-        pending[:] = [f for f in pending if not f.done()]
+        pending[:] = [f for f in pending if not f.done()]       # finished futures (and their arrays) released
         if errors:
             raise errors[0]
 
-    with cf.ThreadPoolExecutor(max_workers=prefetch) as readers, cf.ThreadPoolExecutor(max_workers=writers) as wpool:
+    import contextlib
+    with cf.ThreadPoolExecutor(max_workers=writers) as wpool,             contextlib.closing(bounded_prefetch(todo, load_native, prefetch, readers)) as images:
         try:
-            for n, (i, rgb) in enumerate(zip(todo, readers.map(lambda x: load_native(x), todo)), start=1):
+            for n, (i, rgb) in enumerate(images, start=1):
                 maps = compute_maps(rgb)
+                del rgb                                          # native image released before the next read
                 if maps.shape != (v2cfg.CACHE_SIZE, v2cfg.CACHE_SIZE, len(channels)) or maps.dtype != np.uint8:
                     raise AptosCacheError(f"{i}: Stage-4 maps {maps.dtype} {maps.shape}")
+                drain(block_until=max_pending_writes)            # back-pressure: bounded queued map arrays
                 pending.append(wpool.submit(write, i, maps))
+                del maps
                 if n % 100 == 0:
                     cf.wait(pending)
                     drain()

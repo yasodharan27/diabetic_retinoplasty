@@ -3204,3 +3204,106 @@ Output goes to `results/C2/c2_<sha12>_<timestamp>/` (config.json, results.json, 
 - Run directory: `experiments/Architecture1/arch1_<sha12>_seed42/`. The config hash is checked on every resume; a changed configuration is refused.
 
 **Layout.** Caches stay in the §40/§11 `cache/` namespace (Stage2/Stage3/Stage4/Bundle), which `arch1_data` reads. Experiments go to `experiments/{Stage4V2, Architecture1}/<run>/` on Drive and `results/C2/<run>/` on the laptop. Every config records the git commit, model SHA, split SHA, population SHA, cache/bundle fingerprint, Stage-3 SHA, Stage-4 generation, seed and hyperparameters.
+
+## 47. Stage-4 v2 K=4 run 1 — training, export, validation review (2026-10-02; IDRiD test NOT accessed)
+
+**Run:** `experiments/Stage4V2/stage4v2_k4_seed42_bs8` on a T4.
+- Commit `046259e`; seed 42; 12,000 steps at batch 8; decoder LR 3e-4.
+- Positive weights `[20.0, 16.1, 20.0, 20.0]` (MA, HE, EX, SE): three classes at the cap.
+
+**Export:** `exported_models/LesionSegmentation_v2/2026-10-01_18-38-32/model.pt`.
+- **SHA `cb5fc7a8d370af7d2ae191cadaebdde858f71820d147fb76f852b757766f8ad8`**, from the best EMA at **step 6,000** (selection score 0.4738).
+- Checkpoint hash verified, after fixes `d9e4999`, `20a9c13` and `4e32e0a`: the original EMA hash depended on the tensor device, and setup cached the encoder weights on Drive.
+
+**Validation, selection score (mean over IDRiD-val, TJDR-TRC50DX, TJDR-CLARUS500 of the 4-class mean AUPR):**
+
+| step | 1000 | 2000 | 3000 | 4000 | 5000 | 6000 | 7000 | 8000 | 9000 | 10000 | 11000 | 12000 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| score | 0.012 | 0.302 | 0.423 | 0.451 | 0.454 | **0.474** | 0.454 | 0.450 | 0.464 | 0.448 | 0.463 | 0.444 |
+
+- Step 1000 reflects EMA lag from the initial weights.
+- Soft Dice keeps rising after step 6000 while AUPR is flat. IDRiD-val 1536 mean Dice: 0.125 at 6000, 0.215 at 11000. The probabilities become better calibrated late in training.
+
+**Best step (6000), AUPR / pooled soft Dice at 1536:**
+
+| group | MA | HE | EX | SE | mean AUPR |
+|---|---|---|---|---|---|
+| IDRiD-val (10) | 0.255 / 0.028 | 0.506 / 0.126 | 0.725 / 0.308 | 0.592 / 0.037 | 0.520 |
+| TJDR-val TRC50DX (55) | 0.235 / 0.003 | 0.712 / 0.032 | 0.673 / 0.044 | 0.527 / 0.014 | 0.537 |
+| TJDR-val CLARUS500 (55) | **0.024** / 0.000 | 0.626 / 0.026 | 0.340 / 0.014 | 0.469 / 0.007 | 0.365 |
+
+Wide-field CLARUS is much weaker, and its MA is near chance: the scale risk from §42.
+
+**Gate protocol applied to IDRiD-val** (10 pinned validation images, model `cb5fc7a8…`, CPU). Old-protocol 512 pooled soft Dice:
+
+| class | v2 Dice | reference | beats reference |
+|---|---|---|---|
+| MA | 0.035 | 0.0165 | yes |
+| HE | 0.147 | 0.1273 | yes |
+| EX | **0.321** | 0.3574 | **no** |
+| SE | 0.043 | 0.0244 | yes |
+
+- Mean AUPR at 1536 is **0.522 < 0.55**. **Would FAIL** (EX Dice and mean AUPR).
+- Diagnosis:
+  - **EX is a calibration shortfall.** Its AUPR is 0.73; the soft-Dice deficit comes from probability mass spread over background under w⁺ = 20.
+  - **Mean AUPR is limited mainly by MA** (0.26), and by CLARUS overall.
+- The 10-image validation estimate is not the test result.
+
+**Decision pending (user):**
+- **A.** Run the one-time gate as pre-registered. A FAIL proceeds only with the recorded override; C2 then decides the information question. This is the assistant's recommendation.
+- **B.** One improvement run first: calibration / positive-weight cap, CLARUS scale augmentation, Dice-aware selection. This is a documented deviation, decided on validation only. Only the model finally committed to is gated.
+
+## 48. One-time IDRiD test gate — Stage-4 v2 `cb5fc7a8…`: **PASS** (2026-10-01T19:00 UTC; run once, locked)
+
+**Decision §47 A:** the gate was run as pre-registered on the exported model.
+- Model SHA `cb5fc7a8d370af7d2ae191cadaebdde858f71820d147fb76f852b757766f8ad8`; 27 IDRiD test images.
+- Lock `exported_models/LesionSegmentation_v2/idrid_test_gate_locks/cb5fc7a8….json`.
+- Report in `experiments/Stage4V2/stage4v2_k4_seed42_bs8/gate/idrid_test_gate.json`.
+
+**Pass criterion:** old-protocol pooled soft Dice must beat the documented old Stage 4 in every class, and mean AUPR ≥ 0.55.
+
+| class | v2 Dice (512, old protocol) | old Stage 4 | v2 AUPR (1536) |
+|---|---|---|---|
+| MA | **0.0835** | 0.0165 | 0.284 |
+| HE | **0.3817** | 0.1273 | 0.567 |
+| EX | **0.5068** | 0.3574 | 0.868 |
+| SE | **0.1628** | 0.0244 | 0.506 |
+| mean | 0.2837 | 0.1314 | **0.5562** (≥ 0.55) |
+
+**PASS.**
+- Every class beats the old Stage 4: Dice ×5.1 MA, ×3.0 HE, ×1.4 EX, ×6.7 SE.
+- The AUPR criterion is met by a narrow margin (+0.006).
+- The 10-image validation estimate (§47) had predicted a fail on EX and AUPR. The test set scored higher; small-sample variance between 10 and 27 images.
+- For reference only, the literature IDRiD-only SE-ResNet-101 mAUPR is 0.652 (§40). Not a criterion.
+
+**Use:**
+- The test result is final for this model and is not used for any further selection or tuning.
+- The IDRiD test set is now consumed for Stage 4.
+
+**Next:** APTOS cache generation (`stage4_v2_aptos_cache.ipynb`) for this model, then C2.
+
+## 49. Post-Stage-4 audit fixes (2026-10-02; code only — no training, no cache generation, no Colab)
+
+The read-only audit found one CRITICAL defect and several smaller items. Fixed here:
+
+- **CRITICAL — unbounded image prefetch in `stage4_v2_aptos_cache.generate_stage4_maps`.**
+  - `ThreadPoolExecutor.map` submits every load at once (verified: all tasks start before the first result is consumed).
+  - The reader threads would have decoded all 3,651 native APTOS images (about 3–21 MB each) far faster than the GPU consumes them, exhausting Colab's ~12 GB RAM.
+  - Replaced by `bounded_prefetch`: a sliding window in which a new read starts only after the consumer has finished with the previous image.
+  - At most `STAGE4_CACHE_PREFETCH = 4` native images are resident at once (loading, waiting, or in use), about 84 MB worst case, with `STAGE4_CACHE_READERS = 2` threads.
+  - Order, image-id association, in-order exception propagation, and cancellation on early exit are preserved.
+- **Second queue in the same path.** Finished map arrays waiting for Drive writes were only drained every 100 images, so up to about 100 × 2 MB could queue.
+  - Writes now use back-pressure: at most `STAGE4_CACHE_MAX_PENDING_WRITES = 8` pending, with `STAGE4_CACHE_WRITERS = 4`.
+  - The native image and maps are released as soon as they are used.
+- **MEDIUM — slow bundle staging.** `colab/common/stage4_v2_setup.stage_files` now copies with 8 threads, keeping per-file SHA checks, resume, and remount-and-retry of only the failed files.
+- **MINOR:**
+  - The training notebook header now describes cells 4/5/6 correctly.
+  - The last cell of the APTOS cache notebook prints the exact laptop C2 commands and the Drive upload for `C2_RESULTS`.
+  - The spec has a superseded-items note (no fallback encoder; Stage-3 SHA in the npz; EMA for Architecture 1 not implemented and still open).
+
+**Unchanged:** the Stage-4 model and checkpoint, loss, preprocessing, pooling, cache format, research protocol, C2 and Architecture 1.
+
+**Left as is:**
+- The EMA decision (open).
+- `PROJECT_CODE.md`, which still describes the old Stage 04; the user asked for it not to be modified.
+- A Stage-3 regeneration path: the code stops if parity fails, as specified.

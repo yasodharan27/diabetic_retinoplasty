@@ -133,6 +133,149 @@ class PipelineTests(unittest.TestCase):
             ac.verify_stage4_generation(b["ids"], fx.MODEL_SHA, "c" * 64, b["sha4"], roots=b["roots"], workers=1)
 
 
+class BoundedPrefetchTests(unittest.TestCase):
+    """The OOM fix: at most `max_ahead` images may be loaded (or loading) ahead of consumption."""
+
+    def _instrumented(self, delay=0.0, fail_at=None):
+        import threading
+        import time
+        state = {"started": 0, "consumed": 0, "max_ahead_seen": 0}
+        lock = threading.Lock()
+
+        def load(key):
+            with lock:
+                state["started"] += 1
+                state["max_ahead_seen"] = max(state["max_ahead_seen"], state["started"] - state["consumed"])
+            if fail_at is not None and key == fail_at:
+                raise OSError(f"cannot read {key}")
+            time.sleep(delay)
+            return f"image-{key}"
+
+        def consumed():
+            with lock:
+                state["consumed"] += 1
+        return load, consumed, state
+
+    def test_outstanding_items_are_bounded_with_a_slow_consumer(self):
+        import time
+        load, consumed, state = self._instrumented()
+        for key, item in ac.bounded_prefetch(range(200), load, max_ahead=3, readers=2):
+            time.sleep(0.002)                        # GPU slower than the readers
+            consumed()
+        self.assertEqual(state["started"], 200)
+        self.assertLessEqual(state["max_ahead_seen"], 3)
+
+    def test_order_and_ids_preserved_when_loads_finish_out_of_order(self):
+        import random
+        import time
+        rnd = random.Random(0)
+
+        def load(key):
+            time.sleep(rnd.random() * 0.005)
+            return f"image-{key}"
+        out = list(ac.bounded_prefetch([f"{k:012x}" for k in range(60)], load, max_ahead=4, readers=4))
+        self.assertEqual([k for k, _ in out], [f"{k:012x}" for k in range(60)])
+        self.assertTrue(all(v == f"image-{k}" for k, v in out))
+
+    def test_reader_exception_propagates_in_order_and_stops_reading(self):
+        load, consumed, state = self._instrumented(delay=0.001, fail_at=10)
+        seen = []
+        with self.assertRaises(OSError):
+            for key, _ in ac.bounded_prefetch(range(100), load, max_ahead=4, readers=2):
+                seen.append(key)
+                consumed()
+        self.assertEqual(seen, list(range(10)))       # everything before the failing key, in order
+        self.assertLessEqual(state["started"], 10 + 1 + 4)
+
+    def test_early_exit_cancels_outstanding_reads(self):
+        load, consumed, state = self._instrumented(delay=0.002)
+        gen = ac.bounded_prefetch(range(100), load, max_ahead=3, readers=1)
+        for n, _ in enumerate(gen):
+            consumed()
+            if n == 4:
+                break
+        gen.close()
+        self.assertLessEqual(state["started"], 5 + 3)
+        with self.assertRaises(ValueError):
+            list(ac.bounded_prefetch([1], load, max_ahead=0))
+
+    def test_defaults_are_conservative(self):
+        self.assertLessEqual(v2cfg.STAGE4_CACHE_PREFETCH, 8)
+        self.assertLessEqual(v2cfg.STAGE4_CACHE_READERS, v2cfg.STAGE4_CACHE_PREFETCH)
+        self.assertLessEqual(v2cfg.STAGE4_CACHE_MAX_PENDING_WRITES, 16)
+
+    def test_generation_bounds_reads_and_writes_and_keeps_ids(self):
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = {k: tmp for k in ("stage2_rgb_v2", "stage3_cache_v2", "stage4_cache_v2", "bundle_v2")}
+            ids = [f"{k:012x}" for k in range(1, 25)]
+            lock = threading.Lock()
+            st = {"read": 0, "computed": 0, "written": 0, "max_ahead": 0, "max_pending_writes": 0}
+            real_write = cache.write_pathology_npz
+
+            def load(i):
+                with lock:
+                    st["read"] += 1
+                    st["max_ahead"] = max(st["max_ahead"], st["read"] - st["computed"])
+                return fx.fake_native(i)
+
+            def compute(rgb):
+                time.sleep(0.003)
+                with lock:
+                    st["computed"] += 1
+                return fx.fake_maps(rgb)
+
+            def slow_write(*a, **k):
+                time.sleep(0.01)                     # Drive slower than inference
+                out = real_write(*a, **k)
+                with lock:
+                    st["written"] += 1
+                return out
+
+            from unittest import mock
+            with mock.patch.object(cache, "write_pathology_npz", side_effect=slow_write) as w:
+                def tracking_compute(rgb):
+                    with lock:
+                        st["max_pending_writes"] = max(st["max_pending_writes"], st["computed"] - st["written"])
+                    return compute(rgb)
+                shas = ac.generate_stage4_maps(None, fx.MODEL_SHA, ids, load, v2cfg.STAGE3_LWNET_SHA256, roots=roots,
+                                               prefetch=3, readers=2, writers=2, max_pending_writes=4,
+                                               compute_maps=tracking_compute, log=lambda *a: None)
+                self.assertEqual(w.call_count, len(ids))
+            self.assertLessEqual(st["max_ahead"], 3)
+            self.assertLessEqual(st["max_pending_writes"], 4 + 1)
+            gen = cache.stage4_generation_id(fx.MODEL_SHA, 4)
+            for i in ids:                             # every file holds the maps of ITS image
+                with np.load(os.path.join(tmp, gen, "pathology", cache.pathology_filename(i))) as z:
+                    np.testing.assert_array_equal(z["maps"], fx.fake_maps(fx.fake_native(i)))
+                    self.assertEqual(str(z["image_id"]), i)
+            self.assertEqual(sorted(shas), sorted(ids))
+
+    def test_reader_failure_fails_generation_and_resume_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = {k: tmp for k in ("stage2_rgb_v2", "stage3_cache_v2", "stage4_cache_v2", "bundle_v2")}
+            ids = [f"{k:012x}" for k in range(1, 9)]
+            bad = ids[5]
+
+            def flaky_load(i):
+                if i == bad:
+                    raise OSError("[Errno 107] Transport endpoint is not connected")
+                return fx.fake_native(i)
+            with self.assertRaises(OSError):
+                ac.generate_stage4_maps(None, fx.MODEL_SHA, ids, flaky_load, v2cfg.STAGE3_LWNET_SHA256, roots=roots,
+                                        prefetch=2, readers=1, compute_maps=fx.fake_maps, log=lambda *a: None)
+            gen = cache.stage4_generation_id(fx.MODEL_SHA, 4)
+            with open(os.path.join(tmp, gen, "progress.json"), encoding="utf-8") as fh:
+                done = json.load(fh)["files"]
+            self.assertEqual(sorted(done), sorted(ids[:5]))           # completed writes recorded, none for bad
+            shas = ac.generate_stage4_maps(None, fx.MODEL_SHA, ids, fx.fake_native, v2cfg.STAGE3_LWNET_SHA256,
+                                           roots=roots, compute_maps=fx.fake_maps, log=lambda *a: None)
+            self.assertEqual(sorted(shas), sorted(ids))
+            for i in ids:
+                self.assertEqual(shas[i], done.get(i, shas[i]))       # resumed files were not rewritten
+
+
 class GuardTests(unittest.TestCase):
     def test_parity_enforced(self):
         with self.assertRaises(cache.StaleCacheError):

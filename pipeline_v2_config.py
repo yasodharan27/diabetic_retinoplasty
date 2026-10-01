@@ -157,6 +157,13 @@ STAGE3_PARITY_N = 25            # fixed-seed parity ids (spec §2)
 STAGE3_PARITY_TOL = 1e-4
 RGB_PARITY_TOL = 1e-6           # canonical RGB recomputed from the Stage-2 output must match the cache
 FRESHNESS_CANARY_N = 8          # recompute 8 Stage-4 maps after generation; max |delta| <= 2/255
+# Stage-4 APTOS inference I/O bounds (Colab ~12 GB RAM). A native Stage-2 APTOS image is <= ~21 MB uint8
+# (3216x2136x3), so at most PREFETCH images (~84 MB) are resident ahead of the GPU; at most MAX_PENDING_WRITES
+# finished 2 MB map arrays wait for Drive writes.
+STAGE4_CACHE_PREFETCH = 4
+STAGE4_CACHE_READERS = 2
+STAGE4_CACHE_WRITERS = 4
+STAGE4_CACHE_MAX_PENDING_WRITES = 8
 CANARY_TOL_COUNTS = 2
 PARITY_SEED = 20261001
 STAGE4_GATE_OVERRIDE_TOKEN = "PROCEED_WITH_A_STAGE4_MODEL_THAT_FAILED_THE_GATE"

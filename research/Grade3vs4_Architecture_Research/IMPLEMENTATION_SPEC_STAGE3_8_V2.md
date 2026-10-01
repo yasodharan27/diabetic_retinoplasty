@@ -9,6 +9,12 @@ This is the build spec. Nothing is implemented yet.
 
 **Supersedes:** §39 where different (see §14).
 
+> **Status note (2026-10-02; the body below is kept as written):**
+> - §3/§13 "fallback `tu-seresnext101_32x4d`" was withdrawn by the user decision in record §41. Only the pinned SE-ResNet-101 is used; there is no fallback.
+> - §11: each Stage-4 npz also embeds the Stage-3 SHA (§41 decision 5).
+> - §12 step 6 "EMA shadow" for Architecture 1 is **not implemented**: `arch1_train.py` follows the P protocol, which has no EMA. This is an open decision to take before the Architecture-1 run.
+> - Implemented state: record §43–§49.
+
 ## 1. Final architecture
 
 ```

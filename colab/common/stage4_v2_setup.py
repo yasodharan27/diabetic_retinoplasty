@@ -8,6 +8,7 @@
      LOCAL disk and verifies the exact size + SHA-256. On any failure it raises: there is no fallback encoder.
   5. Verifies the TJDR raw copy (443/110 usable) and the IDRiD segmentation paths.
 """
+import concurrent.futures as cf
 import os
 import posixpath
 import subprocess
@@ -66,40 +67,53 @@ def _remount_drive():
     drive.mount(colab_config.DRIVE_MOUNT_POINT, force_remount=True)
 
 
-def stage_files(pairs, max_remounts=6, remount=None, log=print, label="files"):
+def stage_files(pairs, max_remounts=6, remount=None, log=print, label="files", workers=8):
     """Copies (src, dst, sha256) pairs from Drive to local disk, robust to Drive FUSE drops
-    (`[Errno 107] Transport endpoint is not connected`): atomic per-file copies (dataset_staging._copy_one,
-    which also retries short hiccups), SHA-256 check of every copy, skip of local files that already verify
-    (so a rerun resumes), and an automatic Drive remount when the mount itself has dropped.
+    (`[Errno 107] Transport endpoint is not connected`): atomic per-file copies (dataset_staging._copy_one, which
+    streams the file and retries short hiccups) by `workers` threads, a SHA-256 check of every copy, skip of local
+    files that already verify (so a rerun resumes), and -- when the mount itself drops -- a Drive remount after
+    which only the failed files are retried. Memory stays small: results are status strings, files are streamed.
     Returns {"copied", "skipped", "remounts"}."""
     import dataset_staging
     import stage34_cache_v2 as cache
     remount = remount or _remount_drive
-    copied = skipped = remounts = 0
-    i = 0
-    while i < len(pairs):
-        src, dst, want = pairs[i]
+    counts = {"copied": 0, "skipped": 0}
+    remounts = 0
+
+    def one(pair):
+        src, dst, want = pair
         if os.path.exists(dst) and cache.sha256_file(dst) == want:
-            skipped += 1
-            i += 1
-            continue
-        try:
-            dataset_staging._copy_one(src, dst)
-        except OSError as exc:
-            if not dataset_staging._is_transient_os_error(exc) or remounts >= max_remounts:
-                raise
-            remounts += 1
-            log(f"  Drive dropped at {os.path.basename(src)} ({exc}); remount {remounts}/{max_remounts}, resuming")
-            remount()
-            continue
+            return "skipped"
+        dataset_staging._copy_one(src, dst)
         if cache.sha256_file(dst) != want:
             os.remove(dst)
             raise RuntimeError(f"{dst}: copied file does not match its recorded SHA")
-        copied += 1
-        i += 1
-        if (copied + skipped) % 200 == 0:
-            log(f"  {label}: staged {copied + skipped}/{len(pairs)}")
-    return {"copied": copied, "skipped": skipped, "remounts": remounts}
+        return "copied"
+
+    todo = list(pairs)
+    while todo:
+        failed, last_error = [], None
+        with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(one, p): p for p in todo}
+            for n, fut in enumerate(cf.as_completed(futures), start=1):
+                try:
+                    counts[fut.result()] += 1
+                except OSError as exc:
+                    if not dataset_staging._is_transient_os_error(exc):
+                        raise
+                    failed.append(futures[fut])
+                    last_error = exc
+                if n % 500 == 0:
+                    log(f"  {label}: {counts['copied'] + counts['skipped']}/{len(pairs)} staged")
+        if not failed:
+            break
+        if remounts >= max_remounts:
+            raise last_error
+        remounts += 1
+        log(f"  Drive dropped ({last_error}); remount {remounts}/{max_remounts}, retrying {len(failed)} files")
+        remount()
+        todo = failed
+    return {**counts, "remounts": remounts}
 
 
 def _read_drive_bytes(path, remount, max_remounts, log):
