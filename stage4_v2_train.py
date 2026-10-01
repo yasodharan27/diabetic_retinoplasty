@@ -259,10 +259,40 @@ def validate(model, training_cache, device, amp=True):
 # --------------------------------------------------------------------------- checkpoints
 
 def state_dict_sha256(state_dict):
+    """Content hash of a state dict: key, dtype, shape and raw bytes of every tensor, in key order. Independent
+    of the device the tensors live on (a checkpoint written from the GPU verifies after a CPU load)."""
+    import torch
+    h = hashlib.sha256()
+    for key in sorted(state_dict):
+        v = state_dict[key]
+        h.update(key.encode("utf-8"))
+        if isinstance(v, torch.Tensor):
+            t = v.detach().to("cpu").contiguous()
+            h.update(f"|{t.dtype}|{tuple(t.shape)}|".encode("utf-8"))
+            h.update(t.view(torch.uint8).numpy().tobytes() if t.numel() else b"")
+        else:
+            h.update(repr(v).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _legacy_serialized_sha256(state_dict, device):
+    """The hash written by checkpoints saved before the content hash existed: sha256 of torch.save() of the
+    state dict with its tensors on the device they were saved from."""
     import torch
     buf = io.BytesIO()
-    torch.save(state_dict, buf)
+    torch.save({k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in state_dict.items()}, buf)
     return hashlib.sha256(buf.getvalue()).hexdigest()
+
+
+def verify_ema_hash(ckpt):
+    """True if the checkpoint's EMA weights match their recorded hash (content hash, or the legacy
+    device-dependent serialisation hash re-created on CPU / CUDA)."""
+    import torch
+    rec = ckpt["model_weights_sha256"]
+    if "ema_content" in rec:
+        return rec["ema_content"] == state_dict_sha256(ckpt["ema"])
+    devices = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
+    return any(rec["ema"] == _legacy_serialized_sha256(ckpt["ema"], d) for d in devices)
 
 
 def fingerprints(training_cache):
@@ -284,7 +314,8 @@ def save_checkpoint(path, *, step, model, ema, optimizer, scheduler, scaler, cfg
                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                "scaler": scaler.state_dict(), "config": dataclasses.asdict(cfg), "classes": list(CLASSES),
                "loss_weights": weights, "fingerprints": fps, "history": history, "best": best,
-               "model_weights_sha256": {"model": state_dict_sha256(model.state_dict()), "ema": state_dict_sha256(ema_state)},
+               "model_weights_sha256": {"model_content": state_dict_sha256(model.state_dict()),
+                                        "ema_content": state_dict_sha256(ema_state)},
                "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()},
                "environment": environment_record(), "saved_utc": datetime.datetime.utcnow().isoformat()}
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -298,7 +329,7 @@ def load_checkpoint(path):
     import torch
     cache.assert_not_legacy_path(path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if ckpt["model_weights_sha256"]["ema"] != state_dict_sha256(ckpt["ema"]):
+    if not verify_ema_hash(ckpt):
         raise RuntimeError(f"{path}: EMA weights do not match their recorded sha")
     return ckpt
 
@@ -382,14 +413,25 @@ def run(run_dir, cache_dir, cfg=None, device="cuda", model_factory=None, max_ste
 def export_best(run_dir, export_root=v2cfg.STAGE4_V2_MODEL_ROOT):
     """Exports the best EMA weights as the Stage-4 v2 model (stage4_v2.save_stage4_v2 -> model.pt + manifest).
     The returned SHA names the Stage-4 cache generation."""
+    record_path = os.path.join(run_dir, "exported_model.json")
+    if os.path.exists(record_path):                     # idempotent: one export per run
+        record = _read_json(record_path)
+        if cache.sha256_file(record["model_path"]) != record["model_sha256"]:
+            raise RuntimeError(f"{record['model_path']} no longer matches its recorded SHA")
+        return record
     ck = load_checkpoint(os.path.join(run_dir, "checkpoints", "best_ema.pt"))
     model, _ = s4.build_stage4_model(CLASSES, pretrained=False)
     model.load_state_dict(ck["ema"])
     stamp = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-    return s4.save_stage4_v2(model, os.path.join(export_root, stamp), {
+    export_dir = os.path.join(export_root, stamp)
+    sha = s4.save_stage4_v2(model, export_dir, {
         "classes": list(CLASSES), "source_run": run_dir, "best": ck["best"], "config": ck["config"],
         "fingerprints": ck["fingerprints"], "loss": s4.loss_spec(), "loss_weights": ck["loss_weights"],
         "validation": ck["history"][-1] if ck["history"] else None, "idrid_test_gate": "NOT RUN"})
+    record = {"model_path": os.path.join(export_dir, "model.pt"), "model_sha256": sha, "export_dir": export_dir,
+              "source_run": run_dir, "best": ck["best"]}
+    _write_json(os.path.join(run_dir, "exported_model.json"), record)
+    return record
 
 
 def main():

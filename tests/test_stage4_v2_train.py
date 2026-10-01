@@ -139,7 +139,7 @@ class LoopTests(unittest.TestCase):
                 self.assertEqual(fp["encoder_weights_sha256"], v2cfg.STAGE4_ENCODER_SHA256)
                 self.assertEqual(fp["tjdr_excluded"]["test"], list(v2cfg.TJDR_EXCLUDED["test"]))
                 self.assertEqual(len(fp["training_cache_fingerprint"]), 64)
-                self.assertEqual(ck["model_weights_sha256"]["ema"], train.state_dict_sha256(ck["ema"]))
+                self.assertEqual(ck["model_weights_sha256"]["ema_content"], train.state_dict_sha256(ck["ema"]))
                 self.assertTrue(os.path.exists(os.path.join(rdir, "checkpoints", "best_ema.pt")))
                 with open(os.path.join(rdir, "validation_history.json"), encoding="utf-8") as fh:
                     hist = json.load(fh)
@@ -158,6 +158,27 @@ class LoopTests(unittest.TestCase):
                 train.load_checkpoint(os.path.join(rdir, "checkpoints", "tampered.pt"))
 
 
+class HashTests(unittest.TestCase):
+    def test_content_hash_is_device_and_serialisation_independent(self):
+        import io as _io
+        sd = Toy().state_dict()
+        buf = _io.BytesIO()
+        torch.save(sd, buf)
+        buf.seek(0)
+        reloaded = torch.load(buf, map_location="cpu", weights_only=True)
+        self.assertEqual(train.state_dict_sha256(sd), train.state_dict_sha256(reloaded))
+        changed = {k: v.clone() for k, v in sd.items()}
+        changed["decoder.bias"][0] += 1e-6
+        self.assertNotEqual(train.state_dict_sha256(sd), train.state_dict_sha256(changed))
+
+    def test_legacy_checkpoint_hash_still_verifies(self):
+        sd = Toy().state_dict()
+        legacy = {"ema": sd, "model_weights_sha256": {"ema": train._legacy_serialized_sha256(sd, "cpu")}}
+        self.assertTrue(train.verify_ema_hash(legacy))
+        legacy["ema"] = {k: v + 1 for k, v in sd.items()}
+        self.assertFalse(train.verify_ema_hash(legacy))
+
+
 class GateTests(unittest.TestCase):
     def test_reference_values_pinned(self):
         self.assertEqual(v2cfg.STAGE4_GATE_REFERENCE_DICE, {"MA": 0.0165, "HE": 0.1273, "EX": 0.3574, "SE": 0.0244})
@@ -165,13 +186,17 @@ class GateTests(unittest.TestCase):
 
     def test_refused_without_token_and_only_once(self):
         with tempfile.TemporaryDirectory() as tmp:
-            model_path = os.path.join(tmp, "model.pt")
+            model_path = os.path.join(tmp, "export_1", "model.pt")
             with self.assertRaises(gate.GateRefused):
-                gate.run_gate(model_path, expected_sha256="a" * 64, confirm="yes")
-            with open(gate._lock_path(model_path), "w") as fh:
+                gate.run_gate(model_path, expected_sha256="a" * 64, confirm="yes", lock_root=tmp)
+            lock = gate._lock_path("a" * 64, tmp)
+            os.makedirs(os.path.dirname(lock), exist_ok=True)
+            with open(lock, "w") as fh:
                 fh.write("{}")
-            with self.assertRaises(gate.GateRefused):
-                gate.run_gate(model_path, expected_sha256="a" * 64, confirm=v2cfg.STAGE4_GATE_CONFIRM_TOKEN)
+            for path in (model_path, os.path.join(tmp, "export_2_same_weights", "model.pt")):   # lock is per SHA
+                with self.assertRaises(gate.GateRefused):
+                    gate.run_gate(path, expected_sha256="a" * 64, confirm=v2cfg.STAGE4_GATE_CONFIRM_TOKEN,
+                                  lock_root=tmp)
 
     def test_old_protocol_target_matches_old_loader(self):
         import lesion_segmentation_dataset as lsd

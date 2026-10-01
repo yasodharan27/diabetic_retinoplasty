@@ -66,68 +66,104 @@ def _remount_drive():
     drive.mount(colab_config.DRIVE_MOUNT_POINT, force_remount=True)
 
 
-def stage_training_cache(drive_dir, local_dir, max_remounts=6, remount=None, log=print):
-    """Copies the Stage-4 training cache from Drive to the local disk, robust to Drive FUSE drops
-    (`[Errno 107] Transport endpoint is not connected`):
-      * files listed in the Drive manifest are copied one by one (atomic temp + rename via
-        dataset_staging._copy_one, which also retries short hiccups);
-      * a local file whose SHA-256 already matches the manifest is skipped, so a rerun resumes;
-      * when the mount itself has dropped, Drive is remounted and the copy resumes
-        (up to `max_remounts` times);
-      * manifest.json is written LAST, so its presence means the copy finished.
-    Returns {"copied": n, "skipped": n, "remounts": n}."""
-    import json
-    import shutil
+def stage_files(pairs, max_remounts=6, remount=None, log=print, label="files"):
+    """Copies (src, dst, sha256) pairs from Drive to local disk, robust to Drive FUSE drops
+    (`[Errno 107] Transport endpoint is not connected`): atomic per-file copies (dataset_staging._copy_one,
+    which also retries short hiccups), SHA-256 check of every copy, skip of local files that already verify
+    (so a rerun resumes), and an automatic Drive remount when the mount itself has dropped.
+    Returns {"copied", "skipped", "remounts"}."""
     import dataset_staging
     import stage34_cache_v2 as cache
     remount = remount or _remount_drive
-    os.makedirs(local_dir, exist_ok=True)
-    remounts = 0
-    while True:
-        try:
-            with open(os.path.join(drive_dir, "manifest.json"), "rb") as fh:
-                manifest_bytes = fh.read()
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-            break
-        except OSError as exc:
-            if not dataset_staging._is_transient_os_error(exc) or remounts >= max_remounts:
-                raise
-            remounts += 1
-            log(f"  Drive dropped reading the manifest ({exc}); remount {remounts}/{max_remounts}")
-            remount()
-    names = sorted(manifest["files"])
-    copied = skipped = 0
+    copied = skipped = remounts = 0
     i = 0
-    while i < len(names):
-        name = names[i]
-        dst = os.path.join(local_dir, name)
-        want = manifest["files"][name]["sha256"]
+    while i < len(pairs):
+        src, dst, want = pairs[i]
         if os.path.exists(dst) and cache.sha256_file(dst) == want:
             skipped += 1
             i += 1
             continue
         try:
-            dataset_staging._copy_one(os.path.join(drive_dir, name), dst)
+            dataset_staging._copy_one(src, dst)
         except OSError as exc:
             if not dataset_staging._is_transient_os_error(exc) or remounts >= max_remounts:
                 raise
             remounts += 1
-            log(f"  Drive dropped at {name} ({exc}); remount {remounts}/{max_remounts}, resuming")
+            log(f"  Drive dropped at {os.path.basename(src)} ({exc}); remount {remounts}/{max_remounts}, resuming")
             remount()
             continue
         if cache.sha256_file(dst) != want:
             os.remove(dst)
-            raise RuntimeError(f"{name}: copied file does not match the manifest SHA")
+            raise RuntimeError(f"{dst}: copied file does not match its recorded SHA")
         copied += 1
         i += 1
-        if (copied + skipped) % 50 == 0:
-            log(f"  staged {copied + skipped}/{len(names)}")
-    tmp = os.path.join(local_dir, "manifest.json.tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(manifest_bytes)
-    shutil.move(tmp, os.path.join(local_dir, "manifest.json"))
-    log(f"  training cache staged: {copied} copied, {skipped} already present, {remounts} remounts")
+        if (copied + skipped) % 200 == 0:
+            log(f"  {label}: staged {copied + skipped}/{len(pairs)}")
     return {"copied": copied, "skipped": skipped, "remounts": remounts}
+
+
+def _read_drive_bytes(path, remount, max_remounts, log):
+    import dataset_staging
+    for attempt in range(max_remounts + 1):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError as exc:
+            if not dataset_staging._is_transient_os_error(exc) or attempt == max_remounts:
+                raise
+            log(f"  Drive dropped reading {os.path.basename(path)} ({exc}); remounting")
+            (remount or _remount_drive)()
+
+
+def _write_last(local_path, payload):
+    import shutil
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp = local_path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
+    shutil.move(tmp, local_path)
+
+
+def stage_training_cache(drive_dir, local_dir, max_remounts=6, remount=None, log=print):
+    """The Stage-4 training cache (manifest["files"] = {file name: {"sha256": ...}}); manifest.json is
+    written LAST, byte-for-byte, so its presence means the copy finished."""
+    import json
+    payload = _read_drive_bytes(os.path.join(drive_dir, "manifest.json"), remount, max_remounts, log)
+    manifest = json.loads(payload.decode("utf-8"))
+    pairs = [(os.path.join(drive_dir, n), os.path.join(local_dir, n), v["sha256"])
+             for n, v in sorted(manifest["files"].items())]
+    os.makedirs(local_dir, exist_ok=True)
+    res = stage_files(pairs, max_remounts, remount, log, "training cache")
+    _write_last(os.path.join(local_dir, "manifest.json"), payload)
+    log(f"  training cache staged: {res['copied']} copied, {res['skipped']} already present, {res['remounts']} remounts")
+    return res
+
+
+def stage_bundle(bundle_id, drive_roots, local_roots, max_remounts=6, remount=None, log=print):
+    """Copies one v2 bundle (its three generations + bundle manifest) from Drive to local disk with per-file
+    SHA checks against the generation manifests; manifests are written last. Returns per-kind results."""
+    import json
+    import stage34_cache_v2 as cache
+    names = {"stage2_rgb_v2": cache.rgb_filename, "stage3_cache_v2": cache.vessel_filename,
+             "stage4_cache_v2": cache.pathology_filename}
+    bpath = os.path.join(drive_roots["bundle_v2"], bundle_id, cache.MANIFEST_NAMES["bundle_v2"])
+    bpayload = _read_drive_bytes(bpath, remount, max_remounts, log)
+    bundle = json.loads(bpayload.decode("utf-8"))
+    gens = {"stage2_rgb_v2": bundle["stage2_generation"], "stage3_cache_v2": bundle["stage3_generation"],
+            "stage4_cache_v2": bundle["stage4_generation"]}
+    out = {}
+    for kind, gen in gens.items():
+        src_gen, dst_gen = os.path.join(drive_roots[kind], gen), os.path.join(local_roots[kind], gen)
+        mpayload = _read_drive_bytes(os.path.join(src_gen, cache.MANIFEST_NAMES[kind]), remount, max_remounts, log)
+        files = json.loads(mpayload.decode("utf-8"))["files"]
+        sub = cache.DATA_SUBDIRS[kind]
+        pairs = [(os.path.join(src_gen, sub, names[kind](i)), os.path.join(dst_gen, sub, names[kind](i)), sha)
+                 for i, sha in sorted(files.items())]
+        out[kind] = stage_files(pairs, max_remounts, remount, log, kind)
+        _write_last(os.path.join(dst_gen, cache.MANIFEST_NAMES[kind]), mpayload)
+    _write_last(os.path.join(local_roots["bundle_v2"], bundle_id, cache.MANIFEST_NAMES["bundle_v2"]), bpayload)
+    log(f"  bundle {bundle_id} staged: {out}")
+    return out
 
 
 def setup_stage4_v2(fetch_weights=True):

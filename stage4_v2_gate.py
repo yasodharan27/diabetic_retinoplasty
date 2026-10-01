@@ -53,19 +53,24 @@ def decide(result):
             "min_mean_aupr": v2cfg.STAGE4_GATE_MIN_MEAN_AUPR}
 
 
-def _lock_path(model_path):
-    return os.path.join(os.path.dirname(model_path), "IDRID_TEST_GATE_USED.json")
+def _lock_path(model_sha256, lock_root=None):
+    """One lock per MODEL SHA (not per export folder): re-exporting the same weights cannot re-open the gate."""
+    root = lock_root or os.path.join(v2cfg.STAGE4_V2_MODEL_ROOT, "idrid_test_gate_locks")
+    return os.path.join(root, f"{model_sha256}.json")
 
 
-def run_gate(model_path, *, expected_sha256, confirm, device="cuda", raw_dir=None, processed_dir=None):
-    """The one-time gate. Writes its report (and the lock) next to the exported model."""
+def run_gate(model_path, *, expected_sha256, confirm, device="cuda", raw_dir=None, processed_dir=None,
+             report_dir=None, lock_root=None):
+    """The one-time gate. Writes its report (and the lock) next to the exported model, and a copy into
+    `report_dir` (the training run's gate/ folder) when given."""
     if confirm != v2cfg.STAGE4_GATE_CONFIRM_TOKEN:
         raise GateRefused("The IDRiD test gate runs only with the explicit confirmation token.")
-    lock = _lock_path(model_path)
+    lock = _lock_path(expected_sha256, lock_root)
     if os.path.exists(lock):
         raise GateRefused(f"The one-time IDRiD test gate was already run for this model ({lock}).")
     cache.assert_not_legacy_path(lock)
     model = s4.load_stage4_v2(model_path, expected_sha256=expected_sha256, classes=CLASSES).to(device)
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
     with open(lock, "w") as fh:          # written BEFORE evaluation: a crashed run still counts as used
         json.dump({"model": model_path, "sha256": expected_sha256,
                    "started_utc": datetime.datetime.utcnow().isoformat()}, fh)
@@ -78,8 +83,13 @@ def run_gate(model_path, *, expected_sha256, confirm, device="cuda", raw_dir=Non
         mean512 = np.stack([cache.block_pool_mean_max(p[..., None])[0][..., 0] for p in probs])
         old.update(mean512, old_protocol_target(masks))
         frame.update(probs, np.stack([s4.resize_mask_full_frame(m) for m in masks]))
-    result = {"old_protocol_512": old.result(), "frame_1536": frame.result(), "images": len(v2cfg.IDRID_SEG_TEST_IDS)}
+    result = {"old_protocol_512": old.result(), "frame_1536": frame.result(), "images": len(v2cfg.IDRID_SEG_TEST_IDS),
+              "model_path": model_path, "model_sha256": expected_sha256,
+              "finished_utc": datetime.datetime.utcnow().isoformat()}
     result["decision"] = decide(result)
-    with open(os.path.join(os.path.dirname(model_path), "idrid_test_gate.json"), "w") as fh:
-        json.dump(result, fh, indent=1)
+    for folder in [os.path.dirname(model_path)] + ([report_dir] if report_dir else []):
+        cache.assert_not_legacy_path(folder)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "idrid_test_gate.json"), "w") as fh:
+            json.dump(result, fh, indent=1)
     return result
