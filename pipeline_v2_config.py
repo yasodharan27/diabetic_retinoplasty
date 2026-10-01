@@ -142,6 +142,40 @@ STAGE4_GATE_REFERENCE_DICE = {"MA": 0.0165, "HE": 0.1273, "EX": 0.3574, "SE": 0.
 STAGE4_GATE_MIN_MEAN_AUPR = 0.55
 STAGE4_GATE_CONFIRM_TOKEN = "RUN_THE_ONE_TIME_IDRID_TEST_GATE"
 
+# ------------------------------------------------------------------ APTOS population (downstream, §46)
+# The authoritative split (multiseed_runs.verify_split: 2929/733, sha SPLIT_SHA256) minus the 11 pinned
+# empty-field-of-view images (experiments/ImprovedTraining/improved_multiseed_2026_09/experiment_manifest.json)
+# = 2921 train + 730 val = 3651, the population every Stage 5-8 experiment so far used.
+APTOS_EMPTY_FOV_IDS = ("14ee87d6cc42", "188a9323be03", "2241b7e90782", "262ad704319c", "26453eb7e989",
+                       "3a122851e526", "453a1e2754b2", "6c315ad3d07f", "7356dd08b0ae", "9785805af1b8",
+                       "a6c9e96a10d7")
+APTOS_EXPECTED_COUNTS = {"train": 2921, "val": 730}
+APTOS_POPULATION = 3651
+
+# ------------------------------------------------------------------ APTOS cache generation (§46)
+STAGE3_PARITY_N = 25            # fixed-seed parity ids (spec §2)
+STAGE3_PARITY_TOL = 1e-4
+RGB_PARITY_TOL = 1e-6           # canonical RGB recomputed from the Stage-2 output must match the cache
+FRESHNESS_CANARY_N = 8          # recompute 8 Stage-4 maps after generation; max |delta| <= 2/255
+CANARY_TOL_COUNTS = 2
+PARITY_SEED = 20261001
+STAGE4_GATE_OVERRIDE_TOKEN = "PROCEED_WITH_A_STAGE4_MODEL_THAT_FAILED_THE_GATE"
+
+# ------------------------------------------------------------------ C2 information screen (§40 §10, pre-registered)
+C2_R_FEATURES_REL = "HR_Screen_ImageNet/v1/hr_screen_features.npz"     # under Drive experiments/
+C2_R_FEATURES_SHA256 = "0f8addb8382ae60a5be3a1bfb4f1e01def47c60a4dbc9373272a1c9cb3c0a245"
+C2_K_TOTAL = 64                 # every arm has 64 probe dimensions (two-block arms: 32 + 32)
+C2_N_REPEATS = 10               # outer stratified 5-fold x 10 repeats, identical folds for all arms
+C2_N_FOLDS = 5
+C2_CS = (0.01, 0.1, 1.0, 10.0)
+C2_N_BOOT = 2000                # paired, grade-stratified bootstrap
+C2_SEED = 20261001
+C2_CUTS = (1, 2, 3, 4)          # cumulative cuts grade >= c
+C2_MIN_DELTA = 0.005            # PASS iff R+Q - R >= +0.005 AND bootstrap CI lower > 0 AND R+Q >= Q
+
+# ------------------------------------------------------------------ experiment roots (Drive experiments/)
+EXPERIMENT_DIRS = {"stage4": "Stage4V2", "c2": "C2", "arch1": "Architecture1"}
+
 # ------------------------------------------------------------------ legacy locations (never used)
 LEGACY_DIRS = (
     config.LOCAL_FEATURE_RESULTS_DIR,                              # loose legacy lesion/vessel/rgb cache

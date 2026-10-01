@@ -117,6 +117,18 @@ def assert_legacy_vessel_source(path):
     return path
 
 
+def assert_legacy_rgb_source(path):
+    """The other permitted legacy read: a loose canonical Stage-2 RGB file (`APTOS_<id>_rgb_512x512.npy`,
+    = joint_training_dataset._resize_rgb_01 of the Stage-2 output), copied into `Stage2/rgb-v1/` after its
+    parity check. It is Stage-2 output, not Stage-4; never a lesion file, never an archive shard."""
+    name = os.path.basename(str(path))
+    if not re.fullmatch(r"APTOS_[0-9a-f]+_rgb_512x512\.npy", name):
+        raise LegacyArtifactError(f"{path} is not a loose canonical RGB cache file.")
+    if "cache_archive" in str(path).replace("\\", "/").split("/"):
+        raise LegacyArtifactError(f"{path} is inside a legacy mixed cache archive.")
+    return path
+
+
 def _atomic_write_bytes(path, writer):
     assert_not_legacy_path(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
