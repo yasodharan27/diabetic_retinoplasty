@@ -60,6 +60,33 @@ class ProtocolTests(unittest.TestCase):
         worse = dict(good, metrics=dict(good["metrics"], qwk=0.87))
         self.assertFalse(at.one_seed_checks(worse, p42)["checks"]["noninferior_qwk"])
 
+    def test_final_verdict_opens_only_when_every_preset_criterion_passes(self):
+        p42 = {"qwk": 0.90, "auroc_ge3_g4_vs_g012": 0.80, "grade3_recall": 0.50, "false_urgent_rate": 0.05}
+        cfg = {"seed": 42, "git_commit": "abc", "stage4_sha256": "s4", "stage3_sha256": "s3", "ema": at.EMA}
+
+        def best(dqwk, qwk=0.89):
+            res = {"metrics": {"qwk": qwk, "auroc_ge3_g4_vs_g012": 0.795, "grade3_recall": 0.45,
+                               "false_urgent_rate": 0.06},
+                   "permutation": {k: {"qwk": qwk + dqwk, "dqwk": dqwk, "auroc_ge3_g4_vs_g012": 0.7}
+                                   for k in ("pathology", "vessel", "both")},
+                   "checkpoint": {"which": "BEST", "weights_sha256": "0" * 64, "best_epoch": 3}}
+            res["one_seed_checks"] = at.one_seed_checks(res, p42)
+            return res
+
+        opened = at.final_verdict(cfg, best(-0.02), p42, c2_pass=False)
+        self.assertEqual(opened["status"], "OPEN")
+        self.assertAlmostEqual(opened["criteria"]["lesion_shuffle"]["qwk_drop"], 0.02)
+        self.assertIn("FAILED", opened["statements"]["c2"])
+        self.assertIn("No EMA", opened["statements"]["ema"])
+        self.assertEqual(opened["identity"]["ema"], "none")
+        ignored = at.final_verdict(cfg, best(-0.005), p42, c2_pass=False)       # maps not used -> closed
+        self.assertEqual((ignored["status"], ignored["failed_criteria"]), ("CLOSED", ["lesion_shuffle"]))
+        worse = at.final_verdict(cfg, best(-0.02, qwk=0.87), p42, c2_pass=False)
+        self.assertEqual((worse["status"], worse["failed_criteria"]), ("CLOSED", ["qwk"]))
+        text = at.verdict_markdown(opened)
+        for needle in ("OPEN", "exploratory", "No EMA", "lesion-shuffle QWK drop", "not statistically conclusive"):
+            self.assertIn(needle, text)
+
     def test_metrics_from_logits(self):
         rng = np.random.default_rng(0)
         grades = np.array([0, 1, 2, 3, 4] * 4)
@@ -131,10 +158,20 @@ class TrainingLoopTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(run_dir, "checkpoints")))
             import multiseed_runs as msr
             self.assertIsNotNone(msr.read_stop_decision(run_dir))            # epoch cap reached
-            res = at.evaluate_run(run_dir, bundle, 42, ref, CW, grade_of=grade_of, mixed_precision=False)
+            p42 = {"qwk": 0.90, "auroc_ge3_g4_vs_g012": 0.80, "grade3_recall": 0.50, "false_urgent_rate": 0.05}
+            res = at.evaluate_run(run_dir, bundle, 42, ref, CW, p42_metrics=p42, grade_of=grade_of,
+                                  mixed_precision=False)
             self.assertEqual(set(res), {"best", "last"})
             self.assertIn("pathology", res["best"]["permutation"])
             self.assertEqual(len(res["best"]["checkpoint"]["weights_sha256"]), 64)
+            self.assertEqual(cfg["ema"], "none")
+            self.assertEqual(res["last"]["checkpoint"]["completed_epoch"], 1)
+            verdict = at.write_verdict(run_dir, res, p42, c2_pass=False, sources={"p42": "fixture"})
+            self.assertIn(verdict["status"], ("OPEN", "CLOSED"))
+            self.assertEqual(len(verdict["history"]), 1)
+            self.assertEqual(verdict["identity"]["stage4_sha256"], fx.MODEL_SHA)
+            for name in ("verdict.json", "verdict.md"):
+                self.assertTrue(os.path.exists(os.path.join(run_dir, name)))
             self.assertTrue(os.path.exists(os.path.join(run_dir, "metrics", "per_sample_best.csv")))
             with self.assertRaises(RuntimeError):                            # same dir, different protocol
                 at.train_seed(run_dir, bundle, 42, ref, CW, repo_dir=os.getcwd(), staging_dir=os.path.join(tmp, "s"),

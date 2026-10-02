@@ -28,6 +28,8 @@ P_PROTOCOL = {"batch_size": 2, "max_epochs": 50, "learning_rate": 1e-4, "weight_
 FIRST_SEED = 42
 PERMUTATION_SEED = 20261001
 ONE_SEED_CHECKS = {"q_permutation_dqwk_max": -0.01, "noninferiority_qwk": -0.02, "noninferiority_auroc": -0.01}
+#: No EMA: the run follows the P protocol, which has none (an explicit deviation from the §40 planning note).
+EMA = "none"
 
 
 def assert_protocol(prereg, class_weights):
@@ -69,7 +71,7 @@ def run_mapping(bundle, seed, class_weights, protocol=P_PROTOCOL, repo_dir=None)
             "prior_dims": list(arch1_model.PRIOR_DIMS), "convnext_dims": list(arch1_model.DIMS),
             "class_weights": [float(w) for w in class_weights], "optimizer": "AdamW (no decay on 1-D)",
             "augmentation": "P: lfed._augment_spatial (all channels) + _augment_intensity_rgb (RGB only)",
-            **protocol, "mixed_precision": True, "git_commit": git_commit(repo_dir)}
+            **protocol, "mixed_precision": True, "ema": EMA, "git_commit": git_commit(repo_dir)}
 
 
 def config_hash(mapping):
@@ -283,8 +285,11 @@ def evaluate_run(run_dir, bundle, seed, reference, class_weights, protocol=P_PRO
         weights = os.path.join(gen_dir, ckpt.MODEL_WEIGHTS_FILENAME)
         ckpt.load_model_weights_only(model, weights)
         res, rows = evaluate(model, bundle, val_entries)
+        state = ckpt.read_state(gen_dir)
         res["checkpoint"] = {"which": which.upper(), "generation": gen_dir,
-                             "weights_sha256": _sha256(weights)}
+                             "weights_sha256": _sha256(weights), "completed_epoch": state.completed_epoch,
+                             "best_epoch": state.best_epoch, "best_metric": state.best_metric,
+                             "monitor": state.monitor, "learning_rate": state.learning_rate}
         if p42_metrics is not None and which == "best":
             res["one_seed_checks"] = one_seed_checks(res, p42_metrics)
         pd.DataFrame(rows).to_csv(posixpath.join(out_dir, f"per_sample_{which}.csv"), index=False)
@@ -292,6 +297,106 @@ def evaluate_run(run_dir, bundle, seed, reference, class_weights, protocol=P_PRO
             json.dump(res, fh, indent=1, default=float)
         results[which] = res
     return results
+
+
+# --------------------------------------------------------------------------- final verdict
+
+def final_verdict(config, best, p42_metrics, c2_pass, last=None, history=None, stop=None, sources=None):
+    """The pre-set one-seed criteria (§40 step 6) as one record. `best` = evaluate_run()["best"] WITH
+    "one_seed_checks". Architecture 1 stays OPEN only if every criterion passes; any failure CLOSES it.
+    No criterion here is a superiority test, and one seed is not statistically conclusive."""
+    import pl_convnext as pl
+    m, checks, perm = best["metrics"], best["one_seed_checks"]["checks"], best["permutation"]["pathology"]
+    g3_kind, g3_bound = pl.GUARDRAILS["grade3_recall"]
+    fu_kind, fu_bound = pl.GUARDRAILS["false_urgent_rate"]
+    criteria = {
+        "qwk": {"arch1": m["qwk"], "p42": p42_metrics["qwk"], "delta": m["qwk"] - p42_metrics["qwk"],
+                "required": f"Architecture-1 QWK >= P-42 QWK {ONE_SEED_CHECKS['noninferiority_qwk']:+.2f}",
+                "passed": checks["noninferior_qwk"]},
+        "auroc_ge3_g4_vs_g012": {
+            "arch1": m["auroc_ge3_g4_vs_g012"], "p42": p42_metrics["auroc_ge3_g4_vs_g012"],
+            "delta": m["auroc_ge3_g4_vs_g012"] - p42_metrics["auroc_ge3_g4_vs_g012"],
+            "required": f"Architecture-1 AUROC >= P-42 AUROC {ONE_SEED_CHECKS['noninferiority_auroc']:+.2f}",
+            "passed": checks["noninferior_auroc"]},
+        "lesion_shuffle": {
+            "qwk": m["qwk"], "qwk_shuffled": perm["qwk"], "qwk_drop": -perm["dqwk"],
+            "required": f"QWK drop >= {-ONE_SEED_CHECKS['q_permutation_dqwk_max']:.2f} when the Stage-4 lesion maps "
+                        "are shuffled across validation images (RGB and vessel unchanged)",
+            "passed": checks["q_permutation_contributes"]},
+        "grade3_recall": {"arch1": m["grade3_recall"], "p42": p42_metrics["grade3_recall"],
+                          "delta": m["grade3_recall"] - p42_metrics["grade3_recall"],
+                          "required": f"delta vs P-42 >= {g3_bound:+.2f}", "passed": checks["guardrail_grade3_recall"]},
+        "false_urgent_rate": {"arch1": m["false_urgent_rate"], "p42": p42_metrics["false_urgent_rate"],
+                              "delta": m["false_urgent_rate"] - p42_metrics["false_urgent_rate"],
+                              "required": f"delta vs P-42 <= {fu_bound:+.2f}",
+                              "passed": checks["guardrail_false_urgent_rate"]},
+    }
+    all_pass = all(c["passed"] for c in criteria.values())
+    failed = [k for k, c in criteria.items() if not c["passed"]]
+    return {
+        "experiment": "Architecture1", "seed": config["seed"], "status": "OPEN" if all_pass else "CLOSED",
+        "failed_criteria": failed, "criteria": criteria,
+        "descriptive_permutations": {k: best["permutation"][k] for k in ("vessel", "both")},
+        "identity": {k: config.get(k) for k in ("git_commit", "config_hash", "stage3_sha256", "stage4_sha256",
+                                                 "stage4_generation", "bundle_id", "bundle_fingerprint",
+                                                 "split_sha256", "population_sha256", "ema")},
+        "checkpoints": {"best": best["checkpoint"], "last": (last or {}).get("checkpoint")},
+        "last_checkpoint_metrics": None if last is None else {
+            "qwk": last["metrics"]["qwk"], "auroc_ge3_g4_vs_g012": last["metrics"]["auroc_ge3_g4_vs_g012"]},
+        "stop": stop, "history": history, "sources": sources,
+        "statements": {
+            "c2": ("C2 had already FAILED its pre-registered criterion before this run; this was an exploratory, "
+                   "low-prior falsification test, not a confirmatory experiment."
+                   if not c2_pass else "C2 passed its pre-registered criterion before this run."),
+            "ema": "No EMA was used (P protocol; explicit deviation from the §40 planning note).",
+            "scope": "One seed (42); not statistically conclusive. The criteria are non-inferiority, a "
+                     "lesion-dependency check and guardrails -- none is a superiority test, so no superiority "
+                     "over P is claimed.",
+            "meaning": ("All pre-set criteria passed: the model demonstrably uses the lesion maps and the route "
+                        "remains open for further investigation. This does not show the maps improve grading."
+                        if all_pass else
+                        f"Pre-set closure criterion failed ({', '.join(failed)}): Architecture 1 is closed as a "
+                        "downstream route for this pipeline."),
+        },
+    }
+
+
+def verdict_markdown(v):
+    c = v["criteria"]
+    mark = lambda ok: "PASS" if ok else "FAIL"                                  # noqa: E731
+    lines = [f"# Architecture 1 -- seed {v['seed']} -- {v['status']}", "",
+             v["statements"]["c2"], v["statements"]["ema"], v["statements"]["scope"], "",
+             "| criterion | Architecture 1 | P-42 | delta | required | result |", "|---|---|---|---|---|---|"]
+    for key, label in (("qwk", "QWK"), ("auroc_ge3_g4_vs_g012", "AUROC (>=3; grade 4 vs 0-2)"),
+                       ("grade3_recall", "grade-3 recall"), ("false_urgent_rate", "false-urgent rate")):
+        r = c[key]
+        lines.append(f"| {label} | {r['arch1']:.4f} | {r['p42']:.4f} | {r['delta']:+.4f} | {r['required']} | "
+                     f"{mark(r['passed'])} |")
+    s = c["lesion_shuffle"]
+    lines += [f"| lesion-shuffle QWK drop | {s['qwk']:.4f} -> {s['qwk_shuffled']:.4f} | -- | {s['qwk_drop']:+.4f} | "
+              f">= 0.01 | {mark(s['passed'])} |", "", v["statements"]["meaning"], ""]
+    ident = v["identity"]
+    lines += [f"- git commit `{ident['git_commit']}`; Stage-3 `{ident['stage3_sha256']}`; Stage-4 "
+              f"`{ident['stage4_sha256']}` ({ident['stage4_generation']})",
+              f"- bundle `{ident['bundle_id']}`, fingerprint `{ident['bundle_fingerprint']}`; split "
+              f"`{ident['split_sha256']}`; EMA: {ident['ema']}",
+              f"- BEST checkpoint: epoch index {v['checkpoints']['best'].get('best_epoch')} "
+              f"(weights `{v['checkpoints']['best']['weights_sha256']}`); stop: {v['stop']}"]
+    return "\n".join(lines) + "\n"
+
+
+def write_verdict(run_dir, results, p42_metrics, c2_pass, sources=None):
+    """verdict.json + verdict.md in the run directory, from evaluate_run()'s results (with P-42 metrics)."""
+    import multiseed_runs as msr
+    with open(posixpath.join(run_dir, "config.json")) as fh:
+        config = json.load(fh)
+    verdict = final_verdict(config, results["best"], p42_metrics, bool(c2_pass), results.get("last"),
+                            msr.read_history(run_dir), msr.read_stop_decision(run_dir), sources)
+    with open(posixpath.join(run_dir, "verdict.json"), "w") as fh:
+        json.dump(verdict, fh, indent=1, default=float)
+    with open(posixpath.join(run_dir, "verdict.md"), "w", encoding="utf-8") as fh:
+        fh.write(verdict_markdown(verdict))
+    return verdict
 
 
 def _sha256(path):

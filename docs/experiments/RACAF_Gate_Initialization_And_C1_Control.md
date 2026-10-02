@@ -3307,3 +3307,122 @@ The read-only audit found one CRITICAL defect and several smaller items. Fixed h
 - The EMA decision (open).
 - `PROJECT_CODE.md`, which still describes the old Stage 04; the user asked for it not to be modified.
 - A Stage-3 regeneration path: the code stops if parity fails, as specified.
+
+### 49.1 APTOS cache run — Stage 3 done; RGB copy completed server-side (2026-10-02)
+
+`stage4_v2_aptos_cache.ipynb`, first run:
+- **Stage 3:** parity passed. 3,651 vessel maps, the manifest and `c2_v_pyramid.npz` are on Drive (`cache/Stage3/s3-91f0cada/`).
+- **RGB:** parity max |Δ| = 0.0 (tol 1e-6).
+- **Stall:** the Drive→Drive copy through Colab's FUSE mount stalled after about 1,000 files were recorded (586 actually uploaded; no progress for about 19 minutes). The cause was upload backlog or throttling after several thousand rapid file creations. The runtime was deleted.
+- **Completion:** the RGB copy was finished from the laptop with an rclone **server-side** copy (`cache/LocalFeatureExtraction/APTOS_<id>_rgb_512x512.npy` → `cache/Stage2/rgb-v1/rgb/`) for exactly the 3,651 population ids. The legacy folder holds 3,662 RGB files; the 11 pinned empty-FOV ids are excluded.
+- **Verification from Drive metadata:** 3,651 files, 0 duplicates, 0 missing, 0 extra, and every SHA-256 and size equal to its source.
+- `cache/Stage2/rgb-v1/copy_progress.json` was written with those SHA-256 values, so the notebook skips the copy and still runs its own full verification pass (array validation + SHA) and writes the Stage-2 manifest.
+
+No legacy file was modified. No Stage-4 map exists yet.
+
+## 50. APTOS Stage-4 v2 cache complete; C2 information screen — **FAIL** (2026-10-02)
+
+**Cache.** `stage4_v2_aptos_cache.ipynb` completed on Colab.
+- Bundle `rgb-v1__s3-91f0cada__s4v2-cb5fc7a8d370-K4`, fingerprint `5069adc0fd7ae0774ef775ae64786931c7aed6e54d7ef90f6dc6ac25c73cba8d`.
+- 3,651 images; Stage-4 SHA `cb5fc7a8…`; Stage-3 SHA `91f0cada…`; split `bc80fd45…`; population SHA `fc55cdde…`.
+- Channels: MA / HE / EX / SE, each as mean and max.
+
+**C2.** `stage4_v2_c2.py` on the laptop CPU; 1,210 s; run once.
+- Inputs:
+  - R = `hr_screen_features.npz` (SHA `0f8addb8…`, verified);
+  - Q = `c2_q_pyramid.npz` (3,651 × 336; provenance model `cb5fc7a8…`);
+  - V = `c2_v_pyramid.npz` (3,651 × 42).
+- APTOS training split only: n = 2,921, grades [1444, 296, 791, 154, 236]. Validation not read.
+- k = 64; 10 × 5-fold; 2,000 grade-stratified paired bootstraps.
+- Output: `results/C2/c2_cb5fc7a8d370_2026-10-02_08-46-52/` (results.json SHA `2fb64280…`), copied to `gdrive:DiabeticRetinopathy/experiments/C2/`.
+
+| arm | mean AUROC (95 % CI) | ≥1 | ≥2 | ≥3 | ≥4 |
+|---|---|---|---|---|---|
+| R_64 | 0.9581 (0.9512–0.9642) | 0.9970 | 0.9804 | 0.9421 | 0.9130 |
+| Q_64 | 0.9268 (0.9191–0.9339) | 0.9974 | 0.9758 | 0.8991 | 0.8348 |
+| R_32 ⊕ Q_32 | 0.9577 (0.9511–0.9636) | 0.9985 | 0.9812 | 0.9424 | 0.9086 |
+| R_32 ⊕ V_32 | 0.9545 (0.9480–0.9608) | 0.9968 | 0.9778 | 0.9375 | 0.9061 |
+
+**Primary (pre-registered):** R⊕Q − R = **−0.0005** (95 % CI −0.0042 to +0.0033).
+
+**Checks:**
+- Δ ≥ +0.005: **false**.
+- CI lower > 0: **false**.
+- R⊕Q ≥ Q: true (+0.0309, CI +0.0240 to +0.0378).
+
+**→ C2 FAIL.** The CI upper bound (+0.0033) lies below the pre-registered minimum effect (+0.005).
+
+**Descriptive:**
+- V increment: R⊕V − R = −0.0036 (−0.0075 to +0.0002).
+- Leave-one-class-out, R⊕Q minus R⊕Q without the class; every CI includes 0:
+
+  | class | Δ |
+  |---|---|
+  | MA | −0.0011 |
+  | HE | +0.0021 |
+  | EX | −0.0005 |
+  | SE | −0.0010 |
+
+**Reading:**
+- The Stage-4 v2 maps do carry grading information on their own: Q_64 scores 0.927, and equals R at ≥1 and ≥2. They are clearly weaker at ≥3 and ≥4.
+- At matched capacity, that information is already contained in the frozen ImageNet ConvNeXt features. Replacing half of R's capacity with Q neither helps nor hurts. This is **substitution, not complementarity** — the same pattern as §34.
+
+**Limits of the screen** (stated in §40 before it ran):
+- pyramid-pooled mean/max features discard fine spatial detail;
+- the probe is linear on frozen features;
+- training-split cross-validation only.
+
+**Consequence under §40:** Architecture 1 ("D") is allowed only as a clearly low-prior test; the notebook requires `ACKNOWLEDGE_C2_FAIL`. PL remains the completed fallback that satisfies the binding Stage 3/4 requirement. Decision pending (user).
+
+
+## 51. Architecture 1 — seed-42 exploratory run: pre-run record (2026-10-02; written before training)
+
+**Status.** C2 failed its pre-registered criterion (§50). Architecture 1 seed 42 is therefore a low-prior exploratory / falsification test, not a confirmatory experiment. One seed only; no further seeds run automatically. Training is run manually in Colab (`architecture1_training.ipynb`).
+
+**C2 diagnostic audit (read-only; stored C2 outputs only, nothing refitted against grades).**
+- Per-cut R⊕Q − R: ≥1 +0.0014, ≥2 +0.0008, ≥3 +0.0003, ≥4 −0.0045. Q − R: +0.0004, −0.0046, −0.0430, −0.0782.
+- The information loss in Q is in the pooling (2,097,152 cache values → 336 grid statistics; finest cell 128 × 128 px), not in the probe's PCA (PCA-32 keeps 85 % of Q's variance, PCA-64 94 %; label-free check on the 2,921 training rows).
+- Capacity matching masks little: R_32 ≈ R_64 at ≥3 (0.941 vs 0.942, §34).
+- Image-level peak probability ≥ 0.9 in 53 % (MA), 58 % (HE), 81 % (EX) of training images, so the "max" half of Q is weak. Architecture 1 receives the same maps.
+- Classification: C2 is evidence of redundancy for pooled, linearly-read lesion statistics; it cannot test pixel-aligned, multi-scale, non-linear, end-to-end use of the maps. That untested capability is the only reason this run is made.
+
+**EMA.** Not used. The implementation follows the P protocol, which has no EMA. This is an explicit deviation from the §40 planning note ("EMA shadow"). EMA is not evaluated separately. `config.json` records `"ema": "none"`.
+
+**Pre-run audit (laptop; Drive manifests read via rclone).**
+
+| check | result |
+|---|---|
+| Stage-4 model SHA in bundle and Stage-4 manifest | `cb5fc7a8d370af7d2ae191cadaebdde858f71820d147fb76f852b757766f8ad8` |
+| Stage-4 generation | `s4v2-cb5fc7a8d370-K4`; channels MA/HE/EX/SE × mean/max |
+| Stage-3 SHA | `91f0cada…` (generation `s3-91f0cada`); parity passed, max \|Δ\| 8.3e-7 |
+| RGB parity | passed, max \|Δ\| 0.0 |
+| split SHA | `bc80fd45…`; population SHA `fc55cdde…`; bundle fingerprint `5069adc0…` |
+| training ids | 2,921 = authoritative training split minus the 11 pinned empty-FOV ids (same order) |
+| validation ids | 730 = authoritative validation split minus those ids (same order); no overlap with training |
+| P-42 comparison set | P-42 `per_sample_best.csv` has the same 730 ids in the same order |
+| IDRiD | the bundle accepts only 12-hex APTOS ids; no IDRiD path is read by `arch1_*` |
+| legacy Stage-4 | deny-listed SHA, legacy-path and non-v2-generation refusals unchanged |
+| C2 | read only for its PASS/FAIL flag; not a target, weight or hyper-parameter |
+| mixed precision | forward + 3 optimizer steps under `mixed_float16` on CPU at 64 px: finite, loss-scaled AdamW |
+
+**Protocol (unchanged).** Model, prior encoder, gated injection, CORN, AdamW 1e-4 / wd 0.05, ReduceLROnPlateau, augmentation, batch 2, BEST-by-val-QWK selection, seed 42 — as committed in `4c35b9a`.
+
+**Pre-set criteria (§40 step 6), with the P-42 BEST values they refer to.**
+
+| criterion | P-42 | Architecture 1 must reach |
+|---|---|---|
+| QWK | 0.9184 | ≥ 0.8984 |
+| AUROC (≥3; grade 4 vs 0–2) | 0.9588 | ≥ 0.9488 |
+| lesion-shuffle QWK drop (Stage-4 maps permuted across validation images; RGB and vessel unchanged) | — | ≥ 0.01 |
+| grade-3 recall | 0.6154 | ≥ 0.5154 |
+| false-urgent rate | 0.0379 | ≤ 0.0579 |
+
+**Interpretation, fixed before the run.**
+- Lesion-shuffle passing shows the model uses the lesion maps. It does not show they improve grading.
+- All five passing: the route stays open for further investigation.
+- Any one failing: Architecture 1 is closed as a downstream route for this pipeline.
+- No criterion is a superiority test. One seed is not statistically conclusive.
+
+**Code changes for this run (no model, data or training-loop change).**
+- `arch1_train.py`: `config.json` records `ema`; BEST/LAST checkpoint metadata include epoch and monitor value; `write_verdict` writes `verdict.json` / `verdict.md` (criteria, P-42 comparison, identity, history, statements).
+- `architecture1_training.ipynb`: pins the approved model SHA and the §50 C2 results file; `ACKNOWLEDGE_C2_FAIL = True`; asserts the split, population and P-42 validation ids; uses the base Colab setup (no TJDR / IDRiD / Stage-4 weight checks); writes the verdict.
