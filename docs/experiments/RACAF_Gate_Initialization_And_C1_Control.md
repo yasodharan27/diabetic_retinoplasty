@@ -3426,3 +3426,39 @@ No legacy file was modified. No Stage-4 map exists yet.
 **Code changes for this run (no model, data or training-loop change).**
 - `arch1_train.py`: `config.json` records `ema`; BEST/LAST checkpoint metadata include epoch and monitor value; `write_verdict` writes `verdict.json` / `verdict.md` (criteria, P-42 comparison, identity, history, statements).
 - `architecture1_training.ipynb`: pins the approved model SHA and the §50 C2 results file; `ACKNOWLEDGE_C2_FAIL = True`; asserts the split, population and P-42 validation ids; uses the base Colab setup (no TJDR / IDRiD / Stage-4 weight checks); writes the verdict.
+
+
+## 52. Architecture 1 — extended to three sequential seeds (42 → 123 → 2026): pre-run record (2026-10-02; written before any Architecture-1 training)
+
+**What changed.** The §51 seed-42 run becomes a three-seed sequential evaluation: seeds 42, 123, 2026, in that order, in one notebook. Only the orchestration changed. When this was written no Architecture-1 run existed (`gdrive:DiabeticRetinopathy/experiments/Architecture1` did not exist), so the plan is fixed before any result.
+
+**Unchanged.** Architecture, prior encoder, gated injection, CORN, optimizer, learning rate and schedule, augmentation, batch size, BEST-by-val-QWK selection, split, bundle, Stage-3 and Stage-4 models, the lesion-shuffle protocol (one fixed derangement, permutation seed 20261001, the same for every seed), no EMA. C2 is not rerun. IDRiD is not read. Nothing is tuned between seeds, and no seed's result changes another seed.
+
+**Per-seed closure criteria — the §51 five, against P-42 BEST, for every seed.**
+
+| criterion | P-42 | each seed must reach |
+|---|---|---|
+| QWK | 0.9184 | ≥ 0.8984 |
+| AUROC (≥3; grade 4 vs 0–2) | 0.9588 | ≥ 0.9488 |
+| lesion-shuffle QWK drop | — | ≥ 0.01 |
+| grade-3 recall | 0.6154 | ≥ 0.5154 |
+| false-urgent rate | 0.0379 | ≤ 0.0579 |
+
+Seeds 123 and 2026 are judged against the same P-42 values, as specified; the matched-seed P runs (P-123, P-2026) are not used as references.
+
+**Route-level reading over the three seeds, fixed before the run.** This replaces §51's single-seed rule ("any one failing closes the route"), which was written when only seed 42 was planned.
+- All three seeds pass all five checks: the route remains viable, and lesion-map use is supported by the shuffle tests.
+- Every seed fails the checks: Architecture 1 is closed.
+- Mixed: the inconsistency is reported; nothing is tuned and no seed is rerun.
+- This is not a pre-registered superiority experiment. No superiority threshold exists, and none is claimed from the means.
+
+**Orchestration (`arch1_train.py`).**
+- `run_sequence` runs `SEEDS = (42, 123, 2026)` in order. Run directories: `experiments/Architecture1/arch1_cb5fc7a8d370_seed{42,123,2026}/`.
+- Fresh initialisation: each seed's model is built inside `train_seed` from the frozen pretrained ConvNeXt weights and that seed's own initialisation; nothing learned passes between seeds. `initialization.json` records the hash of the weights each seed started from.
+- A run directory is bound to its seed: `config.json` carries the seed in its hash, and a directory with another configuration is refused.
+- Resume: rerunning keeps completed seeds as recorded, resumes the interrupted seed from its own checkpoint, and starts later seeds fresh. A fresh lock left by a dead runtime is waited out (as in the P/PL notebook) instead of failing.
+- Failure: any exception stops the sequence; no later seed starts and no summary is written. A seed that returns without a stop decision is an error, not a skip.
+- Per seed: `config.json`, `initialization.json`, checkpoints (BEST and LAST), `history/`, `metrics/`, `verdict.json`, `verdict.md`.
+- Summary, only after all three verdicts exist: `experiments/Architecture1/arch1_cb5fc7a8d370_3seed_summary/summary.{json,md}` — per-seed values, mean, SD (n−1), per-seed pass/fail, seeds passing each check, shuffle results, and the route reading above.
+
+**Tests (CPU; no real training).** Seed order and separate directories; fresh initialisation (a model built after another seed has trained equals a pristine build; the pretrained reference is never modified); resume of the real loop from its checkpoint without re-initialisation; a failed or unfinished seed stops the sequence with no summary; aggregate mean / SD / pass counts and the three route readings.

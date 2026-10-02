@@ -12,12 +12,18 @@ Pre-specified one-seed checks (§40 step 6), reported -- never used to tune anyt
   * non-inferiority vs P-42: QWK >= P-42 - 0.02 and AUROC(P>=3, grade 4 vs 0-2) >= P-42 - 0.01;
   * guardrails vs P-42 (pl_convnext.GUARDRAILS): grade-3 recall >= -0.10, false-urgent rate <= +0.02.
 Permutations of V and of V+Q are reported descriptively (spec §9 contribution tests).
+
+Three-seed sequence (record §52): `run_sequence` runs SEEDS in order, each in its own run directory, each
+model freshly built from the frozen pretrained ConvNeXt weights and its own seed; `write_summary` aggregates
+only when all three seeds have a verdict. The five checks stay per-seed closure criteria against P-42 --
+nothing here is a superiority test, and nothing is tuned between seeds.
 """
 import hashlib
 import json
 import os
 import posixpath
 import subprocess
+import time
 
 import numpy as np
 
@@ -26,6 +32,8 @@ P_PROTOCOL = {"batch_size": 2, "max_epochs": 50, "learning_rate": 1e-4, "weight_
               "monitor": "val_QWK", "mode": "max", "early_stopping_patience": 12, "reduce_lr_patience": 4,
               "reduce_lr_factor": 0.5, "min_lr": 1e-6}
 FIRST_SEED = 42
+#: The P/PL run seeds, in execution order. Exactly these; one run directory each.
+SEEDS = (42, 123, 2026)
 PERMUTATION_SEED = 20261001
 ONE_SEED_CHECKS = {"q_permutation_dqwk_max": -0.01, "noninferiority_qwk": -0.02, "noninferiority_auroc": -0.01}
 #: No EMA: the run follows the P protocol, which has none (an explicit deviation from the §40 planning note).
@@ -77,6 +85,51 @@ def run_mapping(bundle, seed, class_weights, protocol=P_PROTOCOL, repo_dir=None)
 def config_hash(mapping):
     keep = {k: v for k, v in mapping.items() if k != "git_commit"}
     return hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def ensure_run_config(run_dir, mapping):
+    """Writes config.json once and returns its hash. A run directory is bound to ONE configuration (seed,
+    data, model, protocol): an existing directory with another one is refused, never overwritten."""
+    chash = config_hash(mapping)
+    cfg_path = posixpath.join(run_dir, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as fh:
+            old = json.load(fh)
+        if old.get("config_hash") != chash:
+            raise RuntimeError(f"{run_dir}: existing run has a different configuration (seed/data/model/protocol); "
+                               "start a new run directory instead of overwriting")
+    else:
+        os.makedirs(run_dir, exist_ok=True)
+        with open(cfg_path, "w") as fh:
+            json.dump({**mapping, "config_hash": chash}, fh, indent=1, default=str)
+    return chash
+
+
+def _pretrained_sha256():
+    import pl_convnext as pl
+    return pl.WEIGHTS_SHA256
+
+
+def weights_sha256(model):
+    """Content hash of every model weight (shape + values, in construction order), to record what a seed
+    started from. Layer names are left out: Keras auto-numbers them per process."""
+    h = hashlib.sha256()
+    for v in model.weights:
+        h.update(str(tuple(v.shape)).encode())
+        h.update(np.ascontiguousarray(np.asarray(v.numpy(), np.float32)).tobytes())
+    return h.hexdigest()
+
+
+def acquire_lock_waiting(run_dir, log=print, sleep=time.sleep, poll_seconds=60):
+    """msr.acquire_lock never forces. After a disconnect the dead runtime's lock stays fresh for up to its
+    TTL; wait for it to go stale (as the P/PL notebook does) instead of failing the resume."""
+    import multiseed_runs as msr
+    while True:
+        try:
+            return msr.acquire_lock(run_dir, owner_id=msr.OWNER_ID)
+        except msr.RunLockedError as error:
+            log(f"  lock held by another runtime; waiting for it to go stale. ({error})")
+            sleep(poll_seconds)
 
 
 def build_compiled_model(channels, seed, reference, class_weights, protocol=P_PROTOCOL, mixed_precision=True,
@@ -182,18 +235,7 @@ def train_seed(run_dir, bundle, seed, reference, class_weights, *, repo_dir, sta
     from training import checkpointing as ckpt
     epochs = int(max_epochs or protocol["max_epochs"])
     msr.ensure_run_dir(run_dir)
-    mapping = run_mapping(bundle, seed, class_weights, protocol, repo_dir)
-    chash = config_hash(mapping)
-    cfg_path = posixpath.join(run_dir, "config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as fh:
-            old = json.load(fh)
-        if old.get("config_hash") != chash:
-            raise RuntimeError(f"{run_dir}: existing run has a different configuration (data/model/protocol); "
-                               "start a new run directory instead of overwriting")
-    else:
-        with open(cfg_path, "w") as fh:
-            json.dump({**mapping, "config_hash": chash}, fh, indent=1, default=str)
+    chash = ensure_run_config(run_dir, run_mapping(bundle, seed, class_weights, protocol, repo_dir))
     if msr.read_stop_decision(run_dir) is not None:
         log("  run already stopped")
         return
@@ -203,7 +245,7 @@ def train_seed(run_dir, bundle, seed, reference, class_weights, *, repo_dir, sta
         return
     tf.keras.backend.clear_session()
     model = build_compiled_model(bundle.channels, seed, reference, class_weights, protocol, mixed_precision)
-    msr.acquire_lock(run_dir, owner_id=msr.OWNER_ID)
+    acquire_lock_waiting(run_dir, log)
     try:
         trainer = Trainer(TrainingConfig(
             run_dir=run_dir, epochs=epochs, monitor=protocol["monitor"], mode=protocol["mode"],
@@ -219,6 +261,10 @@ def train_seed(run_dir, bundle, seed, reference, class_weights, *, repo_dir, sta
         if initial_epoch > 0:
             trainer.restore(model)
             log(f"  resumed at epoch {initial_epoch}")
+        else:                                       # a fresh model: record what this seed started from
+            with open(posixpath.join(run_dir, "initialization.json"), "w") as fh:
+                json.dump({"seed": int(seed), "initial_epoch": 0, "weights_sha256": weights_sha256(model),
+                           "pretrained_backbone_file_sha256": _pretrained_sha256()}, fh, indent=1)
         if initial_epoch >= epochs:
             msr.write_stop_decision(run_dir, initial_epoch, "epoch_cap")
             return
@@ -301,10 +347,11 @@ def evaluate_run(run_dir, bundle, seed, reference, class_weights, protocol=P_PRO
 
 # --------------------------------------------------------------------------- final verdict
 
-def final_verdict(config, best, p42_metrics, c2_pass, last=None, history=None, stop=None, sources=None):
-    """The pre-set one-seed criteria (§40 step 6) as one record. `best` = evaluate_run()["best"] WITH
-    "one_seed_checks". Architecture 1 stays OPEN only if every criterion passes; any failure CLOSES it.
-    No criterion here is a superiority test, and one seed is not statistically conclusive."""
+def final_verdict(config, best, p42_metrics, c2_pass, last=None, history=None, stop=None, sources=None,
+                  initialization=None):
+    """The pre-set per-seed criteria (§40 step 6) as one record. `best` = evaluate_run()["best"] WITH
+    "one_seed_checks". A seed is OPEN only if every criterion passes; any failure makes it CLOSED. The
+    route-level reading over SEEDS is `aggregate`. No criterion here is a superiority test."""
     import pl_convnext as pl
     m, checks, perm = best["metrics"], best["one_seed_checks"]["checks"], best["permutation"]["pathology"]
     g3_kind, g3_bound = pl.GUARDRAILS["grade3_recall"]
@@ -343,20 +390,20 @@ def final_verdict(config, best, p42_metrics, c2_pass, last=None, history=None, s
         "checkpoints": {"best": best["checkpoint"], "last": (last or {}).get("checkpoint")},
         "last_checkpoint_metrics": None if last is None else {
             "qwk": last["metrics"]["qwk"], "auroc_ge3_g4_vs_g012": last["metrics"]["auroc_ge3_g4_vs_g012"]},
-        "stop": stop, "history": history, "sources": sources,
+        "stop": stop, "history": history, "sources": sources, "initialization": initialization,
         "statements": {
             "c2": ("C2 had already FAILED its pre-registered criterion before this run; this was an exploratory, "
                    "low-prior falsification test, not a confirmatory experiment."
                    if not c2_pass else "C2 passed its pre-registered criterion before this run."),
             "ema": "No EMA was used (P protocol; explicit deviation from the §40 planning note).",
-            "scope": "One seed (42); not statistically conclusive. The criteria are non-inferiority, a "
-                     "lesion-dependency check and guardrails -- none is a superiority test, so no superiority "
-                     "over P is claimed.",
-            "meaning": ("All pre-set criteria passed: the model demonstrably uses the lesion maps and the route "
-                        "remains open for further investigation. This does not show the maps improve grading."
+            "scope": f"Seed {config['seed']} of the sequence {', '.join(str(x) for x in SEEDS)}; one seed is not "
+                     "statistically conclusive. The criteria are non-inferiority, a lesion-dependency check and "
+                     "guardrails against P-42 -- none is a superiority test, so no superiority over P is claimed.",
+            "meaning": ("All pre-set criteria passed for this seed: the model demonstrably uses the lesion maps and "
+                        "the seed leaves the route open. This does not show the maps improve grading."
                         if all_pass else
-                        f"Pre-set closure criterion failed ({', '.join(failed)}): Architecture 1 is closed as a "
-                        "downstream route for this pipeline."),
+                        f"Pre-set closure criterion failed for this seed ({', '.join(failed)}).")
+                       + " The route-level reading is the 3-seed summary.",
         },
     }
 
@@ -385,18 +432,223 @@ def verdict_markdown(v):
     return "\n".join(lines) + "\n"
 
 
+def _read_json(path):
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _write_json_last(path, payload):
+    """Atomic: the file appears only complete (its presence is what marks a seed / summary as finished)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=1, default=float)
+    os.replace(tmp, path)
+
+
 def write_verdict(run_dir, results, p42_metrics, c2_pass, sources=None):
-    """verdict.json + verdict.md in the run directory, from evaluate_run()'s results (with P-42 metrics)."""
+    """verdict.md, then verdict.json (written last, atomically) in the run directory, from evaluate_run()'s
+    results (with P-42 metrics)."""
     import multiseed_runs as msr
-    with open(posixpath.join(run_dir, "config.json")) as fh:
-        config = json.load(fh)
+    config = _read_json(posixpath.join(run_dir, "config.json"))
     verdict = final_verdict(config, results["best"], p42_metrics, bool(c2_pass), results.get("last"),
-                            msr.read_history(run_dir), msr.read_stop_decision(run_dir), sources)
-    with open(posixpath.join(run_dir, "verdict.json"), "w") as fh:
-        json.dump(verdict, fh, indent=1, default=float)
+                            msr.read_history(run_dir), msr.read_stop_decision(run_dir), sources,
+                            _read_json(posixpath.join(run_dir, "initialization.json")))
     with open(posixpath.join(run_dir, "verdict.md"), "w", encoding="utf-8") as fh:
         fh.write(verdict_markdown(verdict))
+    _write_json_last(posixpath.join(run_dir, "verdict.json"), verdict)
     return verdict
+
+
+# --------------------------------------------------------------------------- three-seed sequence
+
+def run_dir_for(experiments_root, stage4_sha256, seed):
+    if int(seed) not in SEEDS:
+        raise ValueError(f"seed must be one of {SEEDS}, got {seed!r}")
+    return posixpath.join(experiments_root, "Architecture1", f"arch1_{stage4_sha256[:12]}_seed{int(seed)}")
+
+
+def summary_dir_for(experiments_root, stage4_sha256):
+    return posixpath.join(experiments_root, "Architecture1", f"arch1_{stage4_sha256[:12]}_3seed_summary")
+
+
+def seed_state(run_dir):
+    """"complete" (verdict written) | "trained" (stop decided, not yet evaluated) | "in_progress" (started;
+    resumes from its own checkpoint) | "new"."""
+    import multiseed_runs as msr
+    if os.path.exists(posixpath.join(run_dir, "verdict.json")):
+        return "complete"
+    if msr.read_stop_decision(run_dir) is not None:
+        return "trained"
+    return "in_progress" if os.path.exists(posixpath.join(run_dir, "config.json")) else "new"
+
+
+def run_seed(run_dir, bundle, seed, reference, class_weights, p42_metrics, c2_pass, *, repo_dir, staging_dir,
+             sources=None, log=print, train_fn=None, evaluate_fn=None):
+    """One seed end to end in its own directory: train (or resume THIS seed's checkpoint), evaluate BEST and
+    LAST, write the verdict. A completed seed is returned as recorded, never retrained or re-evaluated.
+    `train_fn` / `evaluate_fn` default to train_seed / evaluate_run (tests substitute them)."""
+    import multiseed_runs as msr
+    if seed_state(run_dir) == "complete":
+        verdict = _read_json(posixpath.join(run_dir, "verdict.json"))
+        ident = verdict["identity"]
+        if (verdict["seed"] != int(seed) or ident["stage4_sha256"] != bundle.stage4_sha256
+                or ident["bundle_fingerprint"] != bundle.fingerprint):
+            raise RuntimeError(f"{run_dir}: the recorded verdict belongs to another seed, model or bundle")
+        log(f"  seed {seed}: already complete ({verdict['status']}) -- kept as recorded")
+        return verdict
+    (train_fn or train_seed)(run_dir, bundle, seed, reference, class_weights, repo_dir=repo_dir,
+                             staging_dir=staging_dir, log=log)
+    if msr.read_stop_decision(run_dir) is None:
+        raise RuntimeError(f"{run_dir}: seed {seed} returned without a stop decision -- training is not finished")
+    results = (evaluate_fn or evaluate_run)(run_dir, bundle, seed, reference, class_weights, p42_metrics=p42_metrics)
+    return write_verdict(run_dir, results, p42_metrics, c2_pass, sources)
+
+
+def run_sequence(experiments_root, bundle, reference, class_weights, p42_metrics, c2_pass, *, repo_dir,
+                 staging_root, sources=None, log=print, train_fn=None, evaluate_fn=None):
+    """Seeds 42 -> 123 -> 2026, one after another. Each model is built fresh inside train_seed (pretrained
+    backbone + that seed's initialisation); nothing learned is passed between seeds. Any exception stops the
+    sequence there: no later seed starts and no summary is written. Rerunning resumes the unfinished seed
+    from its own checkpoint. The summary is written only when all three seeds have a verdict."""
+    import gc
+    verdicts = {}
+    for n, seed in enumerate(SEEDS, start=1):
+        run_dir = run_dir_for(experiments_root, bundle.stage4_sha256, seed)
+        log(f"=== [{n}/{len(SEEDS)}] seed {seed}: {seed_state(run_dir)} | {run_dir}")
+        v = run_seed(run_dir, bundle, seed, reference, class_weights, p42_metrics, c2_pass, repo_dir=repo_dir,
+                     staging_dir=posixpath.join(staging_root, f"seed_{seed}"), sources=sources, log=log,
+                     train_fn=train_fn, evaluate_fn=evaluate_fn)
+        verdicts[seed] = v
+        c = v["criteria"]
+        log(f"=== [{n}/{len(SEEDS)}] seed {seed} DONE: {v['status']} | QWK {c['qwk']['arch1']:.4f} | AUROC "
+            f"{c['auroc_ge3_g4_vs_g012']['arch1']:.4f} | shuffle drop {c['lesion_shuffle']['qwk_drop']:+.4f} | "
+            f"failed: {', '.join(v['failed_criteria']) or 'none'}")
+        gc.collect()
+    summary_dir = summary_dir_for(experiments_root, bundle.stage4_sha256)
+    summary = write_summary(summary_dir, verdicts)
+    log(f"=== all {len(SEEDS)} seeds complete: {summary['route']} | {summary_dir}")
+    return verdicts, summary
+
+
+CRITERIA = ("qwk", "auroc_ge3_g4_vs_g012", "lesion_shuffle", "grade3_recall", "false_urgent_rate")
+_SHARED_IDENTITY = ("stage3_sha256", "stage4_sha256", "stage4_generation", "bundle_id", "bundle_fingerprint",
+                    "split_sha256", "population_sha256", "ema")
+
+
+def aggregate(verdicts):
+    """The 3-seed record from the three per-seed verdicts ({seed: verdict}). Raises unless exactly SEEDS are
+    present and they share data, models and P-42 reference. Mean / SD (n-1) are descriptive: the five checks
+    stay per-seed closure criteria and nothing here is a superiority test."""
+    verdicts = {int(k): v for k, v in verdicts.items()}
+    if tuple(sorted(verdicts)) != tuple(sorted(SEEDS)):
+        raise RuntimeError(f"the summary needs all of seeds {SEEDS}; have {sorted(verdicts)}")
+    first = verdicts[SEEDS[0]]
+    for seed in SEEDS:
+        v = verdicts[seed]
+        if v["seed"] != seed:
+            raise RuntimeError(f"verdict filed under seed {seed} records seed {v['seed']}")
+        for key in _SHARED_IDENTITY:
+            if v["identity"].get(key) != first["identity"].get(key):
+                raise RuntimeError(f"seed {seed}: {key} differs from seed {SEEDS[0]} -- the seeds are not one experiment")
+        for key in CRITERIA:
+            if v["criteria"][key].get("p42") != first["criteria"][key].get("p42"):
+                raise RuntimeError(f"seed {seed}: the P-42 reference for {key} differs between seeds")
+    if len({verdicts[s]["identity"]["config_hash"] for s in SEEDS}) != len(SEEDS):
+        raise RuntimeError("two seeds share a config hash -- the runs are not separate")
+
+    def value(v, key):
+        return v["criteria"][key]["qwk_drop" if key == "lesion_shuffle" else "arch1"]
+
+    per_seed = {seed: {"status": verdicts[seed]["status"], "failed_criteria": list(verdicts[seed]["failed_criteria"]),
+                       "values": {k: float(value(verdicts[seed], k)) for k in CRITERIA},
+                       "qwk_shuffled": float(verdicts[seed]["criteria"]["lesion_shuffle"]["qwk_shuffled"]),
+                       "passed": {k: bool(verdicts[seed]["criteria"][k]["passed"]) for k in CRITERIA},
+                       "best_epoch": verdicts[seed]["checkpoints"]["best"].get("best_epoch"),
+                       "git_commit": verdicts[seed]["identity"].get("git_commit"),
+                       "config_hash": verdicts[seed]["identity"]["config_hash"],
+                       "initial_weights_sha256": (verdicts[seed].get("initialization") or {}).get("weights_sha256")}
+                for seed in SEEDS}
+    stats = {}
+    for key in CRITERIA:
+        x = np.array([per_seed[s]["values"][key] for s in SEEDS], np.float64)
+        stats[key] = {"mean": float(x.mean()), "sd": float(x.std(ddof=1)), "min": float(x.min()), "max": float(x.max()),
+                      "p42": first["criteria"][key].get("p42"), "required": first["criteria"][key]["required"]}
+    passing = {k: int(sum(per_seed[s]["passed"][k] for s in SEEDS)) for k in CRITERIA}
+    open_seeds = [s for s in SEEDS if per_seed[s]["status"] == "OPEN"]
+    closed_seeds = [s for s in SEEDS if s not in open_seeds]
+    if len(open_seeds) == len(SEEDS):
+        route = "VIABLE"
+        reading = ("All three seeds satisfy the pre-set closure checks: the route remains viable, and use of the "
+                   "lesion maps is supported by the shuffle test in every seed.")
+    elif not open_seeds:
+        route = "CLOSED"
+        reading = ("Every seed fails the pre-set closure checks ("
+                   + "; ".join(f"seed {s}: {', '.join(per_seed[s]['failed_criteria'])}" for s in SEEDS)
+                   + "): Architecture 1 is closed as a downstream route for this pipeline.")
+    else:
+        route = "MIXED"
+        reading = (f"Results are inconsistent across seeds: seed(s) {', '.join(map(str, open_seeds))} pass every "
+                   "check; " + "; ".join(f"seed {s} fails {', '.join(per_seed[s]['failed_criteria'])}"
+                                         for s in closed_seeds)
+                   + ". This is reported as an inconsistency. Nothing is tuned and no seed is rerun.")
+    return {
+        "experiment": "Architecture1", "seeds": list(SEEDS), "route": route, "per_seed": per_seed, "stats": stats,
+        "seeds_passing_each_criterion": passing, "seeds_passing_all": open_seeds,
+        "shared_identity": {k: first["identity"].get(k) for k in _SHARED_IDENTITY},
+        "statements": {
+            "reading": reading,
+            "scope": "This is not a pre-registered superiority experiment. The five checks are per-seed exploratory "
+                     "closure criteria against P-42 (non-inferiority, lesion dependency, guardrails). No superiority "
+                     "over P is claimed, whatever the means are.",
+            "c2": first["statements"]["c2"], "ema": first["statements"]["ema"],
+            "protocol": "Same model, data, protocol and evaluation for every seed; each seed trained from a fresh "
+                        "initialisation in its own run directory; nothing was tuned between seeds.",
+        },
+    }
+
+
+def summary_markdown(a):
+    labels = {"qwk": "QWK", "auroc_ge3_g4_vs_g012": "AUROC (>=3; grade 4 vs 0-2)",
+              "lesion_shuffle": "lesion-shuffle QWK drop", "grade3_recall": "grade-3 recall",
+              "false_urgent_rate": "false-urgent rate"}
+    seeds, st = a["seeds"], a["statements"]
+    lines = [f"# Architecture 1 -- seeds {', '.join(map(str, seeds))} -- {a['route']}", "",
+             st["reading"], "", st["scope"], st["c2"], st["ema"], st["protocol"], "",
+             "| criterion | " + " | ".join(f"seed {s}" for s in seeds) + " | mean | SD | P-42 | required | seeds passing |",
+             "|---|" + "---|" * (len(seeds) + 5)]
+    for key in CRITERIA:
+        cells = []
+        for s in seeds:
+            r = a["per_seed"][s]
+            number = f"{r['values'][key]:+.4f}" if key == "lesion_shuffle" else f"{r['values'][key]:.4f}"
+            cells.append(f"{number} {'PASS' if r['passed'][key] else 'FAIL'}")
+        stat = a["stats"][key]
+        p42 = "--" if stat["p42"] is None else f"{stat['p42']:.4f}"
+        lines.append(f"| {labels[key]} | " + " | ".join(cells) + f" | {stat['mean']:.4f} | {stat['sd']:.4f} | {p42} | "
+                     f"{stat['required']} | {a['seeds_passing_each_criterion'][key]}/{len(seeds)} |")
+    lines += ["", "| seed | per-seed status | failed criteria | QWK with lesion maps shuffled | BEST epoch index |",
+              "|---|---|---|---|---|"]
+    for s in seeds:
+        r = a["per_seed"][s]
+        lines.append(f"| {s} | {r['status']} | {', '.join(r['failed_criteria']) or 'none'} | {r['qwk_shuffled']:.4f} | "
+                     f"{r['best_epoch']} |")
+    ident = a["shared_identity"]
+    lines += ["", f"- Stage-3 `{ident['stage3_sha256']}`; Stage-4 `{ident['stage4_sha256']}` ({ident['stage4_generation']})",
+              f"- bundle `{ident['bundle_id']}`, fingerprint `{ident['bundle_fingerprint']}`; split "
+              f"`{ident['split_sha256']}`; EMA: {ident['ema']}"]
+    return "\n".join(lines) + "\n"
+
+
+def write_summary(summary_dir, verdicts):
+    """summary.md, then summary.json (last, atomically). Only callable with all three verdicts."""
+    summary = aggregate(verdicts)
+    os.makedirs(summary_dir, exist_ok=True)
+    with open(posixpath.join(summary_dir, "summary.md"), "w", encoding="utf-8") as fh:
+        fh.write(summary_markdown(summary))
+    _write_json_last(posixpath.join(summary_dir, "summary.json"), summary)
+    return summary
 
 
 def _sha256(path):
