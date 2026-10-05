@@ -324,3 +324,176 @@ def gradient_report(model, rgb, grades, lesion_targets, class_weights):
     del tape
     out["PASS"], out["failures"] = not failures, failures
     return out
+
+
+# --------------------------------------------------------------------------- gate 1 diagnostic (no pass / fail)
+
+LOGIT_BINS = (0.0, 2.0, 4.0, 8.0, 16.0, np.inf)
+DIFF_COUNTS = (0.05, 0.1, 0.5)
+
+
+def _distribution(values, thresholds=DIFF_COUNTS):
+    values = np.asarray(values, np.float64).ravel()
+    out = {"n": int(values.size), "max": float(values.max()), "mean": float(values.mean()),
+           "median": float(np.median(values))}
+    out.update({f"p{q}": float(np.percentile(values, q)) for q in (90, 95, 99)})
+    out.update({f"n_above_{t}": int((values > t).sum()) for t in thresholds})
+    return out
+
+
+def logit_difference_report(image_ids, reference_logits, recomputed_logits):
+    """How two sets of CORN logits for the same images differ: distributions of the absolute differences
+    (per element and per-image maximum), the same for cumulative probabilities and decoded grades, the worst
+    image, where the differences sit relative to the logit magnitude (float16 resolution grows with it), and
+    whether they are a shift or scatter. Returns (summary, per-image frame)."""
+    import pandas as pd
+    ids = [str(i) for i in image_ids]
+    a, b = np.asarray(reference_logits, np.float64), np.asarray(recomputed_logits, np.float64)
+    diff, signed = np.abs(b - a), b - a
+    pa, pb = cumulative(a), cumulative(b)
+    pdiff = np.abs(pb - pa)
+    ga, gb = decode(a), decode(b)
+    magnitude = np.abs(a)
+    step = np.spacing(np.abs(a).astype(np.float16)).astype(np.float64)       # float16 step at each reference logit
+    in_steps = diff / step
+    per_image = diff.max(axis=1)
+    worst = int(np.argmax(per_image))
+    by_magnitude = []
+    for lo, hi in zip(LOGIT_BINS[:-1], LOGIT_BINS[1:]):
+        sel = (magnitude >= lo) & (magnitude < hi)
+        by_magnitude.append({"abs_logit_from": lo, "abs_logit_to": None if np.isinf(hi) else hi, "n": int(sel.sum()),
+                             "mean_abs_diff": float(diff[sel].mean()) if sel.any() else None,
+                             "max_abs_diff": float(diff[sel].max()) if sel.any() else None,
+                             "n_above_0.05": int((diff[sel] > 0.05).sum()),
+                             "max_diff_in_float16_steps": float(in_steps[sel].max()) if sel.any() else None})
+    big = diff > 0.05
+    rank_m, rank_d = np.argsort(np.argsort(magnitude.ravel())), np.argsort(np.argsort(diff.ravel()))
+    summary = {
+        "images": len(ids),
+        "logit_abs_diff": _distribution(diff),
+        "logit_abs_diff_per_image_max": _distribution(per_image),
+        "probability_abs_diff": _distribution(pdiff, thresholds=(0.001, 0.005, 0.01)),
+        "probability_abs_diff_per_image_max": _distribution(pdiff.max(axis=1), thresholds=(0.001, 0.005, 0.01)),
+        "decoded_grades_differ": int((ga != gb).sum()),
+        "worst_image": {"image_id": ids[worst], "index": worst, "max_abs_logit_diff": float(per_image[worst]),
+                        "threshold_index": int(np.argmax(diff[worst])),
+                        "reference_logits": a[worst].tolist(), "recomputed_logits": b[worst].tolist(),
+                        "abs_logit_diff": diff[worst].tolist(),
+                        "reference_cumulative_probabilities": pa[worst].tolist(),
+                        "recomputed_cumulative_probabilities": pb[worst].tolist(),
+                        "max_abs_probability_diff": float(pdiff[worst].max()),
+                        "reference_grade": int(ga[worst]), "recomputed_grade": int(gb[worst])},
+        "saturation": {
+            "by_abs_reference_logit": by_magnitude,
+            "rank_correlation_abs_logit_vs_abs_diff": float(np.corrcoef(rank_m, rank_d)[0, 1]),
+            "elements_above_0.05": int(big.sum()),
+            "abs_reference_logit_of_elements_above_0.05": (
+                {"min": float(magnitude[big].min()), "median": float(np.median(magnitude[big])),
+                 "max": float(magnitude[big].max())} if big.any() else None),
+            "share_of_elements_above_0.05_with_abs_logit_ge_8": float((magnitude[big] >= 8).mean()) if big.any() else None,
+            "max_probability_diff_among_elements_above_0.05": float(pdiff[big].max()) if big.any() else None,
+            "max_diff_in_float16_steps": float(in_steps.max()), "median_diff_in_float16_steps": float(np.median(in_steps))},
+        "shift": {"mean_signed_diff": float(signed.mean()), "mean_signed_diff_per_threshold": signed.mean(axis=0).tolist(),
+                  "share_positive": float((signed > 0).mean()), "share_zero": float((signed == 0).mean()),
+                  "mean_abs_diff": float(diff.mean()),
+                  "images_with_max_diff_above_0.05": int((per_image > 0.05).sum())}}
+    frame = pd.DataFrame({"index": np.arange(len(ids)), "image_id": ids, "max_abs_logit_diff": per_image,
+                          "max_abs_probability_diff": pdiff.max(axis=1), "reference_grade": ga, "recomputed_grade": gb})
+    for k in range(a.shape[1]):
+        frame[f"reference_logit_{k}"], frame[f"recomputed_logit_{k}"] = a[:, k], b[:, k]
+        frame[f"abs_logit_diff_{k}"] = diff[:, k]
+        frame[f"reference_p_gt_{k}"], frame[f"recomputed_p_gt_{k}"] = pa[:, k], pb[:, k]
+    return summary, frame
+
+
+def p_parity_diagnostic(bundle, p_weight_paths, convnext_weights_path, lesion_prior, stored_root, *, expected_sha256=None,
+                        policy="mixed_float16", image_ids=None, out_dir=None, batch_size=8, alt_batch_size=2, log=print):
+    """DIAGNOSTIC of the gate-1 tier-2 result; it has no pass / fail and changes no rule or tolerance.
+
+    Per seed, under `policy` on this runtime, on the validation images: P (the pinned BEST checkpoint) is
+    recomputed and compared with P's STORED validation logits -- element by element, with the worst image, the
+    distributions, the dependence on logit magnitude and the sign pattern -- and, independently of the stored
+    table, E1 with the copied weights is compared with that recomputed P. Two more recomputations of P place
+    the stored-table difference in context: the same policy at another batch size (within-runtime float16
+    variation) and float32. Per-image CSVs and one JSON are written to `out_dir`."""
+    import keras
+    import pandas as pd
+
+    import arch1_posthoc as ph
+    import pathology_grader_fusion as pf
+    import pl_convnext as pl
+    import stage34_cache_v2 as cache
+    from training import checkpointing as ckpt
+    ids = [str(i) for i in (image_ids if image_ids is not None else bundle.val_ids)]
+    previous = keras.mixed_precision.global_policy().name
+    seeds = {}
+    try:
+        keras.mixed_precision.set_global_policy("float32")
+        _, reference_arrays = pl.load_reference(convnext_weights_path)
+        for seed, path in p_weight_paths.items():
+            seed = int(seed)
+            sha = cache.sha256_file(path)
+            if expected_sha256 and sha != expected_sha256[seed]:
+                raise RuntimeError(f"P-{seed}: checkpoint sha256 {sha} is not the pinned {expected_sha256[seed]}")
+            table = pf.p_prediction_path(stored_root, seed, "best")
+            frame = pd.read_csv(table)
+            stored = ph._read_table(table)
+            index = {str(i): n for n, i in enumerate(stored["ids"])}
+            rows = [index[i] for i in ids]
+            stored_logits = frame[[f"logit_{k}" for k in range(4)]].to_numpy(np.float64)[rows]
+            stored_table_consistent = bool(np.abs(cumulative(stored_logits) - stored["p_gt"][rows]).max() < 1e-6
+                                           and np.array_equal(decode(stored_logits), stored["pred"][rows]))
+
+            def run(policy_name, batch, with_e1):
+                keras.backend.clear_session()
+                keras.mixed_precision.set_global_policy(policy_name)
+                p = pl.build_pl_model("P", seed, reference_arrays)
+                ckpt.load_model_weights_only(p, path)
+                if not with_e1:
+                    out = []
+                    for s in range(0, len(ids), batch):
+                        rgb = np.stack([ed.load_inputs(bundle, i)["rgb"] for i in ids[s:s + batch]])
+                        out.append(np.asarray(p.predict_on_batch(p_inputs(rgb)), np.float64))
+                    return np.concatenate(out, 0), None
+                e1 = em.build_e1_model(seed, lesion_prior)
+                em.copy_from_p(e1, p)
+                p_logits, e_logits, _ = paired_logits(p, e1, bundle, ids, batch_size=batch)
+                return p_logits, e_logits
+
+            p_logits, e_logits = run(policy, batch_size, True)
+            summary, per_image = logit_difference_report(ids, stored_logits, p_logits)
+            for k in range(4):
+                per_image[f"e1_logit_{k}"] = e_logits[:, k]
+            per_image["e1_equals_recomputed_p"] = np.all(e_logits == p_logits, axis=1)
+            p_alt, _ = run(policy, alt_batch_size, False)
+            p_f32, _ = run("float32", batch_size, False)
+            alt_summary, _ = logit_difference_report(ids, p_logits, p_alt)
+            f32_vs_stored, _ = logit_difference_report(ids, stored_logits, p_f32)
+            f32_vs_policy, _ = logit_difference_report(ids, p_f32, p_logits)
+            keep = ("logit_abs_diff", "probability_abs_diff", "decoded_grades_differ")
+            seeds[seed] = {
+                "p_checkpoint_sha256": sha, "stored_table": table,
+                "stored_table_internally_consistent": stored_table_consistent,
+                "stored_logit_range": [float(stored_logits.min()), float(stored_logits.max())],
+                "recomputed_p_vs_stored_p": summary,
+                "e1_vs_recomputed_p_same_runtime": dict(compare(p_logits, e_logits),
+                                                        bitwise_equal=bool(np.array_equal(p_logits, e_logits))),
+                "e1_vs_stored_p": compare(stored_logits, e_logits),
+                "recomputed_p_other_batch_size_vs_this_one_same_policy": {k: alt_summary[k] for k in keep},
+                "recomputed_p_float32_vs_stored_p": {k: f32_vs_stored[k] for k in keep},
+                "recomputed_p_policy_vs_recomputed_p_float32": {k: f32_vs_policy[k] for k in keep}}
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                per_image.to_csv(os.path.join(out_dir, f"gate1_diagnostic_per_image_seed{seed}.csv"), index=False)
+            d, w = summary["logit_abs_diff"], summary["worst_image"]
+            log(f"  seed {seed}: P recomputed vs stored: logits max {d['max']:.4f} mean {d['mean']:.4f} median "
+                f"{d['median']:.4f} p99 {d['p99']:.4f} | >0.05: {d['n_above_0.05']} | worst {w['image_id']} | "
+                f"probabilities max {summary['probability_abs_diff']['max']:.4f} | grades differ "
+                f"{summary['decoded_grades_differ']} | E1 == P same runtime: "
+                f"{seeds[seed]['e1_vs_recomputed_p_same_runtime']['bitwise_equal']}")
+    finally:
+        keras.mixed_precision.set_global_policy(previous)
+    result = {"diagnostic": "gate 1, tier 2 (no pass / fail; no rule or tolerance changed)", "policy": policy,
+              "batch_size": batch_size, "alt_batch_size": alt_batch_size, "images": len(ids), "seeds": seeds,
+              "environment": environment(), "timestamp_utc": _now()}
+    return _write(out_dir, "gate1_diagnostic.json", result)

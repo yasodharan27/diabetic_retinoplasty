@@ -398,6 +398,31 @@ class LogAliasTests(unittest.TestCase):
             et.with_aliases(et.with_aliases([]))
 
 
+class DiagnosticTests(unittest.TestCase):
+    def test_logit_difference_report_finds_the_worst_image_and_counts_exceedances(self):
+        rng = np.random.default_rng(0)
+        ids = [f"{n:012x}" for n in range(50)]
+        stored = rng.normal(0, 4, (50, 4))
+        recomputed = stored + rng.normal(0, 0.002, (50, 4))
+        recomputed[17, 2] = stored[17, 2] + 0.07                       # one isolated exceedance
+        recomputed[30, 0] = stored[30, 0] - 0.2
+        summary, frame = eg.logit_difference_report(ids, stored, recomputed)
+        self.assertEqual(summary["worst_image"]["image_id"], ids[30])
+        self.assertEqual((summary["worst_image"]["index"], summary["worst_image"]["threshold_index"]), (30, 0))
+        self.assertAlmostEqual(summary["logit_abs_diff"]["max"], 0.2, places=9)
+        self.assertEqual((summary["logit_abs_diff"]["n_above_0.05"], summary["logit_abs_diff"]["n_above_0.1"],
+                          summary["logit_abs_diff"]["n_above_0.5"]), (2, 1, 0))
+        self.assertEqual(summary["shift"]["images_with_max_diff_above_0.05"], 2)
+        self.assertEqual(summary["saturation"]["elements_above_0.05"], 2)
+        self.assertEqual(sum(b["n"] for b in summary["saturation"]["by_abs_reference_logit"]), 200)
+        self.assertEqual(len(frame), 50)
+        np.testing.assert_allclose(frame["max_abs_logit_diff"].to_numpy(), np.abs(recomputed - stored).max(axis=1))
+        np.testing.assert_allclose(summary["worst_image"]["reference_cumulative_probabilities"], eg.cumulative(stored)[30])
+        self.assertEqual(summary["decoded_grades_differ"], int((eg.decode(stored) != eg.decode(recomputed)).sum()))
+        same, _ = eg.logit_difference_report(ids, stored, stored)
+        self.assertEqual((same["logit_abs_diff"]["max"], same["decoded_grades_differ"]), (0.0, 0))
+
+
 class DataAndGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -4026,3 +4026,29 @@ Range 0 to 1; no non-finite value; 256 distinct levels per class; overall mean 0
 **Gate 1 — P parity: laptop pre-check; official run pending (Colab T4, all 730 validation images, both tiers).** Pre-check with the three pinned P BEST checkpoints (SHA verified) on the 10 validation images mirrored locally, CPU: initialisation — E1 logits equal P's exactly (0) in all three seeds; float32 — E1 with the copied weights equals P exactly (logits 0, probabilities 0, grades identical; every backbone array copied once); mixed_float16 against the stored P BEST tables — logits at most 0.0128 / 0.0062 / 0.0126, probabilities at most 0.0025 / 0.0015 / 0.0009 (seeds 42 / 123 / 2026), grades identical; auxiliary output finite, float32, 16×16×4. A pre-check cannot make E1 ready.
 
 **Status.** NOT READY FOR TRAINING until the official Gate 1 and Gate 2 pass on the Colab runtime (notebook cells 5 and 6). Nothing has been trained. E0, E2 and E3 have not been run.
+
+
+### 62.1 Official gates on the Colab T4 (2026-10-05, commit `9849a62`; Keras 3.13.2, TensorFlow 2.21.0; nothing trained)
+
+**Gate 3 — targets: PASS** (official, Colab). Identical to the laptop run: the same prior to the last digit (0.07176 / 0.10991 / 0.10893 / 0.05475).
+
+**Gate 2 — log aliases: PASS** (official). Keras 3.13.2 logs `corn_QWK`, `corn_corn_loss_unweighted`, `corn_loss`, `lesion_logits_loss`, `loss` and their `val_` forms — the same names as on 3.15.1. Callback order: LogAliases, EarlyStopping, ReduceLROnPlateau, TensorBoard, CSVLogger, TrainingStateCheckpoint. The later callbacks, the checkpoint state (monitor `val_QWK`) and the stored history row all carry `val_QWK`, `QWK`, `val_corn_loss_unweighted`, `corn_loss_unweighted`. Synthetic bundle, random weights, one epoch, mixed precision on the T4: mechanics only.
+
+**Gradient check: PASS** (one real training batch, ImageNet-initialised E1, mixed precision). 178 encoder variables; from the CORN loss alone and from the lesion loss alone every one receives a finite, non-zero gradient (norms 0.081–26.2 and 0.097–12.4). The CORN loss sends no gradient to the lesion head. Parameters 27,826,280 = P's 27,823,204 + 3,076.
+
+**Gate 1 — P parity: FAIL as specified** (official; all 730 validation images; three pinned P BEST checkpoints; 180 backbone arrays + 2 head arrays copied per seed).
+
+| check | seed 42 | seed 123 | seed 2026 | tolerance | |
+|---|---|---|---|---|---|
+| initialisation, E1 vs P logits (16 images) | 0 | 0 | 0 | 1e-5 | pass |
+| float32, E1 vs P (same weights, same runtime): logits / probabilities / grades | 0 / 0 / identical | 0 / 0 / identical | 0 / 0 / identical | 1e-4 / 1e-4 / identical | pass |
+| mixed_float16, E1 vs P (same weights, same runtime) | 0 / 0 / identical | 0 / 0 / identical | 0 / 0 / identical | (not a criterion as written) | — |
+| mixed_float16, E1 vs the stored P BEST table: logits | **0.0604** | 0.0247 | **0.0619** | 0.05 | **fail (42, 2026)** |
+| mixed_float16, E1 vs the stored P BEST table: probabilities | 0.0061 | 0.0041 | 0.0067 | 0.01 | pass |
+| mixed_float16, E1 vs the stored P BEST table: decoded grades | identical | identical | identical | identical | pass |
+
+**What the failure is.** E1's grading path is bit-identical to P on this runtime in both precisions, on every image, in every seed. The failing quantity is therefore P itself, re-run today under mixed_float16, against the logits P stored when it was evaluated after training: it is P's own float16 reproducibility across sessions, measured through E1. Consistent with that (not proven per image — the per-image differences were not saved): the stored logits reach ±19.0 (seed 42) and ±13.7 (seed 2026) but only ±10.2 (seed 123), and float16 resolves 0.0156 above 16 and 0.0078 above 8; the two failing seeds are the two with the largest logits. §60.1 measured the same P-vs-stored quantity as 0.0078 on 10 images; over 730 images the maximum is larger.
+
+**What it is not.** No tolerance was loosened and the gate is recorded as failed. The criterion "E1 vs stored P table, logits ≤ 0.05" was written by me in the specification; it tests two things at once (E1 = P, and P reproduces its stored float16 logits), and only the first is about E1.
+
+**Status: NOT READY FOR TRAINING.** Nothing was trained. Whether tier 2 is re-specified (for example as E1 vs P on the same runtime under mixed_float16, with the stored-table comparison kept for probabilities and grades) is the user's decision; it would be a change to a gate after seeing its result and is recorded as such if made.
