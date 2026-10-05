@@ -3664,3 +3664,247 @@ A "no" to (b) or (c) is not a "no" to (a).
 **Limits to keep in view.** The validation set has been used many times, and every member (P and the pathology grader) is selected by BEST validation QWK on it. Grade-3 recall rests on 39 validation images (one image = 0.026). Each shuffle is a single fixed permutation; the per-image tables are saved, so intervals can be computed afterwards without retraining.
 
 **Code** (not yet committed): `pathology_grader_model.py`, `pathology_grader_train.py`, `pathology_grader_fusion.py`, `arch1_posthoc.py` (the §54 framework, as used for §55), `tests/test_pathology_grader.py`, `tests/test_pathology_grader_fusion.py`, `tests/test_arch1_posthoc.py`, `colab/notebooks/pathology_grader_training.ipynb`. CPU tests: 21 + 10 pass, including a real two-epoch loop with resume on the 5-image fixture with the RGB cache deleted. No Architecture-1, P, PL, C2, Stage-3 or Stage-4 code was modified.
+
+
+## 57. Pathology Grader — three seeds (42, 123, 2026): results, read with the §56 rules (2026-10-05)
+
+**Runs.** `experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed{42,123,2026}/` and `…_3seed_summary/`, commit `8609761`. Every `config.json` carries the fusion rule (weights 0.5 / 0.5, not tuned), `rgb_input: false`, Stage-4 `cb5fc7a8…`, split `bc80fd45…`. Stops: seed 42 at the 50-epoch cap (BEST epoch index 42); seed 123 early stopping at 23 (BEST 10); seed 2026 early stopping at 49 (BEST 36). About 3 minutes per epoch on a T4. Nothing was changed after training began.
+
+### (a) Can the Stage-3 / Stage-4 maps independently support grading? — yes, except at the grade 3 / 4 boundary
+
+| pathology grader alone (BEST) | seed 42 | seed 123 | seed 2026 | mean ± SD | P mean |
+|---|---|---|---|---|---|
+| QWK | 0.8872 | 0.8694 | 0.8783 | 0.8783 ± 0.0089 | 0.9170 |
+| AUROC ≥1 | 0.9976 | 0.9962 | 0.9976 | 0.9972 ± 0.0008 | 0.9978 |
+| AUROC ≥2 | 0.9773 | 0.9761 | 0.9771 | 0.9768 ± 0.0006 | 0.9911 |
+| AUROC ≥3 | 0.9355 | 0.9207 | 0.9356 | 0.9306 ± 0.0086 | 0.9531 |
+| AUROC ≥4 | 0.9104 | 0.8907 | 0.9035 | 0.9015 ± 0.0100 | 0.9374 |
+| grade-3 recall | 0.7179 | 0.6923 | 0.6410 | 0.6838 ± 0.0392 | 0.5470 |
+| grade-4 recall | 0.2586 | 0.1034 | 0.2931 | 0.2184 ± 0.1010 | 0.5747 |
+| false-urgent rate | 0.0506 | 0.0742 | 0.0648 | 0.0632 ± 0.0119 | 0.0353 |
+
+- Mean AUROC over the four cuts: 0.9552 / 0.9459 / 0.9535, above the C2 pooled-linear reference of 0.927 (§50). The network did not under-use its input by that reference.
+- Against P of the same seed: QWK −0.039 (95 % CI −0.056 to −0.021); mean-cut AUROC −0.018 (−0.028 to −0.009). The maps alone grade clearly below RGB, and clearly above chance.
+- **Grade 4 is the weak point.** Of 58 grade-4 images the grader calls 15 / 6 / 17 grade 4 and 24 / 28 / 22 grade 3. AUROC for grade 4 vs grade 3 is 0.664 / 0.591 / 0.583 (P: 0.791 / 0.746 / 0.716). The four lesion classes plus vessels do not separate proliferative from severe non-proliferative disease.
+- **Training curves (rule 2).** Training QWK at the stop: 0.892 / 0.874 / 0.898; gain over the last ten epochs +0.003 / +0.008 / +0.002; training and validation QWK stay within 0.03 of each other. The curves are not materially rising. They flatten with the learning rate at its floor (final 1.6e-6 / 6.2e-6 / 1.0e-6), and seed 42 reached the epoch cap with its best epoch at 43 of 50. Reading: the standalone result is not weak, so rule 2 is not needed to rescue it; the figures are a lower bound under this protocol. Whether 0.87–0.90 training QWK counts as "low" was not given a number in §56 and is not given one now.
+
+### (b) Does the pathology branch add information to P? — not measurably
+
+| same seed (BEST) | seed 42 | seed 123 | seed 2026 | seed mean (95 % CI) |
+|---|---|---|---|---|
+| fused − P: Δ QWK | −0.0041 | −0.0095 | −0.0019 | −0.0052 (−0.0124 to +0.0017) |
+| fused − P: Δ mean-cut AUROC | −0.0020 | +0.0007 | +0.0008 | −0.0002 (−0.0041 to +0.0043) |
+| P + P control − P: Δ QWK | −0.0041 | −0.0036 | −0.0027 | −0.0035 (−0.0093 to +0.0020) |
+| P + P control − P: Δ mean-cut AUROC | — | — | — | +0.0029 (+0.0012 to +0.0047) |
+| fused − control: Δ QWK | −0.0001 | −0.0058 | +0.0008 | −0.0017 (−0.0091 to +0.0063) |
+| fused − control: Δ mean-cut AUROC | −0.0024 | −0.0020 | −0.0048 | −0.0031 (−0.0078 to +0.0020) |
+
+- **Fusion reading (rule 4): C.** Fusion is approximately equal to P and does not exceed the P + P control. No incremental grading benefit is demonstrated; the standalone capability of (a) stands.
+- A D-like element in seed 123 only: fused − P Δ QWK −0.0095 (CI −0.018 to −0.001). Per rule 4 this does not show the pathology information is useless.
+- The control pairs overlap (rule 5); the control's SD (0.0020) is not an independent three-run estimate.
+- The two branches decode the same grade on 80–82 % of validation images. P wrong and pathology right: 34 / 39 / 36 images. P right and pathology wrong: 86 / 95 / 88.
+
+### (c) Does the fixed fusion produce a useful final pipeline? — comparable to P overall, weaker on grade 4
+
+| fused (BEST) | seed 42 | seed 123 | seed 2026 | mean ± SD | P mean | P + P mean |
+|---|---|---|---|---|---|---|
+| QWK | 0.9143 | 0.9053 | 0.9157 | 0.9118 ± 0.0056 | 0.9170 | 0.9135 |
+| AUROC ≥3 | 0.9576 | 0.9512 | 0.9501 | 0.9530 ± 0.0041 | 0.9531 | 0.9571 |
+| AUROC ≥4 | 0.9473 | 0.9381 | 0.9329 | 0.9394 ± 0.0073 | 0.9374 | 0.9432 |
+| grade-3 recall | 0.5897 | 0.6667 | 0.5385 | 0.5983 ± 0.0645 | 0.5470 | 0.5470 |
+| grade-4 recall | 0.5862 | 0.2759 | 0.5690 | 0.4770 ± 0.1744 | 0.5747 | 0.5517 |
+| false-urgent rate | 0.0379 | 0.0521 | 0.0474 | 0.0458 ± 0.0072 | 0.0353 | 0.0358 |
+
+- Grade-4 recall falls against P in every seed (−0.086, −0.138, −0.069); grade-3 recall rises in two of three. The false-urgent rate rises in two of three.
+- §54 tolerances against same-seed P: maintained in seeds 42 and 2026; seed 123 exceeds the false-urgent tolerance by 0.0005. Fused lesion-shuffle Δ QWK −0.203 / −0.354 / −0.367. §54 category D, **descriptive only** (rule 7).
+
+### Shuffle analysis (rule 6: mechanistic evidence; single-class drops are lower bounds and are not added)
+
+| input shuffled, pathology grader | seed 42 | seed 123 | seed 2026 | seed mean Δ QWK (95 % CI) |
+|---|---|---|---|---|
+| vessel | −0.0411 | −0.0189 | −0.0430 | −0.0343 (−0.0535 to −0.0163) |
+| MA | −0.1041 | −0.1509 | −0.6057 | −0.2869 (−0.3128 to −0.2600) |
+| HE | −0.5436 | −0.7269 | −0.6102 | −0.6269 (−0.6802 to −0.5746) |
+| EX | −0.3274 | −0.2794 | −0.2772 | −0.2947 (−0.3396 to −0.2504) |
+| SE | −0.3116 | −0.6335 | −0.0602 | −0.3351 (−0.3691 to −0.3008) |
+| all lesions | −0.8195 | −0.8158 | −0.8033 | −0.8129 (−0.8889 to −0.7385) |
+| everything | −0.8508 | −0.8266 | −0.8480 | −0.8418 |
+
+- Intervals are over validation images for the one fixed permutation (computed afterwards from the saved per-image tables; no retraining).
+- Every lesion class is used in every seed. HE is the largest in all three. MA and SE swap importance between seeds (MA −0.10 / −0.15 / −0.61; SE −0.31 / −0.63 / −0.06), which is what redundant classes look like.
+- **The vessel map is used by this branch**: Δ QWK below zero in all three seeds, each interval excluding zero; mean-cut AUROC −0.020 / −0.013 / −0.020. This is the first measured vessel contribution in the project. It is small, and it disappears in the fused model (vessel-shuffle Δ QWK +0.002 / −0.004 / +0.000).
+
+### Limits
+
+One validation set, used many times, and every member is selected by BEST validation QWK on it. Grade-3 recall rests on 39 images and grade-4 recall on 58. The standalone figures are a lower bound under the P protocol. No seed is singled out; no superiority is claimed.
+
+**Not done.** No further run, no tuning, no change to weights, thresholds or code. Local copy of the run files (no checkpoints): `results/PathologyGrader/`.
+
+
+## 58. Severity-aware fixed fusion — the one predefined rule: pre-run record (2026-10-05; written before the rule was evaluated)
+
+**State when written.** The rule below has not been computed on any data. What had been seen: the stored P and pathology-grader BEST predictions on the 730 validation images, through the read-only fusion-design audit of 2026-10-05 (per-threshold AUROC, calibration, error overlap). **The rule was designed after that inspection. Its result on the APTOS validation set is therefore descriptive and post hoc**, whatever it shows.
+
+**Audit findings that led here (stored predictions; no rule was evaluated in the audit).**
+- P is at least as strong as the pathology grader at every threshold in every seed; they are equal only at ≥1 (AUROC 0.997–0.999 vs 0.996–0.998; ≥2 0.991 vs 0.977; ≥3 0.948–0.961 vs 0.921–0.936; ≥4 0.928–0.950 vs 0.891–0.910).
+- At every threshold the pathology grader corrects about as many P errors as another P seed does (≥3: 21 / 13 / 16 vs 20 / 14 / 14; ≥4: 13 / 8 / 12 vs 13 / 15 / 8) and adds two to four times as many new errors (≥4: 28 / 24 / 30 vs 19 / 11 / 6).
+- Why the 50 / 50 rule lost grade-4 recall (§57): on the 58 grade-4 images the pathology grader's median P(≥4) is 0.34–0.39 and its sensitivity at ≥4 is 0.26 / 0.10 / 0.29; over all 730 images its largest P(≥4) is 0.64–0.86. Averaging pulled 5 / 8 / 4 of P's correct grade-4 calls under 0.5 and gained none. Calibration error at ≥4 is similar for the two branches (0.026–0.037 vs 0.011–0.042): this is lack of discrimination, not a scale mismatch.
+- The one stratum where the pathology grader rescues more than a second P seed: grade 3 (pathology-only correct 6 / 9 / 8 of 39; other-P-seed-only 4 / 3 / 5).
+
+**The locked rule.** With p_k = P(grade > k):
+
+```
+fused_0 = 0.5 · P_0 + 0.5 · Path_0
+fused_1 = 0.5 · P_1 + 0.5 · Path_1
+fused_2 = 0.5 · P_2 + 0.5 · Path_2
+fused_3 = min(P_3, fused_2)
+grade   = number of k with fused_k > 0.5
+```
+
+P and Path are the stored BEST predictions of the same seed. No learned gate, no validation-derived weight, no threshold other than CORN's 0.5, no alternative cap.
+
+**Justification, independent of any score.** Proliferative DR (grade 4) is defined by neovascularisation and vitreous or preretinal haemorrhage. Stage 4 segments MA, HE, EX and SE and none of those signs (spec §5: no admitted data for them). The pathology branch therefore has nothing to vote with at ≥4, and is not allowed to suppress the RGB decision there. Earlier evidence pointing the same way, from before the pathology grader existed: C2's per-threshold gap between pooled lesion features and RGB (−0.078 at ≥4, about 0 at ≥1; §50) and the low lesion extent of the persistent grade-4 failures (§26). The cap `min(P_3, fused_2)` only keeps the cumulative vector ordinal.
+
+**Data.** Stored BEST per-image tables only: P seeds 42 / 123 / 2026 (§22) and pathology grader seeds 42 / 123 / 2026 (§57), on the authoritative 730 validation images in their authoritative order. Nothing is trained. The run stops if order, BEST provenance, CORN cumulative semantics or the formula check fails.
+
+**Controls.** (1) P alone. (2) The recorded 50 / 50 fusion (§57), unchanged. (3) The locked rule. (4) The locked rule with the designated other P seed in place of the pathology branch (42 → 123 → 2026 → 42). The P + P pairs overlap and are not independent.
+
+**Reported, per seed and as mean ± SD.** QWK; AUROC ≥1, ≥2, ≥3, ≥4; grade-3 recall; grade-4 recall; false-urgent rate; lesion-shuffle and vessel-shuffle drops recomputed under the locked rule from the saved shuffled tables (§56 methodology); matched-seed differences: rule − P, rule − recorded 50 / 50, rule − P + P control.
+
+**Reading.**
+- The three questions of §56 stay separate: (a) the pathology branch grades on its own — answered in §57; (b) does it add information to P; (c) is the fixed fusion architecturally useful.
+- The fusion readings A–D of §56 are reused unchanged. The §54 category is descriptive only.
+- No superiority over P is claimed. No number is added to decide "improves" or "degrades".
+- **No other fusion rule will be evaluated, and this result will not be used to create one.**
+- The IDRiD grading test stays untouched. It is not used to choose between rules.
+
+**Code.** `pathology_grader_severity_fusion.py` (evaluation only; reuses `arch1_posthoc` and `pathology_grader_fusion`, neither modified) and `tests/test_pathology_grader_severity_fusion.py`.
+
+
+## 59. Severity-aware fixed fusion — result of the one predefined rule (2026-10-05; descriptive, post hoc)
+
+**Run.** `python pathology_grader_severity_fusion.py --experiments results --out results/PathologyGrader/severity_fusion` on the laptop (CPU; nothing trained), from the stored BEST tables. Pre-run audit passed: the 730 authoritative validation images in their authoritative order for 3 P + 3 pathology BEST tables and 6 shuffled tables; cumulative CORN semantics (p_gt = cumulative product of sigmoid(logits), non-increasing, grades = decode); each table reproduces its run's stored BEST metrics; the formula check; local files identical to Drive (rclone check, 33 files, 0 differences). 2,000 grade-stratified paired resamples, seed 20260927. Output also on Drive: `experiments/PathologyGrader/pathgrader_cb5fc7a8d370_severity_fusion/`.
+
+**Rule (§58, unchanged).** fused_k = 0.5·P_k + 0.5·Path_k for k = 0, 1, 2; fused_3 = min(P_3, fused_2); grade = #{k: fused_k > 0.5}.
+
+| mean ± SD over seeds 42, 123, 2026 | P alone | recorded 50 / 50 | **locked rule** | P + P control, same rule |
+|---|---|---|---|---|
+| QWK | 0.9170 ± 0.0019 | 0.9118 ± 0.0056 | **0.9132 ± 0.0035** | 0.9140 ± 0.0025 |
+| AUROC ≥1 | 0.9978 | 0.9982 | **0.9982** | 0.9982 |
+| AUROC ≥2 | 0.9911 | 0.9881 | **0.9881** | 0.9924 |
+| AUROC ≥3 | 0.9531 | 0.9530 | **0.9530** | 0.9571 |
+| AUROC ≥4 | 0.9374 | 0.9394 | **0.9375** | 0.9388 |
+| grade-3 recall | 0.5470 ± 0.0592 | 0.5983 ± 0.0645 | **0.5812 ± 0.0392** | 0.5556 ± 0.0534 |
+| grade-4 recall | 0.5747 ± 0.1404 | 0.4770 ± 0.1744 | **0.5632 ± 0.1446** | 0.5460 ± 0.1294 |
+| false-urgent rate | 0.0353 ± 0.0033 | 0.0458 ± 0.0072 | **0.0458 ± 0.0072** | 0.0358 ± 0.0009 |
+
+Per seed, locked rule: QWK 0.9155 / 0.9092 / 0.9148; AUROC ≥4 0.9515 / 0.9333 / 0.9277; grade-3 recall 0.5897 / 0.6154 / 0.5385; grade-4 recall 0.6552 / 0.3966 / 0.6379; false-urgent 0.0379 / 0.0521 / 0.0474.
+
+| matched-seed difference | seed 42 | seed 123 | seed 2026 | mean (95 % CI) |
+|---|---|---|---|---|
+| rule − P: Δ QWK | −0.0029 | −0.0056 | −0.0028 | −0.0038 (−0.0105 to +0.0028) |
+| rule − P: Δ mean AUROC, 4 cuts | −0.0010 | −0.0005 | −0.0005 | −0.0006 (−0.0026 to +0.0013) |
+| rule − P: Δ grade-3 recall | −0.0256 | +0.1026 | +0.0256 | +0.0342 |
+| rule − P: Δ grade-4 recall | −0.0172 | −0.0172 | +0.0000 | −0.0115 |
+| rule − P: Δ false-urgent | +0.0000 | +0.0205 | +0.0111 | +0.0105 |
+| rule − recorded 50 / 50: Δ QWK | +0.0013 | +0.0039 | −0.0009 | +0.0014 (−0.0008 to +0.0035) |
+| rule − recorded 50 / 50: Δ grade-4 recall | +0.0690 | +0.1207 | +0.0690 | +0.0862 |
+| rule − recorded 50 / 50: Δ grade-3 recall | +0.0000 | −0.0513 | +0.0000 | −0.0171 |
+| rule − P + P control: Δ QWK | +0.0015 | −0.0022 | −0.0017 | −0.0008 (−0.0076 to +0.0064) |
+| rule − P + P control: Δ mean AUROC, 4 cuts | −0.0018 | −0.0020 | −0.0035 | −0.0024 (−0.0044 to −0.0004) |
+| rule − P + P control: Δ grade-4 recall | +0.0345 | +0.0000 | +0.0172 | +0.0172 |
+
+| shuffle (Δ QWK) | seed 42 | seed 123 | seed 2026 | mean |
+|---|---|---|---|---|
+| lesions, locked rule | −0.2024 | −0.3445 | −0.3606 | −0.3025 |
+| lesions, recorded 50 / 50 | −0.2033 | −0.3542 | −0.3670 | −0.3082 |
+| vessel, locked rule | +0.0004 | −0.0062 | +0.0037 | −0.0007 |
+| vessel, recorded 50 / 50 | +0.0023 | −0.0044 | +0.0002 | −0.0006 |
+
+**Reading.**
+- **Against the 50 / 50 rule:** the grade-4 loss is removed in every seed (4, 7 and 4 of 58 images recovered); grade-3 recall is unchanged in two seeds and two images lower in seed 123. The rule does what it was built to do.
+- **Against P:** comparable, with no improvement. QWK −0.004 with an interval spanning zero; grade-3 recall higher in two seeds and lower in one; grade-4 recall one image lower in two seeds, equal in the third; false-urgent rate higher in two seeds. Grade-4 calls go from 53 / 29 / 51 (P) to 52 / 28 / 50: the cap removes one P grade-4 call per seed where the fused P(≥3) is at or below 0.5.
+- **Against the P + P control:** not better. QWK −0.001 (interval spanning zero); mean AUROC over the four cuts −0.0024, interval excluding zero on the control's side. The P + P pairs overlap and are not independent.
+- **§56 fusion reading: C** — fusion approximately equal to P; no measurable incremental grading benefit is demonstrated, while the standalone capability of the pathology branch (§57) stands.
+- **§54 (descriptive only):** tolerances against same-seed P held in seeds 42 and 2026; seed 123 exceeds the false-urgent tolerance by 0.0005 (unchanged from the 50 / 50 rule, because the ≥3 fusion is the same). Category D.
+- The fused grade depends on the lesion maps (Δ QWK −0.20 to −0.36) and not measurably on the vessel map.
+
+**The three questions.** (a) The pathology branch grades on its own: yes, §57. (b) It adds incremental information to P: not shown, under either rule. (c) The fixed fusion is architecturally useful: under the locked rule it is a pipeline in which Stage 4 demonstrably shapes the grade at ≥1 to ≥3 while overall grading stays comparable to P; that is a description of the architecture, not evidence of a gain.
+
+**Not done, and not to be done on this basis.** No other fusion rule was evaluated and this result is not used to create one. No superiority over P is claimed. Nothing was trained. The IDRiD grading test is untouched.
+
+
+## 60. IDRiD Disease Grading Testing Set — one-time external evaluation: pre-run protocol (2026-10-05; written before any IDRiD prediction exists)
+
+**Status.** Architecture development is frozen. No IDRiD grading prediction has been generated by any model in this project. IDRiD cannot change any model, rule or preprocessing decision. The machine-readable lock is `idrid_grading_protocol.json`; the evaluator (`idrid_grading_eval.py`) refuses anything that differs from it.
+
+### The frozen pipeline
+
+| stage | what runs |
+|---|---|
+| 1 | IQA: frozen, not part of the grading graph |
+| 2 | `stage4_v2_data.stage2_rgb`: the approved "DR" profile (gamma, then CLAHE), once, at native size, on the RAW image |
+| RGB frame | full-frame direct resize to 512 × 512 (no crop) |
+| 3 | LWNet `91f0cada…961118de1`, test-time augmentation, joint 512 resize |
+| 4 | Stage-4 v2 U-Net `cb5fc7a8…766f8ad8` (generation `s4v2-cb5fc7a8d370-K4`; MA / HE / EX / SE): full-frame resize to 1536 × 1536, exact 3 × 3 mean + max pooling to 512 × 512, uint8 |
+| RGB branch | P (pretrained ConvNeXt-Tiny + CORN), seeds 42 / 123 / 2026, BEST checkpoints |
+| pathology branch | pathology grader (vessel map + Stage-4 maps → Stage-5 encoder → CORN; no RGB), seeds 42 / 123 / 2026, BEST checkpoints |
+| 7 | the locked severity-aware fusion (§58), P and pathology grader of the same seed |
+| 8 | CORN decode → grade 0–4 |
+
+**Fusion — the only final fusion.** With p_k = P(grade > k): fused_k = 0.5·P_k + 0.5·Path_k for k = 0, 1, 2; fused_3 = min(P_3, fused_2); grade = number of k with fused_k > 0.5. No other rule is computed on IDRiD.
+
+### The eight pinned model files (SHA-256, bytes)
+
+| file | SHA-256 | bytes |
+|---|---|---|
+| Stage 3 LWNet `exported_models/VesselSegmentation/best_model.pth` | `91f0cada4b26ece63464b05be60f9b3a51f1bcd1f764081d07d3a35961118de1` | 919,662 |
+| Stage 4 `exported_models/LesionSegmentation_v2/2026-10-01_18-38-32/model.pt` | `cb5fc7a8d370af7d2ae191cadaebdde858f71820d147fb76f852b757766f8ad8` | 225,875,347 |
+| P seed 42, BEST (`best_a`, epoch index 18) | `7d6f5498ec45f737e20126ddca1d731ba04203ace0bac7814b6915475ebc041d` | 111,706,200 |
+| P seed 123, BEST (`best_a`, epoch index 3) | `e5f4d3868bc83d71a3495c8e45dc87ba030a68328672ffb1d82bcc74f22d06a2` | 111,706,200 |
+| P seed 2026, BEST (`best_b`, epoch index 6) | `d7d7d95f6ddf97c34e74d6b5711f00de9ea9dc83db42b9005b24897818c09d65` | 111,706,200 |
+| pathology grader seed 42, BEST (`best_a`, epoch index 42) | `58fc6d0db064f88d7d8bf9ce16de8c2e42b94ed942519f4422733ac947bff205` | 5,065,312 |
+| pathology grader seed 123, BEST (`best_b`, epoch index 10) | `885958dc8cc53e0b65dd3a8678e6ba0e8fd24eb5ede395c9779b20995cf9dec8` | 5,065,312 |
+| pathology grader seed 2026, BEST (`best_b`, epoch index 36) | `ea9c4af4906f72e11c30e4eb3b05e46cb685021a0d001119a4391bb71b80503e` | 5,065,312 |
+
+- P files: `experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_<s>/checkpoints/<slot>/model.weights.h5`. Their SHA-256 values were not on record before; they are pinned here. Each run's BEST pointer and stored BEST metrics name the same epoch.
+- Pathology files: `experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed<s>/checkpoints/<slot>/model.weights.h5`; the hashes equal the BEST weights recorded by the runs (§57).
+- Build dependency of P only: `convnext_tiny_notop.h5`, `d547c096…e49ef1` (the graph is constructed from it and every weight is then replaced by the checkpoint).
+- No LAST checkpoint and no other run is used.
+
+### Dataset and the leakage decision
+
+- IDRiD, B. Disease Grading, **Testing Set**: 103 raw JPG images, grades 0–4 = 34 / 5 / 32 / 19 / 13. Image-set hash `879e0680…8d32c733`, label-file hash `ced1cb8f…bff8ff602` (in the lock file; verified at run time). The raw tree is used; the already-preprocessed IDRiD tree would apply Stage 2 twice.
+- **Three test images are copies of images used to train Stage 4 v2, with pixel-level lesion masks:** `IDRiD_088` = segmentation `IDRiD_22`, `IDRiD_089` = `IDRiD_31`, `IDRiD_091` = `IDRiD_09` (thumbnail difference 0.56–0.62; the next nearest test image is at 4.7). All three are grade 2. First found in §18; re-checked against the v2 training set on 2026-10-05.
+- **Decision (user, 2026-10-05).** These three images are **excluded from the primary analysis. The primary external result is the 100-image set** (grades 34 / 5 / 29 / 19 / 13).
+- The **103-image result is a sensitivity analysis only**: computed after the primary result, with exactly the same frozen pipeline, labelled as such, never a replacement, never used for selection.
+- No further exclusions are searched for. If another overlap or a data-integrity problem appears, the run stops and it is reported.
+- Limit to state with the result: Stage 4 was trained on IDRiD's camera domain (segmentation subset). This is an external test of the grading classifiers, not of a fully independent pipeline. IDRiD's own train / test duplicates (§18) involve the training split, which this project never uses.
+
+### Inference settings (established from the project's own records, not chosen)
+
+Tesla T4; Stage-4 inference with automatic mixed precision on; the two Keras graders built and run under `mixed_float16`; batch 8. Source: the Stage-4 APTOS cache manifest (`amp: true`, Tesla T4, cudnn deterministic) and the P / pathology-grader runs (mixed precision). Stage-4 maps are computed once per image from the native Stage-2 image and quantised to uint8 exactly as in the cache.
+
+### APTOS parity gate (before any IDRiD image is read)
+
+The first two images of every grade in the authoritative 730-image validation order (10 images) go through the evaluator from the raw file and are compared with the cached Stage-2 / 3 / 4 arrays and the stored BEST prediction tables. Tolerances: Stage 2 exact; RGB frame 1e-6; vessel map 1e-4; Stage-4 maps 2 counts of 255 (the project's existing constants); logits 0.05; cumulative probabilities 0.01 (set here for float16 logits); decoded grades identical for P, the pathology grader and the fusion. The gate runs on the machine and runtime that will run IDRiD; a failed gate stops the evaluation and no IDRiD image is read.
+
+**Laptop pre-check (2026-10-05; not the gate, cannot unlock IDRiD).** The same code and the same ten images on the laptop CPU in float32 with Stage-4 mixed precision off: RGB frame identical to the cache (0); vessel map within 2.5e-6; logits within 0.024 and cumulative probabilities within 0.0025 of the stored tables; decoded grades identical for P, the pathology grader and the fusion in all three seeds. The Stage-4 maps differ from the T4 cache by up to 20 counts on isolated pixels (mean difference at most 0.19 counts, at most 0.005 in nine of ten images), which exceeds the 2-count tolerance. So the evaluator's data flow reproduces the stored predictions, and CPU / float32 is **not** the frozen setting: the gate and the IDRiD run both use the T4 settings above. **The official gate has not been run yet.**
+
+### What is reported
+
+- Per seed and as mean ± SD over seeds 42 / 123 / 2026: QWK; AUROC ≥1, ≥2, ≥3, ≥4; recall for grades 0–4 (grade 3 and grade 4 in particular); false-urgent rate; confusion matrix. A 95 % grade-stratified bootstrap interval over the test images (2,000 resamples, seed 20260927) for the seed mean.
+- No three-seed ensemble. No seed selection.
+- Rows: the fused final pipeline; P alone; the pathology grader alone. **P and the pathology grader are reference rows only** and cannot influence any selection.
+- **No lesion or vessel shuffle is performed on IDRiD**, and the 50 / 50 fusion is not computed on it.
+- With 19 grade-3 and 13 grade-4 images, one image is 0.053 and 0.077 of recall.
+
+### Rules
+
+Evaluation only. No tuning. No threshold changes. No preprocessing changes. No retraining. No checkpoint, seed or fusion selection. No repeated runs for better numbers. **The final pipeline is evaluated once**: the evaluator needs a confirmation token, writes a lock before any prediction exists, and refuses a second run; a rerun is allowed only for a technical failure, with the reason recorded.
+
+### Saved by the run
+
+Per-image logits, cumulative probabilities and decoded grades for P, the pathology grader and the fusion, per seed (all 103 images, with a primary-set flag); per-seed and aggregate metrics for the 100-image primary set and, separately, the 103-image sensitivity set; the lock file and its hash; the eight checkpoint hashes as verified; per-image file hashes and the label-file hash; the excluded list; git commit; package versions; device; the command; the timestamp; the parity result. Output: `experiments/IDRiDGrading/idrid_grading_<protocol sha12>_<UTC time>/`.
+
+**Code.** `idrid_grading_eval.py`, `idrid_grading_protocol.json`, `tests/test_idrid_grading_eval.py`, `colab/notebooks/idrid_grading_evaluation.ipynb`. The old `idrid_external_evaluation.ipynb` (RACAF) is not used.

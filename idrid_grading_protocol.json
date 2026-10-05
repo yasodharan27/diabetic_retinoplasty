@@ -1,0 +1,215 @@
+{
+ "name": "IDRiD Disease Grading Testing Set -- one-time external evaluation of the frozen Stage 1-8 pipeline",
+ "prepared": "2026-10-05",
+ "research_record_section": "§60",
+ "status": "architecture development is frozen; IDRiD cannot change any model, rule or preprocessing decision",
+ "seeds": [
+  42,
+  123,
+  2026
+ ],
+ "dataset": {
+  "name": "IDRiD -- B. Disease Grading, Testing Set (raw images)",
+  "image_dir": "1. Original Images/b. Testing Set",
+  "label_file": "2. Groundtruths/b. IDRiD_Disease Grading_Testing Labels.csv",
+  "label_columns": [
+   "Image name",
+   "Retinopathy grade"
+  ],
+  "n_images": 103,
+  "grade_counts": [
+   34,
+   5,
+   32,
+   19,
+   13
+  ],
+  "images_manifest_sha256": "879e06809b78459b9e9f1dcaacdd2b81ac861e3c8ca36b1ae49d7cbe8d32c733",
+  "images_manifest_definition": "sha256 over the lines '<file name>:<sha256 of the file>\\n', file names sorted",
+  "label_file_sha256": "ced1cb8f66e126e98edde38a9b10843e6e8c3a76795b17dd57ca5abbff8ff602",
+  "primary_exclusions": [
+   "IDRiD_088",
+   "IDRiD_089",
+   "IDRiD_091"
+  ],
+  "exclusion_reason": {
+   "IDRiD_088": "copy of segmentation image IDRiD_22 (Stage-4 v2 training)",
+   "IDRiD_089": "copy of segmentation image IDRiD_31 (Stage-4 v2 training)",
+   "IDRiD_091": "copy of segmentation image IDRiD_09 (Stage-4 v2 training)"
+  },
+  "primary_set": "100 images (103 minus the three exclusions) -- THE primary external result",
+  "sensitivity_set": "103 images -- computed after the primary result, labelled sensitivity analysis, never a replacement",
+  "note": "the RAW tree is used; the already-preprocessed IDRiD tree would apply Stage 2 twice"
+ },
+ "checkpoints": {
+  "stage3_lwnet": {
+   "role": "Stage 3 vessel segmentation (LWNet), frozen",
+   "path": "exported_models/VesselSegmentation/best_model.pth",
+   "sha256": "91f0cada4b26ece63464b05be60f9b3a51f1bcd1f764081d07d3a35961118de1",
+   "bytes": 919662
+  },
+  "stage4_unet": {
+   "role": "Stage 4 v2 lesion segmentation (SE-ResNet-101 U-Net), generation s4v2-cb5fc7a8d370-K4",
+   "path": "exported_models/LesionSegmentation_v2/2026-10-01_18-38-32/model.pt",
+   "sha256": "cb5fc7a8d370af7d2ae191cadaebdde858f71820d147fb76f852b757766f8ad8",
+   "bytes": 225875347
+  },
+  "convnext_pretrained": {
+   "role": "build dependency of P only (ImageNet file the P graph is constructed from; every weight is then replaced by the P checkpoint)",
+   "path": "experiments/PL_ConvNeXtPriors/pretrained_weights/convnext_tiny_notop.h5",
+   "sha256": "d547c096cabd03329d7be5562c5e14798aa39ed24b474157cef5e85ab9e49ef1",
+   "bytes": 111650432
+  },
+  "p_seed42": {
+   "role": "P (RGB ConvNeXt-Tiny + CORN), seed 42, BEST",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_42/checkpoints/best_a/model.weights.h5",
+   "sha256": "7d6f5498ec45f737e20126ddca1d731ba04203ace0bac7814b6915475ebc041d",
+   "bytes": 111706200,
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_42/checkpoints/best.json",
+   "best_slot": "best_a",
+   "best_epoch_index": 18,
+   "best_val_qwk": 0.91841059923172
+  },
+  "p_seed123": {
+   "role": "P (RGB ConvNeXt-Tiny + CORN), seed 123, BEST",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_123/checkpoints/best_a/model.weights.h5",
+   "sha256": "e5f4d3868bc83d71a3495c8e45dc87ba030a68328672ffb1d82bcc74f22d06a2",
+   "bytes": 111706200,
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_123/checkpoints/best.json",
+   "best_slot": "best_a",
+   "best_epoch_index": 3,
+   "best_val_qwk": 0.9148064851760864
+  },
+  "p_seed2026": {
+   "role": "P (RGB ConvNeXt-Tiny + CORN), seed 2026, BEST",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "d7d7d95f6ddf97c34e74d6b5711f00de9ea9dc83db42b9005b24897818c09d65",
+   "bytes": 111706200,
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_2026/checkpoints/best.json",
+   "best_slot": "best_b",
+   "best_epoch_index": 6,
+   "best_val_qwk": 0.9176334738731384
+  },
+  "pathology_seed42": {
+   "role": "pathology grader, seed 42, BEST",
+   "path": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "58fc6d0db064f88d7d8bf9ce16de8c2e42b94ed942519f4422733ac947bff205",
+   "bytes": 5065312,
+   "best_pointer": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed42/checkpoints/best.json",
+   "best_slot": "best_a",
+   "best_epoch_index": 42,
+   "best_val_qwk": 0.8871759176254272
+  },
+  "pathology_seed123": {
+   "role": "pathology grader, seed 123, BEST",
+   "path": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "885958dc8cc53e0b65dd3a8678e6ba0e8fd24eb5ede395c9779b20995cf9dec8",
+   "bytes": 5065312,
+   "best_pointer": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed123/checkpoints/best.json",
+   "best_slot": "best_b",
+   "best_epoch_index": 10,
+   "best_val_qwk": 0.8694382309913635
+  },
+  "pathology_seed2026": {
+   "role": "pathology grader, seed 2026, BEST",
+   "path": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "ea9c4af4906f72e11c30e4eb3b05e46cb685021a0d001119a4391bb71b80503e",
+   "bytes": 5065312,
+   "best_pointer": "experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed2026/checkpoints/best.json",
+   "best_slot": "best_b",
+   "best_epoch_index": 36,
+   "best_val_qwk": 0.8783055543899536
+  }
+ },
+ "pipeline": {
+  "stage1": "IQA: frozen, not part of the grading graph",
+  "stage2": "stage4_v2_data.stage2_rgb: cv2.imread -> image_preprocessing.preprocess_array(profile='DR') -> RGB, native size, once",
+  "rgb_frame": "stage4_v2_aptos_cache.recompute_rgb_512: full-frame direct resize to 512x512 (no crop), float32 [0,1]",
+  "stage3": "stage4_v2_aptos_cache.recompute_vessel_512: LWNet on the native image with TTA, joint 512 resize",
+  "stage4": "stage4_v2.pathology_cache_maps: full-frame direct resize to 1536x1536, exact 3x3 mean + max pooling to 512x512, uint8",
+  "p": "pl_convnext.build_pl_model('P', seed): RGB frame in channels 0-2; BEST weights",
+  "pathology": "pathology_grader_model.build_pathology_grader: vessel map + Stage-4 maps, no RGB; BEST weights",
+  "fusion": "pathology_grader_severity_fusion.fuse_severity on P and pathology of the same seed"
+ },
+ "inference": {
+  "device": "cuda",
+  "stage4_amp": true,
+  "keras_policy": "mixed_float16",
+  "vessel_tta": true,
+  "stage4_inference_size": 1536,
+  "cache_size": 512,
+  "stage2_profile": "DR",
+  "batch_size": 8
+ },
+ "inference_source": "Stage-4 APTOS cache manifest (Tesla T4, amp true, cudnn deterministic); P and the pathology grader were built and evaluated under mixed_float16 on a T4",
+ "fusion": {
+  "fused_0": "0.5 * P_0 + 0.5 * Path_0",
+  "fused_1": "0.5 * P_1 + 0.5 * Path_1",
+  "fused_2": "0.5 * P_2 + 0.5 * Path_2",
+  "fused_3": "min(P_3, fused_2)",
+  "decode": "grade = number of k with fused_k > 0.5"
+ },
+ "fusion_note": "the only final fusion; no other rule is computed on IDRiD",
+ "metrics": [
+  "QWK",
+  "AUROC >=1",
+  "AUROC >=2",
+  "AUROC >=3",
+  "AUROC >=4",
+  "recall for grades 0-4",
+  "grade-3 recall",
+  "grade-4 recall",
+  "false-urgent rate",
+  "confusion matrix"
+ ],
+ "aggregation": {
+  "per_seed": true,
+  "mean_sd_over_seeds": true,
+  "ensemble": false,
+  "seed_selection": false,
+  "interval": "95 % grade-stratified bootstrap over the test images (2,000 resamples, seed 20260927) of the seed mean"
+ },
+ "references": {
+  "rows": [
+   "P alone",
+   "pathology grader alone",
+   "fused final pipeline"
+  ],
+  "note": "reference rows only; they do not influence any selection"
+ },
+ "not_done_on_idrid": [
+  "lesion / vessel shuffles",
+  "the 50 / 50 fusion",
+  "any other fusion rule",
+  "any threshold or weight search"
+ ],
+ "parity": {
+  "purpose": "this code must reproduce the stored APTOS validation predictions before any IDRiD image is read",
+  "images_per_grade": 2,
+  "subset_rule": "the first two images of every grade in the authoritative 730-image validation order",
+  "tolerances": {
+   "stage2": "exact",
+   "rgb_max_abs": 1e-06,
+   "vessel_max_abs": 0.0001,
+   "stage4_max_counts": 2,
+   "logit_max_abs": 0.05,
+   "probability_max_abs": 0.01,
+   "grades": "identical"
+  },
+  "tolerance_source": "RGB_PARITY_TOL, STAGE3_PARITY_TOL and CANARY_TOL_COUNTS are the project's existing constants; the logit and probability tolerances are set here for float16 logits (resolution 0.008 at |logit| 8-16)"
+ },
+ "rules": [
+  "evaluation only",
+  "no tuning",
+  "no threshold changes",
+  "no preprocessing changes",
+  "no retraining",
+  "no checkpoint selection",
+  "no seed selection",
+  "no fusion selection",
+  "no repeated runs for better numbers",
+  "a rerun only for a technical failure, with the reason recorded"
+ ],
+ "confirmation_token": "RUN_THE_ONE_TIME_IDRID_GRADING_TEST",
+ "outputs": "experiments/IDRiDGrading/idrid_grading_<protocol sha12>_<UTC time>/"
+}
