@@ -3908,3 +3908,121 @@ Evaluation only. No tuning. No threshold changes. No preprocessing changes. No r
 Per-image logits, cumulative probabilities and decoded grades for P, the pathology grader and the fusion, per seed (all 103 images, with a primary-set flag); per-seed and aggregate metrics for the 100-image primary set and, separately, the 103-image sensitivity set; the lock file and its hash; the eight checkpoint hashes as verified; per-image file hashes and the label-file hash; the excluded list; git commit; package versions; device; the command; the timestamp; the parity result. Output: `experiments/IDRiDGrading/idrid_grading_<protocol sha12>_<UTC time>/`.
 
 **Code.** `idrid_grading_eval.py`, `idrid_grading_protocol.json`, `tests/test_idrid_grading_eval.py`, `colab/notebooks/idrid_grading_evaluation.ipynb`. The old `idrid_external_evaluation.ipynb` (RACAF) is not used.
+
+
+### 60.1 Official APTOS parity gate — PASS (2026-10-05; Colab T4; no IDRiD image read)
+
+Run from `colab/notebooks/idrid_grading_evaluation.ipynb` cell 3 at commit `6a88636`, protocol `f93c1237…`. Environment: Tesla T4, Stage-4 mixed precision on, Keras `mixed_float16`, torch 2.11.0+cu130 (the version in the Stage-4 cache manifest), TensorFlow 2.20.0, Keras 3.13.2.
+
+Ten authoritative validation images (grades 0, 3, 1, 0, 1, 2, 4, 3, 2, 4), from the raw files:
+
+| check | result | tolerance |
+|---|---|---|
+| Stage 2 recomputed from raw vs the stored Stage-2 file | identical, 10 / 10 | exact |
+| RGB frame vs cache | 0 | 1e-6 |
+| vessel map vs cache | at most 8.3e-7 | 1e-4 |
+| Stage-4 maps vs cache | 0 counts, 10 / 10 | 2 counts |
+| logits vs stored BEST tables (P and pathology grader, three seeds) | at most 0.0078 | 0.05 |
+| cumulative probabilities vs stored | at most 0.00017 | 0.01 |
+| fused probabilities vs fusion of the stored tables | at most 0.00009 | 0.01 |
+| decoded grades (P, pathology grader, fusion; three seeds) | identical | identical |
+
+The evaluator reproduces the cached arrays and the stored predictions under the frozen settings. All nine pre-run conditions hold; the pipeline is ready for the one-time IDRiD run. The IDRiD test has not been run.
+
+
+## 61. IDRiD Disease Grading Testing Set — the one-time external evaluation: result (2026-10-05)
+
+**Run.** `colab/notebooks/idrid_grading_evaluation.ipynb` cell 4, once, in the runtime of the passed gate (§60.1). Commit `6a88636`, protocol `f93c1237…`, Tesla T4, Stage-4 mixed precision on, `mixed_float16`. Lock written 2026-10-05 13:28:16 UTC with no previous run and no rerun reason. All nine pinned files verified; 103 images and the label file matched their hashes. Output: `experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/`. Verified afterwards from the saved per-image tables: the fused tables equal the locked rule applied to the saved P and pathology tables, and the primary QWK recomputes exactly in all three seeds. No rule, threshold, checkpoint or seed was changed or selected.
+
+### Primary result — 100 images (grades 34 / 5 / 29 / 19 / 13)
+
+| mean ± SD over seeds 42, 123, 2026 | final pipeline (locked fusion) | reference: P alone | reference: pathology grader alone |
+|---|---|---|---|
+| QWK | **0.6290 ± 0.0435** | 0.6418 ± 0.0904 | 0.5923 ± 0.0830 |
+| AUROC ≥1 | **0.8908 ± 0.0189** | 0.8876 ± 0.0164 | 0.8544 ± 0.0240 |
+| AUROC ≥2 | **0.9032 ± 0.0162** | 0.8952 ± 0.0208 | 0.8831 ± 0.0187 |
+| AUROC ≥3 | **0.9165 ± 0.0171** | 0.8929 ± 0.0574 | 0.8716 ± 0.0255 |
+| AUROC ≥4 | **0.8618 ± 0.0363** | 0.8612 ± 0.0362 | 0.8102 ± 0.0089 |
+| recall, grade 0 | 0.4510 ± 0.0740 | 0.5098 ± 0.1114 | 0.4706 ± 0.1556 |
+| recall, grade 1 | 0.4667 ± 0.2309 | 0.3333 ± 0.1155 | 0.8000 ± 0.2000 |
+| recall, grade 2 | 0.6552 ± 0.0345 | 0.7241 ± 0.0597 | 0.5517 ± 0.0345 |
+| recall, grade 3 | 0.4211 ± 0.2412 | 0.2982 ± 0.1993 | 0.5263 ± 0.0526 |
+| recall, grade 4 | 0.1795 ± 0.1175 | 0.2051 ± 0.1175 | 0.2051 ± 0.0444 |
+| false-urgent rate | 0.0098 ± 0.0085 | 0.0049 ± 0.0085 | 0.0637 ± 0.0340 |
+
+- Final pipeline per seed: QWK 0.5889 / 0.6753 / 0.6229; AUROC ≥3 0.9007 / 0.9347 / 0.9141; AUROC ≥4 0.8294 / 0.8550 / 0.9010; grade-3 recall 0.2105 / 0.6842 / 0.3684; grade-4 recall 0.3077 / 0.0769 / 0.1538.
+- 95 % bootstrap interval of the seed mean (over images): final pipeline QWK 0.500 to 0.738, mean AUROC over the four cuts 0.854 to 0.926; P QWK 0.532 to 0.732; pathology grader QWK 0.459 to 0.711.
+- Final pipeline minus P, same seed (reference only): QWK −0.0127 (−0.109 to +0.061), per seed +0.051 / −0.027 / −0.062; mean AUROC over the four cuts +0.0089 (−0.006 to +0.025); grade-3 recall +0.123 (per seed +0.053 / +0.158 / +0.158); false-urgent +0.005.
+- Confusion matrices and per-image tables are in the output folder.
+
+### Sensitivity analysis only — 103 images (includes the three Stage-4-training copies)
+
+Final pipeline QWK 0.6234 ± 0.0450; P 0.6359 ± 0.0902; pathology grader 0.5882 ± 0.0791. Final pipeline minus P: QWK −0.0125 (−0.109 to +0.061). Final pipeline AUROC ≥3 is 0.889 (0.917 on the primary set). This does not replace the primary result. The three excluded grade-2 images are over-graded by every model (P calls them 3 / 4 / 2, 3 / 3 / 3 and 3 / 4 / 2 across seeds; the pathology grader 3 or 4 in every case), which is why the false-urgent rate rises to 0.042 for the final pipeline and 0.038 for P when they are included. P does not use Stage 4, so this over-grading is not explained by the Stage-4 overlap.
+
+### Reading
+
+- **External performance is far below APTOS validation.** QWK falls from 0.913 (APTOS validation, §59) to 0.629 on IDRiD for the final pipeline, and from 0.917 to 0.642 for P. The APTOS figures were measured on the set used for checkpoint selection, many times over; the IDRiD figure is the first uncontaminated one.
+- **Ranking transfers better than the decoded grades.** AUROC is 0.86–0.92 at every threshold, while decoded grades are poor: only 45 % of grade-0 images are called grade 0 (most are called 1 or 2), and grade-4 recall is 0.18 on 13 images. The fixed 0.5 decision points do not transfer to IDRiD. Under the protocol nothing is recalibrated or re-thresholded.
+- **Final pipeline versus P: comparable, no demonstrated improvement.** The QWK difference is −0.013 with an interval from −0.11 to +0.06, and its sign changes between seeds. Mean AUROC is +0.009 with an interval spanning zero. Grade-3 recall is higher in all three seeds (1, 3 and 3 of 19 images); grade-0 and grade-2 recall are lower. The seed-to-seed SD of QWK is 0.044 for the final pipeline and 0.090 for P.
+- **The pathology grader alone reaches QWK 0.59 and AUROC 0.81–0.88** on images its classifier never saw. Stage 4 itself was trained on IDRiD's camera domain, so this is not a fully independent test of that branch.
+- **Seed 42 of P is weak on IDRiD** (QWK 0.538, AUROC ≥3 0.827) against 0.702 and 0.685 for the other two seeds. No seed is singled out or dropped.
+
+### What can and cannot be claimed
+
+- Can: on 100 external images the frozen pipeline grades with QWK 0.63 (interval 0.50–0.74) and per-threshold AUROC 0.86–0.92; it is comparable to its RGB branch alone; its lesion-driven branch grades above chance on its own.
+- Cannot: superiority over P; adequacy of grade-4 detection (13 images, recall 0.18); anything about full-pipeline independence from IDRiD (Stage 4); any clinical use.
+- Limits: 100 images; 19 grade-3 and 13 grade-4 (one image = 0.053 and 0.077 of recall); 5 grade-1 images; three seeds; one dataset, one camera domain.
+
+**Closed.** The IDRiD grading test has been used. It is not rerun, and no model, rule, threshold or preprocessing choice is changed on the basis of this result.
+
+
+## 62. E1 multi-task grader — pre-run record: design, rules and gates (2026-10-05; written before any E1 training)
+
+**Context.** After §61 the objective was restated by the user: novelty is not the goal, and beating P is not required; a marginally lower QWK is acceptable for a meaningfully richer grading model. The earlier binding rule that Stage 3/4 must feed the classifier is lifted. Two novelty audits (lesion-guided routing; structured vessel–lesion representations) ended in rejection and are not reopened. IDRiD stays consumed (§61) and is not used here in any way.
+
+**Hypothesis.** Auxiliary supervision from the frozen Stage-4 lesion maps, applied to the feature map the grader pools, can be added to P at no material cost in grading, and changes what that feature map encodes.
+
+### Locked design
+
+- **Model.** P's graph (ImageNet ConvNeXt-Tiny → final map F3 16×16×768 → average pooling → LayerNorm → CORN Dense 768→4) plus one head on F3: Conv2D(4, 1×1) → linear, float32, output `lesion_logits` (MA, HE, EX, SE). 3,076 added parameters, beside the grading path. Bias = logit of the per-class mean training target (clipped to [1e-4, 1−1e-4]); kernel GlorotUniform(seed).
+- **Targets.** From the cached Stage-4 maps (uint8 512×512×8), the four `max` channels ÷ 255, reduced by an exact 32×32 block maximum to 16×16×4: the largest teacher probability in each 96×96 region of the 1536² Stage-4 output. Soft targets; no thresholding.
+- **Loss.** L = L_CORN + 1.0 · L_lesion; L_lesion = mean over batch, cells and classes of sigmoid cross-entropy with logits, float32. λ = 1 is fixed and is not tuned.
+- **Not in E1.** No vessel supervision, no vessel input, no Stage-3 file read. No Dice, focal or class weighting on the lesion loss. No decoder.
+- **Protocol.** P's, unchanged: batch 2, AdamW 1e-4 / weight decay 0.05 (none on 1-D parameters), weighted CORN with the pre-registered class weights, ≤ 50 epochs, early stopping on validation QWK (12), ReduceLROnPlateau (4, 0.5, 1e-6), mixed precision, P's augmentation and epoch order (flips / rot90 on RGB and targets together; brightness / contrast on RGB only), seeds 42 / 123 / 2026, BEST by validation QWK, no EMA. The lesion loss never enters checkpoint selection.
+- **Bookkeeping.** A two-output Keras model logs `val_corn_QWK`; a first-in-list callback copies the grading output's metrics to `val_QWK`, `QWK`, `val_corn_loss_unweighted`, `corn_loss_unweighted`, which the existing run machinery reads. The Keras `loss` / `val_loss` of E1 is CORN + lesion and is not comparable with P's.
+
+### Rules fixed before training
+
+- **Comparison.** Against the stored P run of the same seed, by the §54 paired bootstrap. Categories on the three-seed mean: *clearly better* (ΔQWK interval above zero and positive in 3/3 seeds); *comparable* (interval includes zero); *marginally worse, acceptable* (interval below zero but inside the §54 tolerances: QWK −0.02, AUROC −0.01, grade-3 recall −0.10, false-urgent +0.02); *substantially worse* (any tolerance breached on the mean).
+- **Reading.** QWK down with AUROC unchanged is a decision-threshold shift, not a representation loss; the severe cuts are read by AUROC first. Grade-4 recall is reported (one image = 0.017). §26 found the recurrent grade-4 failures are low-lesion-burden images, so AUROC ≥4 is the quantity to watch.
+- **Mechanism (secondary).** With the encoder frozen, a fresh head of the same form is trained on the training targets (L_lesion only; Adam 1e-3, batch 16, 5 epochs, no augmentation, final epoch, fixed seed) on P BEST and on E1 BEST of each seed; score = validation cell-level AUROC against target ≥ 0.5, mean of the four classes. "Mechanism changed" only if probe(E1) − probe(P) is positive in 3/3 seeds and the paired bootstrap interval of the mean (2,000 resamples over images, seed 20260927) excludes zero. The P half (E0) needs no grader training. Descriptive: E1's own head on validation; training-versus-validation QWK gap.
+- **Decision tree.** A failed gate → stop. E1 substantially worse → stop. E1 comparable and mechanism unchanged → stop ("supervision absorbed"). E1 clearly better, or mechanism changed → E2 (same model; each training image takes the targets of a fixed derangement partner, seed 20261001). E1 differs from E2 as well → E3 (one output channel; target = 32×32 block mean of the vessel map). E0, E2 and E3 are not run automatically.
+- **No iteration.** No second λ, no decoder variants, no added vessel term, no changed loss after seeing a result.
+- **Limits stated in advance.** The comparison is against stored P runs (as for Architecture 1); run-to-run GPU nondeterminism is not measured. The teacher's probabilities are not calibrated (Stage 4 was trained with positive-weighted BCE + Dice) and there is no lesion ground truth on APTOS, so map quality is agreement with Stage 4, not accuracy. Sharing an encoder does not force the grade to depend on the lesion output. E1 has no external evaluation: IDRiD is consumed.
+
+### Implementation (new files only; no existing file modified)
+
+`e1_model.py`, `e1_data.py`, `e1_train.py`, `e1_gates.py`, `tests/test_e1_multitask.py`, `colab/notebooks/e1_multitask_grader.ipynb`. The encoder is built from arch1_model's stage-by-stage helpers (imported) without the prior encoder and injections. P checkpoints are nested, so they are loaded into a P model and copied (`arch1_model.copy_backbone_weights`: every backbone array exactly once, plus the CORN head).
+
+**Tests (laptop CPU, Keras 3.15.1): 23 / 23 pass.** Construction; parameters = P + 3,076; shapes (B, 4) and (B, 16, 16, 4); lesion output float32; targets equal a brute-force block maximum and commute with every flip / rot90 combination; intensity jitter leaves targets bit-identical and the RGB identical to Architecture 1's augmentation; loss equals an independent reference (the float32 mean agrees with the float64 reference to 1e-4 relative, each term to 1e-5); mixed precision finite, grading float16, lesion float32; P checkpoint copy consumes every array once; E1 at initialisation equals P (1e-5); each loss alone reaches every encoder variable (finite, non-zero) and the lesion loss does not reach the CORN head; total loss = CORN + lesion; checkpoint round trip; one-epoch synthetic run (checkpoints, history, aliases, resume refusal on a changed configuration).
+
+### Gates (none trains E1)
+
+**Gate 3 — targets: PASS** (official; laptop, the SHA-verified Stage-4 cache mirrored from Drive; label-free; all 2,921 training images, every one also pooled by explicit loops).
+
+| | MA | HE | EX | SE |
+|---|---|---|---|---|
+| mean target (the bias prior) | 0.0718 | 0.1099 | 0.1089 | 0.0547 |
+| cells ≥ 0.5 | 0.0430 | 0.1246 | 0.0801 | 0.0756 |
+| cells > 0.9 | 0.0357 | 0.0474 | 0.0662 | 0.0091 |
+| cells > 0 | 0.1663 | 0.2671 | 0.4202 | 0.0892 |
+| cells exactly 0 / exactly 1 | 0.834 / 0.027 | 0.733 / 0.025 | 0.580 / 0.044 | 0.911 / 0.007 |
+| images with no cell ≥ 0.5 | 0.381 | 0.267 | 0.117 | 0.501 |
+
+Range 0 to 1; no non-finite value; 256 distinct levels per class; overall mean 0.0863; cells above 0.5: 0.0808, above 0.9: 0.0396; images with no positive cell in any class: 0.0298; no pooling disagreement; every cached file carries its own image id. Bias logits: −2.560 / −2.092 / −2.102 / −2.849.
+
+**Gate 2 — log aliases: laptop pre-check PASS; official run pending (Colab, Keras 3.13.2).** Observed on Keras 3.15.1: `corn_QWK`, `corn_corn_loss_unweighted`, `corn_loss`, `lesion_logits_loss`, `loss` and their `val_` forms — the four expected source names exist; the aliases reach the later callbacks, the checkpoint state (monitor `val_QWK`) and the stored history.
+
+**Gate 1 — P parity: laptop pre-check; official run pending (Colab T4, all 730 validation images, both tiers).** Pre-check with the three pinned P BEST checkpoints (SHA verified) on the 10 validation images mirrored locally, CPU: initialisation — E1 logits equal P's exactly (0) in all three seeds; float32 — E1 with the copied weights equals P exactly (logits 0, probabilities 0, grades identical; every backbone array copied once); mixed_float16 against the stored P BEST tables — logits at most 0.0128 / 0.0062 / 0.0126, probabilities at most 0.0025 / 0.0015 / 0.0009 (seeds 42 / 123 / 2026), grades identical; auxiliary output finite, float32, 16×16×4. A pre-check cannot make E1 ready.
+
+**Status.** NOT READY FOR TRAINING until the official Gate 1 and Gate 2 pass on the Colab runtime (notebook cells 5 and 6). Nothing has been trained. E0, E2 and E3 have not been run.
