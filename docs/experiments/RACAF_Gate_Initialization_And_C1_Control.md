@@ -3462,3 +3462,205 @@ Seeds 123 and 2026 are judged against the same P-42 values, as specified; the ma
 - Summary, only after all three verdicts exist: `experiments/Architecture1/arch1_cb5fc7a8d370_3seed_summary/summary.{json,md}` — per-seed values, mean, SD (n−1), per-seed pass/fail, seeds passing each check, shuffle results, and the route reading above.
 
 **Tests (CPU; no real training).** Seed order and separate directories; fresh initialisation (a model built after another seed has trained equals a pristine build; the pretrained reference is never modified); resume of the real loop from its checkpoint without re-initialisation; a failed or unfinished seed stops the sequence with no summary; aggregate mean / SD / pass counts and the three route readings.
+
+
+## 53. Before the Architecture-1 result: P's own seeds against the P-42 thresholds; next steps staged per outcome (2026-10-02; no Architecture-1 verdict exists yet)
+
+**State when written.** Architecture-1 seed 42 was at epoch 11 of training (no verdict; seeds 123 and 2026 not started). Nothing in this section uses an Architecture-1 result.
+
+**Finding — the pre-set thresholds contain P's own seed-to-seed variation.** The five checks (§51–§52) compare every seed with P-42. Applying the four metric checks to the stored P and PL runs (BEST; recomputed from each run's `per_sample_best.csv` and equal to its stored `metrics_best.json`):
+
+| run | QWK (≥ 0.8984) | AUROC ≥3 (≥ 0.9488) | grade-3 recall (≥ 0.5154) | false-urgent (≤ 0.0579) | all four |
+|---|---|---|---|---|---|
+| P-42 | 0.9184 | 0.9588 | 0.6154 | 0.0379 | pass |
+| P-123 | 0.9148 | 0.9489 | **0.5128** | 0.0316 | fail |
+| P-2026 | 0.9176 | **0.9410** | **0.5128** | 0.0363 | fail |
+| PL-42 | 0.9215 | 0.9617 | **0.4615** | 0.0316 | fail |
+| PL-123 | 0.9138 | 0.9585 | **0.1026** | 0.0063 | fail |
+| PL-2026 | 0.9177 | 0.9515 | **0.4103** | 0.0253 | fail |
+
+- A model exactly as good as P would read as MIXED under the pre-set criteria: P-123 misses grade-3 recall by 0.003, P-2026 misses AUROC and grade-3 recall.
+- The pre-set criteria and the three-seed reading (§52) are **not changed**. Seed 42 is unaffected (its reference is P-42 either way).
+- The post-run report will additionally give a **matched-seed reading** — the same tolerances, each seed against the P run of the same seed — labelled descriptive. It was specified here, before any seed finished. Making it the criterion would be the user's decision and would be recorded as a change.
+
+**Next steps staged, none approved or run** (`next_steps/architecture1_outcomes/`; main code untouched, nothing committed):
+
+| route | next step | source in the record |
+|---|---|---|
+| VIABLE | step F: Architecture 1 + soft ordinal CORN targets (σ = 0.5), weight-EMA shadow tracked | spec §12 step 7; §33 candidate 2 and rule "E2"; §35 |
+| MIXED | the post-run report only; the decision that follows is the user's | §52 |
+| CLOSED | PL-v2: PL's early fusion retrained on the v2 bundle (the §22 PL runs used the legacy Stage-4 maps) | §40 fallback; cache rule §37 |
+| any | laptop post-run report and draft record section | standing rule |
+
+- Mechanism audit: `next_steps/architecture1_outcomes/MECHANISMS_AUDIT.md`. A combination is proposed in the record only for a viable route (priors + soft targets + EMA shadow). Nothing is proposed for a mixed result. The closed-route fallback is weak: the §22 PL runs failed the grade-3 recall check in every seed.
+- Open items to confirm before step F: the guardrail bounds (§33 names the guardrails without bounds), the EMA momentum and evaluation rule (§35 left both open), and whether to add three hard-target runs with a shadow to complete the §35 2 × 2.
+- Step G (IDRiD grading, once) is not prepared: it depends on F's verdict.
+- All staged code is additive. `arch1_train.py` gets a `Variant` hook that is hash-neutral with no variant (tested against the committed file), applied only after the three seeds have finished.
+
+
+## 54. How the three-seed Architecture-1 result will be read — matched-seed framework, fixed before seeds 123 and 2026 (2026-10-02, 08:10 UTC)
+
+**State when written.** Seed 42 was at epoch 20 of training: no verdict, no evaluation files. Seeds 123 and 2026 had not started (Drive directory listing only). What had been seen of seed 42 before this section: its validation QWK at epochs 1–3 (0.869, 0.878, 0.915, read to check training speed) and that its best epoch so far was 9 at epoch 11. No lesion-shuffle result, no test of any criterion.
+
+**The running experiment is not changed.** Code, seeds, checkpoint selection and the five per-seed checks stay as committed (`79d6a2d`).
+
+**Why the reading changes.** §53: P's own seeds 123 and 2026 do not pass the P-42 thresholds. A threshold derived from one P seed is not a suitable sole closure rule for a three-seed experiment. This section therefore replaces the route-level reading of §52 (all pass = viable, all fail = closed, mixed = reported). It is a change to a pre-registered reading, made after §53 and before any Architecture-1 verdict existed; it is recorded as a change, not as the original plan.
+
+**1. Primary analysis — matched-seed comparison (descriptive).** Architecture 1 seed s against P seed s (42, 123, 2026), BEST checkpoints, the same 730 validation images in the same order, the same metric code:
+- Δ QWK, Δ AUROC (≥3; grade 4 vs 0–2), Δ grade-3 recall, Δ false-urgent rate;
+- lesion-shuffle Δ QWK (lesion maps permuted across validation images, RGB and vessel unchanged; the fixed derangement of §52);
+- each per seed, and mean ± SD over the three matched differences; paired grade-stratified bootstrap intervals (2,000 resamples, seed 20260927) for the QWK and AUROC differences.
+
+**2. The five checks against P-42 are kept, relabelled.** They are reported as **"P-42-derived absolute reference bounds; not a multi-seed success criterion"** — descriptive safety checks. The run's own `summary.json` will still say VIABLE / MIXED / CLOSED, because that code is not touched; it is read as the tally of those bounds and nothing more. The bounds are not replaced and not hidden.
+
+**3. Interpretation — four categories (user, 2026-10-02).** A category is a reading of the evidence. None of them starts an experiment.
+
+| | Evidence | Reading |
+|---|---|---|
+| **A** | consistent lesion dependence, and matched-seed performance maintained or improved | Architecture 1 has evidence worth pursuing; whether soft targets / EMA are scientifically necessary is then decided separately |
+| **B** | lesion dependence present, grading consistently worse | the maps carry usable information but the fusion is harmful; investigate or close before adding mechanisms |
+| **C** | lesion dependence disappears | the lesion maps are not contributing meaningfully; close Architecture 1 |
+| **D** | highly inconsistent across seeds | report the instability; do not pick a seed and do not add mechanisms on that basis |
+
+**Operational definitions (mine; built only from tolerances already in the record — to be confirmed by the user; any amendment will be recorded with its timing).** Per seed, BEST checkpoint:
+- *Lesion dependence*: lesion-shuffle Δ QWK ≤ −0.01 (the §40 value).
+- *Performance maintained*: against P of the same seed, Δ QWK ≥ −0.02, Δ AUROC ≥ −0.01, Δ grade-3 recall ≥ −0.10 and Δ false-urgent ≤ +0.02 — the existing tolerances, with the reference changed from P-42 to the same-seed P.
+- **A**: dependence in 3/3 seeds and maintained in 3/3. **B**: dependence in 3/3 and maintained in 0/3. **C**: dependence in 0/3. **D**: anything else.
+- "Improved" is not a category and has no threshold: there is no pre-registered superiority criterion. Means, SDs and intervals are reported; superiority is not claimed.
+
+**4. Nothing follows automatically.**
+- The soft-target and PL-v2 packages staged in `next_steps/architecture1_outcomes/` are **dormant**. Their code refuses to run without the record section that approves the run; no Architecture-1 result supplies that.
+- If Architecture 1 ignores the lesion maps, soft targets / EMA are not expected to fix that and are not run.
+- EMA is unresolved: the record (§35) fixes neither a momentum nor an evaluation rule, and the "2-epoch horizon, last epoch" I had staged is withdrawn as a default — EMA is now off unless a value is pre-registered. The 2 × 2 (hard / soft × no EMA / EMA) is incomplete, because the Architecture-1 runs have no shadow: either the hard / EMA cell is run, or the experiment is framed as a single combined intervention with nothing attributed to EMA.
+- No seed is singled out for any purpose.
+
+**5. Step G (IDRiD grading test) is not run.** The Stage-4 segmentation test is already consumed (§48). The grading test is for the finalized downstream model, once — not for an Architecture-1 seed.
+
+**Limits to keep in view.** The validation set has been used many times. Grade-3 recall rests on 39 validation images, so one image is 0.026 and the −0.10 tolerance is about four images.
+
+**Code (staged only; main code untouched, nothing committed).** `next_steps/architecture1_outcomes/COMMON/arch1_posthoc.py` implements 1–3 and writes the report and a draft record section; it was checked on the real P / PL files (it reproduces their stored metrics and the §22 PL − P differences).
+
+
+## 55. Architecture 1 — three seeds (42, 123, 2026): category **D** — inconsistent across seeds (runs finished 2026-10-03; analysed 2026-10-05)
+
+**Runs.** `experiments/Architecture1/` on Drive; Stage-4 `cb5fc7a8…`, Stage-3 `91f0cada…`, bundle fingerprint `5069adc0…`, split `bc80fd45…`. EMA: none. 730 validation images, the P order. C2 had already FAILED its pre-registered criterion before this run; this was an exploratory, low-prior falsification test, not a confirmatory experiment.
+
+**Matched-seed comparison with P (primary analysis; BEST checkpoints; descriptive).**
+
+| Architecture 1 − P, same seed | seed 42 | seed 123 | seed 2026 | mean | SD | 95 % CI of the mean | > 0 in |
+|---|---|---|---|---|---|---|---|
+| Δ QWK | -0.0037 (-0.0227 to +0.0148) | +0.0048 (-0.0142 to +0.0253) | -0.0084 (-0.0258 to +0.0086) | -0.0024 | 0.0067 | -0.0145 to +0.0102 | 1/3 |
+| Δ AUROC (>=3; grade 4 vs 0-2) | -0.0054 (-0.0193 to +0.0069) | +0.0015 (-0.0218 to +0.0250) | +0.0141 (+0.0008 to +0.0286) | +0.0034 | 0.0099 | -0.0083 to +0.0159 | 2/3 |
+| Δ grade-3 recall | -0.3077 | -0.0513 | -0.0513 | -0.1368 | 0.1480 | — | 0/3 |
+| Δ false-urgent rate | -0.0205 | -0.0032 | -0.0095 | -0.0111 | 0.0088 | — | 0/3 |
+| lesion-shuffle ΔQWK (maps permuted − intact) | -0.0204 | -0.0256 | -0.0326 | -0.0262 | 0.0061 | — | — |
+
+| seed | reference | Δ QWK (≥ −0.02) | Δ AUROC ≥3 (≥ −0.01) | Δ grade-3 recall (≥ −0.10) | Δ false-urgent (≤ +0.02) | performance maintained | lesion-shuffle ΔQWK (≤ −0.01) | lesion dependence |
+|---|---|---|---|---|---|---|---|---|
+| 42 | P-42 | -0.0037 PASS | -0.0054 PASS | -0.3077 FAIL | -0.0205 PASS | no | -0.0204 | yes |
+| 123 | P-123 | +0.0048 PASS | +0.0015 PASS | -0.0513 PASS | -0.0032 PASS | yes | -0.0256 | yes |
+| 2026 | P-2026 | -0.0084 PASS | +0.0141 PASS | -0.0513 PASS | -0.0095 PASS | yes | -0.0326 | yes |
+
+**Interpretation (rules of §54): D — inconsistent across seeds.** Lesion dependence in seeds [42, 123, 2026] (3/3); matched-seed performance maintained in seeds [123, 2026] (2/3). The seeds disagree on lesion dependence or on matched-seed performance. This is reported as instability. No seed is singled out and no mechanism is added on this basis.
+
+**P-42-derived absolute reference bounds; not a multi-seed success criterion.** Tally recorded by the run's code: CLOSED.
+
+| check against P-42 | seed 42 | seed 123 | seed 2026 | mean | SD | P-42 | seeds within |
+|---|---|---|---|---|---|---|---|
+| QWK | 0.9147 PASS | 0.9196 PASS | 0.9093 PASS | 0.9145 | 0.0052 | 0.9184 | 3/3 |
+| AUROC (>=3; grade 4 vs 0-2) | 0.9533 PASS | 0.9504 PASS | 0.9550 PASS | 0.9529 | 0.0023 | 0.9588 | 3/3 |
+| lesion-shuffle QWK drop | +0.0204 PASS | +0.0256 PASS | +0.0326 PASS | 0.0262 | 0.0061 | n/a | 3/3 |
+| grade-3 recall | 0.3077 FAIL | 0.4615 FAIL | 0.4615 FAIL | 0.4103 | 0.0888 | 0.6154 | 0/3 |
+| false-urgent rate | 0.0174 PASS | 0.0284 PASS | 0.0269 PASS | 0.0242 | 0.0060 | 0.0379 | 3/3 |
+
+- P's own seeds against the same bounds: P-123, P-2026 are not within all four metric bounds.
+- Architecture 1 − PL, same seed, mean ± SD: QWK -0.0031 ± 0.0078; AUROC ≥3 -0.0043 ± 0.0068; grade-3 recall +0.0855 ± 0.2581.
+- Vessel-shuffle ΔQWK per seed: +0.0001, +0.0003, +0.0000; BEST epoch index: 9, 26, 32; train − validation QWK at BEST: +0.0529, +0.0736, +0.0855.
+
+**Not concluded.**
+- No superiority over P is claimed: there is no pre-registered superiority criterion, and a mean above zero is not one.
+- No seed is singled out; checkpoint selection is BEST by validation QWK in every run.
+- No further experiment follows automatically from the category. Soft targets, EMA and the PL-v2 fallback stay dormant until a decision is recorded.
+- The IDRiD grading test is untouched. It is for the finalized downstream model, once, not for a seed.
+
+**Notes on this reading (2026-10-05).**
+- **Status of the rules.** The four categories are the user's (§54). The operational definitions were mine and were not confirmed before seeds 123 and 2026 finished; they are applied here exactly as recorded in §54, unchanged. I had raised one alternative before the result — judging "performance maintained" on the three-seed mean, as §22 did for P/PL — and it was not adopted. Stated post hoc and for transparency only: on the three-seed mean, Δ grade-3 recall is −0.137, outside the −0.10 tolerance, while Δ QWK, Δ AUROC and Δ false-urgent are inside theirs. Neither reading gives category A.
+- **What is consistent across the seeds.** The model depends on the lesion maps in every seed (shuffle Δ QWK −0.020, −0.026, −0.033). QWK and AUROC are not distinguishable from P of the same seed (seed-mean Δ QWK −0.002, 95 % CI −0.015 to +0.010; Δ AUROC +0.003, CI −0.008 to +0.016). Grade-3 recall is lower than P in every seed (−0.308, −0.051, −0.051) and the false-urgent rate is lower in every seed.
+- **What is inconsistent.** The size of the grade-3 recall loss: 12 of 39 images in seed 42, 2 of 39 in seeds 123 and 2026. Seed 42's BEST epoch is early (index 9 of 22); the other two are late (26 of 39, 32 of 45).
+- **Vessel map.** Shuffling the vessel map changes QWK by +0.0001, +0.0003 and +0.0000. In this model the Stage-3 vessel input has no measurable effect on validation grading.
+- **Interpretation, labelled as such.** Dependence on the lesion maps without any gain over P is the pattern C2 predicted (§50): the maps substitute for evidence the RGB trunk already has, they do not add to it. This is consistent with the evidence, not established by it.
+- **Not done.** Nothing was applied from `next_steps/`, nothing was committed, no follow-up was started. Output: `results/Architecture1/posthoc_2026-10-05/` (report.md, results.json, record_section.md).
+
+
+## 56. Pathology Grader — pre-run record and interpretation rules (2026-10-05; written before any training)
+
+**State when written.** No pathology-grader run exists (`experiments/PathologyGrader/` is absent on Drive). The code is written and CPU-tested but not committed; `main` is at `79d6a2d`. Nothing in this section changes the model, the training code, the fusion code, a threshold or the configuration.
+
+**Why this experiment.** After the three-seed Architecture-1 result (§55) the direction chosen is a dual-branch pipeline: the stored RGB grader P plus a grader that sees only the segmentation outputs, combined by a fixed rule. Read-only inspection of the three Architecture-1 BEST checkpoints (2026-10-05) showed why its Stage-3/4 pathway stayed marginal: the injection gates ended at about 0.01 on average (largest 0.066) at all four scales, and the prior encoder's weights kept cosine similarity 0.90–0.99 with their seed initialisation. A branch with no RGB input cannot be bypassed in that way.
+
+### Design (fixed)
+
+- **Model** (`pathology_grader_model.py`): Stage-3 vessel map (1 channel) + Stage-4 v2 lesion maps (MA, HE, EX, SE; mean and max each, 8 channels) → the Architecture-1 Stage-5 encoder, unchanged → global average pooling → LayerNorm → CORN (256 → 4). About 1.2 M parameters. No RGB input, no ConvNeXt; the RGB cache is never opened. Trained from scratch: no pretrained weights.
+- **Data**: bundle `rgb-v1__s3-91f0cada__s4v2-cb5fc7a8d370-K4` (Stage-3 `91f0cada…`, Stage-4 `cb5fc7a8…`), split `bc80fd45…`, 2,921 training and 730 validation images.
+- **Protocol**: the P protocol — batch 2, AdamW 1e-4 / weight decay 0.05, weighted CORN with the pre-registered class weights, ≤ 50 epochs, early stopping on validation QWK (patience 12), ReduceLROnPlateau (4, 0.5, 1e-6), mixed precision, BEST by validation QWK. Seeds 42 → 123 → 2026, one run directory per seed, fresh initialisation each. No EMA, no soft targets.
+- **Augmentation**: P's flips and 90° rotations with P's per-image RNG, applied to the whole [vessel | lesion] stack. P's brightness / contrast jitter is RGB-only and does not apply.
+- **Fusion** (`pathology_grader_fusion.FUSION`, written into every run's hashed `config.json` before the first epoch): with p_k = P(grade > k), k = 0…3,
+  `fused_k = 0.5 · p_k[P, same seed, BEST] + 0.5 · p_k[pathology grader, same seed, BEST]`; `grade = number of k with fused_k > 0.5`.
+  P is the stored §22 runs, frozen and not retrained.
+- **Control**: the same arithmetic on two P seeds — P-42 with P-123, P-123 with P-2026, P-2026 with P-42.
+- **Shuffles** (BEST checkpoint; one fixed derangement of the validation images, seed 20261001): vessel; MA; HE; EX; SE (each class's mean and max channels together); all lesions; everything.
+- **Outputs**: `experiments/PathologyGrader/pathgrader_cb5fc7a8d370_seed{42,123,2026}/` and `…_3seed_summary/`.
+
+### Pre-run audit findings (2026-10-05, read-only)
+
+| check | finding |
+|---|---|
+| RGB leakage | none: the only inputs are the two segmentation tensors; tests run with the RGB cache deleted; P enters only at fusion |
+| channel order and alignment | vessel, then MA, HE, EX, SE; verified against the manifest on every read; augmentation applied to the whole stack |
+| trained from scratch | yes; each seed records the hash of its starting weights |
+| learning rate 1e-4, batch 2 | defensible: the six-run pre-registration used this protocol on randomly initialised networks, and the NO_RACAF runs reached training QWK 0.52–0.54 after one epoch and 0.87–0.90 at the stop. Those runs stopped at 27–36 epochs with the learning rate decayed to 3e-6–1.2e-5 and training QWK still rising, so under-training is possible. The encoder uses GroupNorm, so batch size 2 is not itself a problem |
+| fusion predetermined | yes: the rule is in the hashed configuration; a changed rule makes every run directory refuse to continue; completed seeds are never recomputed |
+| control | valid for ordinary ensembling gains, with the limits in rules 4 and 5 |
+| §54 framework | applied with the recorded tolerances and the 0.01 shuffle value, all three seeds, BEST checkpoints |
+| shuffles | each replaces exactly its own channels (tested) |
+
+The result is a lower bound on what the maps support under this protocol, not a ceiling.
+
+### Interpretation rules (fixed before training)
+
+**1. Primary question.** Do the frozen Stage-3 vessel and Stage-4 lesion outputs independently contain usable DR-grading information? The **pathology-only grader is the primary experiment.** The fixed fusion with P is a secondary, pipeline-integration experiment.
+
+**2. Under-training rule.** A weak pathology-only result counts as evidence against the maps only if the training curves show adequate fitting. If training QWK is still low or materially rising at the stopping epoch, the standalone result is classified **UNDER-TRAINED UNDER THIS PROTOCOL** and no conclusion is drawn that the Stage-3 / Stage-4 maps lack grading information. C2's pooled-map linear probe (§50: mean AUROC 0.927 over the four cuts, training-split cross-validation) is a **reference point, not a performance target**: a pathology network substantially below it triggers an examination of whether the network under-used its input.
+
+**3. Standalone result — what is reported.** QWK; AUROC for ≥1, ≥2, ≥3, ≥4; grade-3 recall; grade-4 recall; false-urgent rate; the training and validation curves; each per seed and as mean ± SD over seeds 42, 123, 2026. No success threshold is created after the results are seen.
+
+**4. Fusion result.** The rule is permanently `fused_k = 0.5 · P_same_seed,k + 0.5 · pathology_same_seed,k`. No weight or threshold tuning is permitted. Reading:
+
+| | outcome | reading |
+|---|---|---|
+| A | fusion improves over P and exceeds the P + P control | evidence that the pathology branch adds complementary information beyond ordinary RGB ensembling |
+| B | fusion improves over P but not beyond P + P | the improvement cannot be attributed to pathology; likely an ordinary ensemble benefit |
+| C | fusion approximately equal to P | no measurable incremental grading benefit is demonstrated, although standalone pathology capability may still be present |
+| D | fusion worse than P | does **not** prove the pathology information is useless: a fixed 50 / 50 fusion can dilute a weaker but complementary branch |
+
+**5. P + P control.** The three control pairs overlap — each P seed appears in two of them — so they are not independent. Their SD is not an independent three-run estimate and is not treated as one.
+
+**6. Shuffle analysis.** For vessel, MA, HE, EX and SE the change in QWK and AUROC caused by shuffling is reported; the all-lesion and vessel shuffles are reported as well.
+- Each single-class drop is a **lower bound** on that class's contribution.
+- Class-specific drops are not added together.
+- A small single-class drop does not mean the class carries no information: classes may be redundant with each other.
+- The shuffle analysis is mechanistic evidence, not a superiority criterion.
+
+**7. §54 category.** The matched-seed framework of §54 may be reported for the fused model; its category is **descriptive only.** A fused lesion-shuffle drop below 0.01 is not evidence that the pathology branch is unused, because the 50 / 50 fusion inherently dilutes any perturbation of that branch. The §54 category is not used to close the pathology route. (The report code prints the §54 category text automatically, including a sentence that a model "is closed" for category C; for this experiment that sentence is not a decision.)
+
+**8. No post-hoc changes.** Once training begins: no new thresholds; no changed fusion weight; no seed selection; no changed loss; no EMA; no soft targets; no new architecture; no additional training runs based on an observed result.
+
+**9. Final interpretation — three separate questions.** The record will answer each on its own:
+- (a) Can the Stage-3 / Stage-4 maps independently support grading? — the standalone result, read with rule 2.
+- (b) Does the pathology branch add information to P? — fusion against P and against the P + P control, read with rules 4 and 5.
+- (c) Does the fixed fusion produce a useful final pipeline? — the fused model's own metrics against P.
+A "no" to (b) or (c) is not a "no" to (a).
+
+**Limits to keep in view.** The validation set has been used many times, and every member (P and the pathology grader) is selected by BEST validation QWK on it. Grade-3 recall rests on 39 validation images (one image = 0.026). Each shuffle is a single fixed permutation; the per-image tables are saved, so intervals can be computed afterwards without retraining.
+
+**Code** (not yet committed): `pathology_grader_model.py`, `pathology_grader_train.py`, `pathology_grader_fusion.py`, `arch1_posthoc.py` (the §54 framework, as used for §55), `tests/test_pathology_grader.py`, `tests/test_pathology_grader_fusion.py`, `tests/test_arch1_posthoc.py`, `colab/notebooks/pathology_grader_training.ipynb`. CPU tests: 21 + 10 pass, including a real two-epoch loop with resume on the 5-image fixture with the RGB cache deleted. No Architecture-1, P, PL, C2, Stage-3 or Stage-4 code was modified.
