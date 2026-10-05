@@ -4052,3 +4052,33 @@ Range 0 to 1; no non-finite value; 256 distinct levels per class; overall mean 0
 **What it is not.** No tolerance was loosened and the gate is recorded as failed. The criterion "E1 vs stored P table, logits ≤ 0.05" was written by me in the specification; it tests two things at once (E1 = P, and P reproduces its stored float16 logits), and only the first is about E1.
 
 **Status: NOT READY FOR TRAINING.** Nothing was trained. Whether tier 2 is re-specified (for example as E1 vs P on the same runtime under mixed_float16, with the stored-table comparison kept for probabilities and grades) is the user's decision; it would be a change to a gate after seeing its result and is recorded as such if made.
+
+
+### 62.2 Gate 1 diagnostic on the Colab T4 (2026-10-05, commit `59c4c26`; no rule or tolerance changed; nothing trained)
+
+`e1_gates.p_parity_diagnostic`, all 730 validation images, three pinned P BEST checkpoints, mixed_float16, batch 8.
+
+| P recomputed (mixed_float16) vs P's stored logits | seed 42 | seed 123 | seed 2026 |
+|---|---|---|---|
+| logits: max | 0.0078 | 0.0078 | 0.0078 |
+| logits: mean / median | 0.00031 / 0 | 0.00016 / 0 | 0.00018 / 0 |
+| logits: p90 / p95 / p99 | 0.0005 / 0.0020 / 0.0078 | 0.0002 / 0.0010 / 0.0039 | 0.0002 / 0.0010 / 0.0039 |
+| logits above 0.05 / 0.1 / 0.5 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| share of the 2,920 logits exactly equal | 0.867 | 0.847 | 0.857 |
+| cumulative probabilities: max | 0.00033 | 0.00020 | 0.00020 |
+| decoded grades that differ | 0 | 0 | 0 |
+| worst image (index) | `10eefba568dd` (38) | `3ca8be3b40d6` (155) | `034cb07a550f` (8) |
+| E1 vs recomputed P, same runtime | bitwise equal | bitwise equal | bitwise equal |
+| context: P at batch 2 vs batch 8, same policy — logits max | 0.0156 | 0.0078 | 0.0078 |
+| context: P in float32 vs stored — logits max (count above 0.05) | 0.0604 (8) | 0.0247 (0) | 0.0619 (14) |
+| context: P mixed vs P float32, same runtime — logits max | 0.0604 | 0.0247 | 0.0619 |
+
+Worst images: seed 42, threshold 1, stored 9.71875 vs recomputed 9.7109375 (grade 2 both); seed 123, threshold 0, −9.015625 vs −9.0234375 (grade 0 both); seed 2026, threshold 0, 8.6171875 vs 8.609375 (grade 4 both). Each is a single float16 step; the probability change is at most 1.4e-6.
+
+**Finding: the §62.1 Gate 1 failure was a defect in the gate's code, not in E1 and not in P.** Under mixed_float16, P reproduces its stored logits to one float16 step (max 0.0078, none above 0.05). The values §62.1 reported for the "mixed_float16" tier — 0.0604 / 0.0247 / 0.0619 — are, to the last digit, the *float32*-versus-stored differences measured here. `e1_gates.p_parity` sets the policy once per tier and then calls `keras.backend.clear_session()` for each seed; in Keras 3 that call resets the global dtype policy to float32 (verified: mixed_float16 before, float32 after). The tier labelled mixed_float16 therefore ran in float32, twice over. The diagnostic sets the policy after clearing the session and is not affected. The laptop pre-check in §62 had the same defect (its 0.0128 is the float32-versus-stored value on those 10 images). The training and evaluation code clears the session before the policy is set and is not affected; Gate 2 and the gradient check printed "Mixed precision enabled" and ran in mixed precision.
+
+**Corrections to §62.1.** The explanation offered there (float16 resolution at saturated logits) is wrong: the differences do not concentrate at large logits (rank correlation between |logit| and |difference| −0.20 to −0.24; the 96 logits above 16 in seed 42 reproduce exactly). What §62.1 measured was the float32-versus-float16 difference of P, which is real (up to 0.06 in logits, 0.0067 in probabilities, no grade change) and is the reason the tolerance for the mixed tier is 0.05 and for the float32 tier 1e-4 against a same-precision reference. Also: the "difference in float16 steps" column of the diagnostic is not meaningful for logits near zero (the step there is tiny) and is not used.
+
+**Not a systematic shift.** Mean signed difference −3e-6 to −3e-5; about 85 % of logits identical; the rest scattered at one step.
+
+**Status.** Gate 1 remains recorded as FAILED as run; its rule and tolerances are unchanged. The gate has not yet been executed correctly in mixed precision. Nothing was trained.

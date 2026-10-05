@@ -513,6 +513,15 @@ class DataAndGateTests(unittest.TestCase):
             self.assertEqual(row["lesion_output_shape"], [16, 16, 4])
             self.assertLessEqual(result["initialisation"][seed]["logit_max_abs"], eg.INIT_TOL)
         self.assertFalse(result["official"])
+        # The mixed tier must really run in mixed precision (keras.backend.clear_session() resets the policy).
+        mixed = eg.p_parity(self.bundle, {42: paths[42]}, weights_file, PRIOR, policies=("float32", "mixed_float16"),
+                            expected_sha256=shas, official=False, log=lambda *a: None)
+        self.assertEqual(mixed["tiers"]["float32"][42]["grading_output_dtype"], {"p": "float32", "e1_grading": "float32"})
+        self.assertEqual(mixed["tiers"]["mixed_float16"][42]["grading_output_dtype"], {"p": "float16", "e1_grading": "float16"})
+        self.assertEqual(mixed["tiers"]["mixed_float16"][42]["policy_in_force"], "mixed_float16")
+        self.assertTrue(mixed["tiers"]["mixed_float16"][42]["e1_vs_live_p"]["grades_equal"])
+        self.assertEqual(keras.mixed_precision.global_policy().name, "float32")          # restored afterwards
+        self.assertTrue(any("stored P BEST tables" in f for f in mixed["failures"]))      # no stored_root given
         bad = eg.p_parity(self.bundle, paths, weights_file, PRIOR, policies=("float32",),
                           expected_sha256={42: "0" * 64, 123: shas[123]}, official=False, log=lambda *a: None)
         self.assertFalse(bad["PASS"])                                      # an unpinned checkpoint is refused

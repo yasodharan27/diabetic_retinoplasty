@@ -131,17 +131,25 @@ def p_parity(bundle, p_weight_paths, convnext_weights_path, lesion_prior, *, pol
             log(f"  init parity seed {seed}: logits {init[int(seed)]['logit_max_abs']:.3g}")
             del p, e1
         for policy in policies:
-            keras.mixed_precision.set_global_policy(policy)
             tiers[policy] = {}
+            expected_dtype = "float16" if policy == "mixed_float16" else "float32"
             for seed, path in p_weight_paths.items():
                 seed = int(seed)
+                # Keras 3: clear_session() resets the global dtype policy to float32, so the policy is set
+                # AFTER it, for every model, and the built models are checked to really be in that precision.
                 keras.backend.clear_session()
+                keras.mixed_precision.set_global_policy(policy)
                 p = pl.build_pl_model("P", seed, reference_arrays)
                 ckpt.load_model_weights_only(p, path)
                 e1 = em.build_e1_model(seed, lesion_prior)
+                dtypes = {"p": str(p.outputs[0].dtype), "e1_grading": str(e1.outputs[0].dtype)}
+                if set(dtypes.values()) != {expected_dtype}:
+                    raise RuntimeError(f"{policy}, seed {seed}: the models were not built in this precision "
+                                       f"(grading outputs {dtypes}, expected {expected_dtype})")
                 report = em.copy_from_p(e1, p)
                 p_logits, e_logits, lesion = paired_logits(p, e1, bundle, ids)
                 row = {"copy_report": report, "e1_vs_live_p": compare(p_logits, e_logits),
+                       "grading_output_dtype": dtypes, "policy_in_force": keras.mixed_precision.global_policy().name,
                        "lesion_output_finite": bool(np.isfinite(lesion).all()),
                        "lesion_output_dtype": str(lesion.dtype), "lesion_output_shape": list(lesion.shape[1:])}
                 if not row["lesion_output_finite"]:
