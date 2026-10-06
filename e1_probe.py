@@ -103,17 +103,35 @@ def build_frozen_encoder(kind, seed, weights_path, lesion_prior, reference_array
     return feature_model(model), model
 
 
-def extract(bundle, features, full, image_ids, batch_size=EXTRACT_BATCH, log=None):
-    """(F3 for every image as float16 (N, 16, 16, 768), grading logits (N, 4) float64), unaugmented."""
+def _ram():
+    try:
+        import psutil
+        m = psutil.virtual_memory()
+        return f"RAM {m.used / 2 ** 30:.1f}/{m.total / 2 ** 30:.1f} GB"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def extract(bundle, features, full, image_ids, path, batch_size=EXTRACT_BATCH, log=None):
+    """F3 of every image, unaugmented, written batch by batch to a float16 .npy memmap at `path` (never held
+    in RAM as a whole), and the grading logits (N, 4) float64. Returns (read-only memmap, grading logits)."""
+    import stage34_cache_v2 as cache
     ids = [str(i) for i in image_ids]
-    maps, grading = [], []
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    shape = (len(ids),) + tuple(int(d) for d in features.output.shape[1:])
+    store = np.lib.format.open_memmap(path, mode="w+", dtype=np.float16, shape=shape)
+    grading = np.zeros((len(ids), 4), np.float64)
     for s in range(0, len(ids), batch_size):
-        rgb = np.stack([ed.load_inputs(bundle, i)["rgb"] for i in ids[s:s + batch_size]])
-        maps.append(np.asarray(features.predict_on_batch({"rgb": rgb})).astype(np.float16))
-        grading.append(np.asarray(full.predict_on_batch({"rgb": rgb})[0], np.float64))
+        chunk = ids[s:s + batch_size]
+        rgb = np.stack([cache.read_stage2_rgb(bundle._path("stage2_rgb_v2", i),
+                                              expected_file_sha256=bundle._sha("stage2_rgb_v2", i)) for i in chunk])
+        store[s:s + len(chunk)] = np.asarray(features.predict_on_batch({"rgb": rgb})).astype(np.float16)
+        grading[s:s + len(chunk)] = np.asarray(full.predict_on_batch({"rgb": rgb})[0], np.float64)
         if log and (s // batch_size) % 50 == 0:
-            log(f"    features {min(s + batch_size, len(ids))}/{len(ids)}")
-    return np.concatenate(maps, 0), np.concatenate(grading, 0)
+            log(f"    features {min(s + batch_size, len(ids))}/{len(ids)}  {_ram()}")
+    store.flush()
+    del store
+    return np.load(path, mmap_mode="r"), grading
 
 
 def targets_for(bundle, image_ids):
@@ -137,32 +155,53 @@ def build_probe(seed, lesion_prior, feature_shape):
     return model
 
 
+def _predict(probe, features, batch=256):
+    """Probe logits for stored features, read from the (memory-mapped) array in batches."""
+    out = np.zeros((len(features), features.shape[1], features.shape[2], len(em.LESION_CLASSES)), np.float32)
+    for s in range(0, len(features), batch):
+        out[s:s + batch] = np.asarray(probe.predict_on_batch(np.ascontiguousarray(features[s:s + batch])), np.float32)
+    return out
+
+
 def train_probe(seed, lesion_prior, train_features, train_targets, val_features, val_targets, log=None):
     """Trains the fresh probe for PROBE['epochs'] epochs and returns the FINAL epoch's validation logits with
-    the per-epoch behaviour (training loss as it ran, then train / validation loss and validation AUROC with
-    the epoch's weights). The per-epoch numbers are reported only; nothing is selected with them."""
+    the per-epoch behaviour (training loss as it ran, then validation loss and validation AUROC with the
+    epoch's weights). The per-epoch numbers are reported only; nothing is selected with them. The feature
+    arrays may be memory-mapped: only one batch is in RAM at a time."""
     import keras
     keras.mixed_precision.set_global_policy("float32")
     probe = build_probe(seed, lesion_prior, train_features.shape[1:])
     initial = [w.copy() for w in probe.get_weights()]
+    size = PROBE["batch_size"]
+
+    class _Epoch(keras.utils.PyDataset):
+        def __init__(self, order):
+            super().__init__()
+            self.order = order
+
+        def __len__(self):
+            return int(np.ceil(len(self.order) / size))
+
+        def __getitem__(self, index):
+            rows = self.order[index * size:(index + 1) * size]
+            return np.stack([train_features[int(r)] for r in rows]), train_targets[rows]
+
     curve = []
-    predict = lambda x: np.asarray(probe.predict(x, batch_size=256, verbose=0), np.float32)
-    start = predict(val_features)
+    start = _predict(probe, val_features)
     curve.append({"epoch": 0, "val_loss": et.lesion_loss_numpy(val_targets, start),
                   "val_mean_cell_auroc": probe_scores(val_targets, start)["mean"]})
     for epoch in range(PROBE["epochs"]):
         order = np.random.default_rng([int(seed), epoch]).permutation(len(train_features))
-        history = probe.fit(train_features[order], train_targets[order], batch_size=PROBE["batch_size"], epochs=1,
-                            shuffle=False, verbose=0)
-        val_logits = predict(val_features)
+        history = probe.fit(_Epoch(order), epochs=1, shuffle=False, verbose=0)
+        val_logits = _predict(probe, val_features)
         row = {"epoch": epoch + 1, "running_train_loss": float(history.history["loss"][0]),
                "val_loss": et.lesion_loss_numpy(val_targets, val_logits),
                "val_mean_cell_auroc": probe_scores(val_targets, val_logits)["mean"]}
         curve.append(row)
         if log:
             log(f"    probe epoch {epoch + 1}: train loss {row['running_train_loss']:.4f} | val loss {row['val_loss']:.4f} | "
-                f"val mean cell AUROC {row['val_mean_cell_auroc']:.4f}")
-    train_logits = predict(train_features)
+                f"val mean cell AUROC {row['val_mean_cell_auroc']:.4f}  {_ram()}")
+    train_logits = _predict(probe, train_features)
     final = {"train_loss": et.lesion_loss_numpy(train_targets, train_logits),
              "train_scores": probe_scores(train_targets, train_logits),
              "val_loss": curve[-1]["val_loss"], "val_scores": probe_scores(val_targets, val_logits),
@@ -188,9 +227,15 @@ def e1_best_weights(run_dir):
 
 
 def run(bundle, p_weight_paths, e1_run_dirs, convnext_weights_path, lesion_prior, out_dir, *, p_sha256=None,
-        seeds=SEEDS, train_ids=None, val_ids=None, log=print):
+        seeds=SEEDS, train_ids=None, val_ids=None, work_dir="/content/e1_probe_features", log=print):
     """The probe for every seed and both encoders. Writes, per (model, seed), the final validation logits and
-    the behaviour, and summary.json with the point estimates. The bootstrap is `analyse`."""
+    the behaviour, and summary.json with the point estimates. The bootstrap is `analyse`.
+
+    Memory: features are written to a float16 memmap under `work_dir` (local disk, ~1.5 GB per model, deleted
+    when that model's probe is done) and read in batches. Resumable: a (model, seed) whose result is already in
+    summary.json -- for the same bundle, prior, protocol and weights -- is not recomputed."""
+    import gc
+
     import keras
 
     import pl_convnext as pl
@@ -199,10 +244,23 @@ def run(bundle, p_weight_paths, e1_run_dirs, convnext_weights_path, lesion_prior
     val_ids = [str(i) for i in (val_ids if val_ids is not None else bundle.val_ids)]
     os.makedirs(out_dir, exist_ok=True)
     previous = keras.mixed_precision.global_policy().name
-    summary = {"probe": PROBE, "criterion": "probe(E1) - probe(P) > 0 in 3/3 seeds AND the 95% paired bootstrap interval "
-                                            "of the three-seed mean excludes zero (record 62)",
-               "lesion_prior": [float(p) for p in lesion_prior], "train_images": len(train_ids), "val_images": len(val_ids),
-               "bundle_fingerprint": bundle.fingerprint, "seeds": {}}
+    identity = {"probe": PROBE, "lesion_prior": [float(p) for p in lesion_prior], "train_images": len(train_ids),
+                "val_images": len(val_ids), "bundle_fingerprint": bundle.fingerprint}
+    summary = dict(identity, criterion="probe(E1) - probe(P) > 0 in 3/3 seeds AND the 95% paired bootstrap interval of the "
+                                       "three-seed mean excludes zero (record 62)", seeds={})
+    summary_path = os.path.join(out_dir, "summary.json")
+    if os.path.exists(summary_path):
+        with open(summary_path) as fh:
+            old = json.load(fh)
+        if all(old.get(k) == v for k, v in json.loads(json.dumps(identity)).items()):
+            summary["seeds"] = {int(k): v for k, v in old.get("seeds", {}).items()}
+            log(f"  resuming: {[(s, sorted(k for k in v if k in MODELS)) for s, v in summary['seeds'].items()]} already done")
+
+    def save():
+        with open(summary_path + ".tmp", "w") as fh:
+            json.dump(summary, fh, indent=1, default=float)
+        os.replace(summary_path + ".tmp", summary_path)
+
     try:
         keras.mixed_precision.set_global_policy("float32")
         _, reference_arrays = pl.load_reference(convnext_weights_path)
@@ -215,27 +273,41 @@ def run(bundle, p_weight_paths, e1_run_dirs, convnext_weights_path, lesion_prior
             p_sha = cache.sha256_file(p_weight_paths[seed])
             if p_sha256 and p_sha != p_sha256[seed]:
                 raise RuntimeError(f"P-{seed}: checkpoint {p_sha} is not the pinned {p_sha256[seed]}")
-            summary["seeds"][seed] = {}
+            done = summary["seeds"].setdefault(seed, {})
             for kind, path, sha in (("p", p_weight_paths[seed], p_sha), ("e1", e1_path, e1_sha)):
-                log(f"  seed {seed} / {kind}: frozen features")
+                saved = os.path.join(out_dir, f"probe_{kind}_seed{seed}.npz")
+                if done.get(kind, {}).get("weights_sha256") == sha and os.path.exists(saved):
+                    log(f"  seed {seed} / {kind}: already done (val mean cell AUROC "
+                        f"{done[kind]['final']['val_scores']['mean']:.4f}) -- kept")
+                    continue
+                log(f"  seed {seed} / {kind}: frozen features  {_ram()}")
                 features, full = build_frozen_encoder(kind, seed, path, lesion_prior, reference_arrays)
-                train_f, _ = extract(bundle, features, full, train_ids, log=log)
-                val_f, val_grading = extract(bundle, features, full, val_ids, log=log)
+                files = [os.path.join(work_dir, f"{kind}_seed{seed}_{part}.npy") for part in ("train", "val")]
+                train_f, _ = extract(bundle, features, full, train_ids, files[0], log=log)
+                val_f, val_grading = extract(bundle, features, full, val_ids, files[1], log=log)
                 del features, full
+                keras.backend.clear_session()
+                gc.collect()
                 val_logits, curve, final = train_probe(seed, lesion_prior, train_f, train_targets, val_f, val_targets, log=log)
-                np.savez_compressed(os.path.join(out_dir, f"probe_{kind}_seed{seed}.npz"), val_logits=val_logits,
-                                    val_grading_logits=val_grading, image_ids=np.asarray(val_ids))
-                summary["seeds"][seed][kind] = {"weights_sha256": sha, "curve": curve, "final": final,
-                                                "feature_abs_mean": float(np.abs(val_f.astype(np.float32)).mean())}
+                np.savez_compressed(saved, val_logits=val_logits, val_grading_logits=val_grading, image_ids=np.asarray(val_ids))
+                done[kind] = {"weights_sha256": sha, "curve": curve, "final": final,
+                              "feature_abs_mean": float(np.mean([np.abs(val_f[i].astype(np.float32)).mean()
+                                                                 for i in range(len(val_f))]))}
                 log(f"  seed {seed} / {kind}: val mean cell AUROC {final['val_scores']['mean']:.4f} "
                     f"{ {k: round(v, 4) for k, v in final['val_scores'].items() if k != 'mean'} }")
                 del train_f, val_f
-            s = summary["seeds"][seed]
-            s["difference_e1_minus_p"] = {k: s["e1"]["final"]["val_scores"][k] - s["p"]["final"]["val_scores"][k]
-                                          for k in s["p"]["final"]["val_scores"]}
-            log(f"  seed {seed}: probe(E1) - probe(P) = {s['difference_e1_minus_p']['mean']:+.4f}")
-            with open(os.path.join(out_dir, "summary.json"), "w") as fh:
-                json.dump(summary, fh, indent=1, default=float)
+                keras.backend.clear_session()
+                gc.collect()
+                for f in files:
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                save()
+            done["difference_e1_minus_p"] = {k: done["e1"]["final"]["val_scores"][k] - done["p"]["final"]["val_scores"][k]
+                                             for k in done["p"]["final"]["val_scores"]}
+            log(f"  seed {seed}: probe(E1) - probe(P) = {done['difference_e1_minus_p']['mean']:+.4f}")
+            save()
     finally:
         keras.mixed_precision.set_global_policy(previous)
     return summary

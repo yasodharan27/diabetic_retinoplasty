@@ -62,7 +62,13 @@ class ProbeTests(unittest.TestCase):
         np.testing.assert_allclose(a.get_weights()[1], em.prior_logits(PRIOR), rtol=1e-6)
         self.assertEqual(a.count_params(), 32 * 4 + 4)
         logits, curve, final = ep.train_probe(42, PRIOR, features[:32], targets[:32], features[32:], targets[32:])
-        again, curve2, _ = ep.train_probe(42, PRIOR, features[:32], targets[:32], features[32:], targets[32:])
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:   # the same from memory-mapped features
+            # (Windows keeps a mapped file open until the map is collected; the leftover temp file is harmless)
+            np.save(os.path.join(tmp, "tr.npy"), features[:32])
+            np.save(os.path.join(tmp, "va.npy"), features[32:])
+            tr, va = np.load(os.path.join(tmp, "tr.npy"), mmap_mode="r"), np.load(os.path.join(tmp, "va.npy"), mmap_mode="r")
+            again, curve2, _ = ep.train_probe(42, PRIOR, tr, targets[:32], va, targets[32:])
+            del tr, va
         self.assertEqual(logits.shape, (16, 4, 4, 4))
         self.assertEqual([c["epoch"] for c in curve], [0, 1, 2, 3, 4, 5])
         self.assertLess(curve[-1]["val_loss"], curve[0]["val_loss"])
@@ -107,7 +113,7 @@ class AnalysisTests(unittest.TestCase):
 class EncoderTests(unittest.TestCase):
     def test_frozen_encoders_share_one_graph_and_p_features_are_p(self):
         from training import checkpointing as ckpt
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             b = fx.build(os.path.join(tmp, "data"))
             bundle = ad.Arch1Bundle(expected_bundle_id=b["bundle"]["bundle_id"], expected_split_sha256=v2cfg.SPLIT_SHA256,
                                     expected_stage4_sha256=fx.MODEL_SHA, roots=b["roots"], expected_population=5)
@@ -126,9 +132,13 @@ class EncoderTests(unittest.TestCase):
             for kind, path in (("p", p_path), ("e1", e1_path)):
                 features, full = ep.build_frozen_encoder(kind, 42, path, PRIOR, arrays, policy="float32")
                 self.assertFalse(full.trainable_variables)                # nothing can be trained
-                out[kind] = ep.extract(bundle, features, full, ids)
+                out[kind] = ep.extract(bundle, features, full, ids, os.path.join(tmp, "feat", f"{kind}.npy"))
+                self.assertIsInstance(out[kind][0], np.memmap)             # on disk, not held in RAM
                 self.assertEqual((out[kind][0].shape, out[kind][0].dtype), ((2, 16, 16, 768), np.float16))
-            np.testing.assert_array_equal(out["p"][0], out["e1"][0])       # same weights -> same features
+            np.testing.assert_array_equal(np.asarray(out["p"][0]), np.asarray(out["e1"][0]))   # same weights -> same features
+            mapped = np.asarray(out["p"][0])
+            out = {k: (np.array(v[0]), v[1]) for k, v in out.items()}       # release the files before cleanup
+            del mapped
             import e1_gates as eg
             rgb = np.stack([__import__("e1_data").load_inputs(bundle, i)["rgb"] for i in ids])
             np.testing.assert_allclose(out["p"][1], np.asarray(p.predict_on_batch(eg.p_inputs(rgb)), np.float64), atol=1e-4)
