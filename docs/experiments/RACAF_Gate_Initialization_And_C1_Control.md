@@ -4082,3 +4082,93 @@ Worst images: seed 42, threshold 1, stored 9.71875 vs recomputed 9.7109375 (grad
 **Not a systematic shift.** Mean signed difference −3e-6 to −3e-5; about 85 % of logits identical; the rest scattered at one step.
 
 **Status.** Gate 1 remains recorded as FAILED as run; its rule and tolerances are unchanged. The gate has not yet been executed correctly in mixed precision. Nothing was trained.
+
+
+### 62.3 Gate 1 rerun — official PASS; E1 ready for training (2026-10-05, commit `c9897cd`; Colab T4, Keras 3.13.2; nothing trained)
+
+`e1_gates.p_parity` after the fix of §62.2 (the policy is set after `clear_session()` for every model; the gate raises unless the built models are in the tier's precision). Rule and tolerances unchanged. All 730 validation images, three pinned P BEST checkpoints.
+
+| check | seed 42 | seed 123 | seed 2026 | tolerance |
+|---|---|---|---|---|
+| precision actually used, float32 tier / mixed tier (P and E1) | float32 / float16 | float32 / float16 | float32 / float16 | — |
+| initialisation, E1 vs P logits (16 images) | 0 | 0 | 0 | 1e-5 |
+| float32, E1 vs P: logits / probabilities / grades | 0 / 0 / identical | 0 / 0 / identical | 0 / 0 / identical | 1e-4 / 1e-4 / identical |
+| mixed_float16, E1 vs P on the same runtime | 0 / 0 / identical | 0 / 0 / identical | 0 / 0 / identical | (reported) |
+| mixed_float16, E1 vs the stored P BEST table: logits | 0.0156 | 0.0010 | 0.0010 | 0.05 |
+| … probabilities | 0.00029 | 0.00017 | 0.00018 | 0.01 |
+| … decoded grades | identical | identical | identical | identical |
+
+**Gate 1: PASS (official).** The stored-table differences are one to two float16 steps and vary between sessions (the diagnostic of §62.2 measured 0.0078 in every seed).
+
+**All gates.** Gate 1 P parity PASS (this section); Gate 2 log aliases PASS (§62.1); Gate 3 targets PASS (§62 and §62.1); gradient check on a real batch PASS (§62.1). The notebook's combined status reads `p_parity PASS, log_alias PASS, targets PASS | gradient check PASS`.
+
+**Status: READY FOR TRAINING.** Nothing has been trained. Training is notebook cell 8 (`RUN_TRAINING`), seeds 42 → 123 → 2026 under the rules fixed in §62. E0, E2 and E3 remain conditional and are not run.
+
+
+## 63. E1 multi-task grader — three-seed result (runs finished 2026-10-06; read under the rules of §62)
+
+**Runs.** `experiments/E1MultiTask/e1_cb5fc7a8d370_seed{42,123,2026}/`, commit `c9897cd`, λ = 1.0, prior as in §62, P protocol, mixed precision, no EMA; all three gates recorded as passed in every `result.json`. All three stopped by early stopping: 36 / 21 / 32 epochs, BEST at epoch index 23 / 8 / 19. Verified locally from the downloaded outputs: the per-sample BEST tables reproduce the stored QWK exactly and hold the same 730 images, in the same order, as the stored P tables. Analysis: `results/E1MultiTask/e1_vs_p_analysis.json`. No IDRiD. Nothing was tuned.
+
+### E1 against P of the same seed (BEST checkpoints, 730 validation images)
+
+| | seed 42 | seed 123 | seed 2026 | E1 mean ± SD | P mean ± SD |
+|---|---|---|---|---|---|
+| QWK, E1 (P) | 0.9203 (0.9184) | 0.9134 (0.9148) | 0.9202 (0.9176) | 0.9180 ± 0.0039 | 0.9170 ± 0.0019 |
+| AUROC grade 4 vs 0–2, E1 (P) | 0.9590 (0.9588) | 0.9462 (0.9489) | 0.9614 (0.9410) | 0.9555 ± 0.0082 | 0.9496 ± 0.0089 |
+| mean AUROC, four cuts | 0.9723 (0.9752) | 0.9689 (0.9678) | 0.9746 (0.9665) | 0.9719 ± 0.0029 | 0.9698 ± 0.0047 |
+| AUROC ≥3 | 0.9577 (0.9612) | 0.9514 (0.9500) | 0.9604 (0.9481) | 0.9565 | 0.9531 |
+| AUROC ≥4 | 0.9433 (0.9504) | 0.9354 (0.9335) | 0.9493 (0.9283) | 0.9427 | 0.9374 |
+| grade-3 recall (of 39) | 21 (24) | 24 (20) | 17 (20) | 0.530 ± 0.090 | 0.547 ± 0.059 |
+| grade-4 recall (of 58) | 37 (39) | 27 (24) | 36 (37) | 0.575 | 0.575 |
+| false-urgent rate | 0.0363 (0.0379) | 0.0474 (0.0316) | 0.0300 (0.0363) | 0.0379 ± 0.0088 | 0.0353 ± 0.0033 |
+| MAE | 0.1822 (0.1781) | 0.2041 (0.2014) | 0.1808 (0.1904) | 0.1890 | 0.1900 |
+| decoded grades that differ from P | 59 | 84 | 67 | | |
+
+| E1 − P, paired bootstrap (2,000, seed 20260927) | seed 42 | seed 123 | seed 2026 | three-seed mean (95 % interval) |
+|---|---|---|---|---|
+| Δ QWK | +0.0019 (−0.012 to +0.017) | −0.0014 (−0.018 to +0.015) | +0.0026 (−0.013 to +0.018) | **+0.0010 (−0.0073 to +0.0095)** |
+| Δ AUROC grade 4 vs 0–2 | +0.0002 (−0.014 to +0.014) | −0.0028 (−0.020 to +0.015) | +0.0205 (+0.008 to +0.035) | +0.0060 (−0.0029 to +0.0156) |
+| Δ mean AUROC, four cuts | −0.0029 (−0.010 to +0.004) | +0.0011 (−0.008 to +0.010) | +0.0081 (+0.001 to +0.015) | +0.0021 (−0.0027 to +0.0073) |
+| Δ grade-3 recall | −0.077 | +0.103 | −0.077 | −0.017 |
+| Δ false-urgent | −0.0016 | +0.0158 | −0.0063 | +0.0026 |
+
+§54 tolerances against same-seed P (QWK −0.02, AUROC −0.01, grade-3 recall −0.10, false-urgent +0.02): all four hold in all three seeds.
+
+**Category (§62): COMPARABLE.** The interval of the mean Δ QWK includes zero and Δ QWK is positive in 2 / 3 seeds, so it is not "clearly better"; no tolerance is breached, so it is neither "marginally worse" nor "substantially worse". The only interval that excludes zero is seed 2026's AUROC, where P-2026 is P's weakest seed on that endpoint (0.9410); the three-seed interval includes zero. No superiority is claimed.
+
+### The auxiliary head and the training behaviour (descriptive)
+
+| | seed 42 | seed 123 | seed 2026 |
+|---|---|---|---|
+| lesion head vs teacher on validation, BEST: loss | 0.1165 | 0.1264 | 0.1184 |
+| cell AUROC MA / HE / EX / SE | 0.955 / 0.988 / 0.964 / 0.996 | 0.946 / 0.982 / 0.952 / 0.994 | 0.955 / 0.987 / 0.965 / 0.996 |
+| mean cell AUROC | 0.9756 | 0.9685 | 0.9754 |
+| training QWK at BEST, E1 (P) | 0.993 (0.990) | 0.949 (0.923) | 0.992 (0.940) |
+| validation CORN loss (unweighted) at BEST, E1 (P) | 0.324 (0.279) | 0.213 (0.222) | 0.293 (0.201) |
+| LAST: QWK / grade-3 recall | 0.9149 / 0.436 | 0.8978 / 0.385 | 0.9106 / 0.333 |
+
+- **The head learned the task.** From the pooled 16×16 feature map alone it reproduces the teacher's coarse lesion maps with cell AUROC 0.95–0.996 in every class. This is agreement with Stage 4, not accuracy against ground truth.
+- **Over-fitting is unchanged.** Training QWK still reaches 0.99; validation QWK peaks later than P's (epoch index 23 / 8 / 19 against 18 / 3 / 6) but no higher; the validation CORN loss at BEST is not lower than P's. The dense supervision did not act as a regulariser for grading.
+- **Late training degrades grade 3, as in P** (§24): grade-3 recall falls from 0.530 at BEST to 0.385 at LAST.
+- **Grade 4.** Recall equal to P's on average (100 against 100 correct of 174 over the three seeds); AUROC ≥4 +0.005 on average with inconsistent sign. The §62 concern that lesion supervision might worsen the low-burden grade-4 failures is not borne out, and there is no improvement either.
+
+### What is and is not established
+
+- Established: the lesion head can be added to P at no measurable cost in grading (all tolerances hold in 3 / 3 seeds), and the same network then outputs coarse lesion maps that agree closely with Stage 4.
+- Not established: that the supervision *changed* the grading representation. The pre-registered mechanism measurement (a fresh frozen-encoder probe on P and on E1) has not been run; E1's own head reaching 0.97 does not show that P's features could not have supported the same head. C2 (§50) predicts they largely could.
+- Not established: any grading benefit. The result is the "preserve" half of the hypothesis, not the "improve" half.
+- Limits as stated in §62: comparison against stored P runs (GPU nondeterminism not measured); APTOS validation only, the set used for checkpoint selection; no external evaluation exists for E1.
+
+### Position in the decision tree (§62)
+
+E1 is comparable. The branch depends on the mechanism measurement: unchanged → stop ("supervision absorbed"); changed → E2 becomes eligible. That measurement (E0 on P plus the same probe on E1) is conditional and has not been run. Nothing further is launched; the next step is the user's decision.
+
+
+### 63.1 Mechanism probe — implementation note, written before any probe result (2026-10-06)
+
+The probe of §62 is implemented in `e1_probe.py` (tests: `tests/test_e1_probe.py`, 7 pass; notebook cell 9). The protocol and the criterion are those of §62, unchanged. Points §62 left open, fixed here before the probe has run:
+
+- **Frozen encoder.** The final 16×16×768 feature map is computed once per image with the encoder untrainable (no augmentation, so the map is a constant) and the probe is trained on the stored maps — the same optimisation as training the head on a frozen encoder. P BEST and E1 BEST are both run through E1's graph (Gate 1: it reproduces P bit for bit). Features are taken under mixed_float16, the precision both models were trained and evaluated in, and stored as float16; the probe itself is float32.
+- **Fresh probe.** Conv2D(4, 1×1) with a GlorotUniform(seed) kernel and the training-target prior as bias — identical for the P probe and the E1 probe of a seed. E1's trained lesion head and both grading heads are not used. The probe seed is the run seed (42 / 123 / 2026); the training order is a seeded permutation per epoch, the same for both probes.
+- **Bootstrap.** The 2,000 resamples (seed 20260927) are the project's grade-stratified image resamples (`arch1_posthoc.bootstrap_indices`), the same for both probes and all seeds; grades are used only to stratify. Cell AUROC is recomputed per class on each resample; the three-seed mean difference is taken per resample.
+- **Reported, not used for any choice:** per-epoch training loss, validation loss and validation mean cell AUROC of every probe, and the final training-set scores, to show whether a probe is under-trained. The final epoch is the one scored, as pre-registered.
