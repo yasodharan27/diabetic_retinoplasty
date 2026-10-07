@@ -278,6 +278,62 @@ def record_invocation(out_dir, record):
     return runs
 
 
+# --------------------------------------------------------------------------- shared steps of a probe run
+
+def prepare_data(lesion_root, ids, work_dir, log=print):
+    """Frames (Stage 2 once per image, then the 512 frame; a float32 memmap per split under `work_dir`) and the
+    (16, 16, 4) cell targets of every image of the probe set. Returns (frames, targets)."""
+    frames, targets = {}, {}
+    for split in SPLITS:
+        path = os.path.join(work_dir, f"frames_{split}.npy")
+        done = os.path.join(work_dir, f"frames_{split}.done")
+        if not os.path.exists(done):
+            store = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(len(ids[split]), 512, 512, 3))
+            for n, name in enumerate(ids[split]):
+                store[n] = frame_from_raw(image_path(lesion_root, split, name))
+                if (n + 1) % 50 == 0 or n + 1 == len(ids[split]):
+                    log(f"  frames {split} {n + 1}/{len(ids[split])}  {ep._ram()}")
+            store.flush()
+            del store
+            open(done, "w").close()
+        frames[split] = np.load(path, mmap_mode="r")
+        targets[split] = np.stack([load_targets(lesion_root, split, name) for name in ids[split]]).astype(np.float32)
+    return frames, targets
+
+
+def probe_encoder(kind, seed, weights_path, reference_arrays, frames, ids, targets, prior, log=print):
+    """One frozen encoder (`kind` 'p' = P's graph, 'e1' = E1's graph) and its probe: features of every split,
+    the probe trained on the training split with the validation split for the stopping rule, and exactly two
+    predictions of the test split (one per weight set). Returns (result, arrays to save)."""
+    import gc
+
+    import keras
+    features, full = ep.build_frozen_encoder(kind, seed, weights_path, [0.1] * 4, reference_arrays)
+    f = {}
+    for split in SPLITS:
+        chunks = []
+        for s in range(0, len(ids[split]), ep.EXTRACT_BATCH):
+            rgb = np.ascontiguousarray(frames[split][s:s + ep.EXTRACT_BATCH])
+            chunks.append(np.asarray(features.predict_on_batch({"rgb": rgb})).astype(np.float16))
+        f[split] = np.concatenate(chunks, 0)
+    del features, full
+    keras.backend.clear_session()
+    gc.collect()
+    probe, weights, behaviour = train_probes(seed, prior, f["train"], targets["train"], f["val"], targets["val"], log=log)
+    result = {"behaviour": behaviour}
+    arrays = {"test_ids": np.asarray(ids["test"])}
+    for variant in VARIANTS:                         # the only two test predictions of this probe
+        test_logits, test = evaluate_probe(probe, weights[variant], f["test"], targets["test"])
+        _, val = evaluate_probe(probe, weights[variant], f["val"], targets["val"])
+        _, train = evaluate_probe(probe, weights[variant], f["train"], targets["train"])
+        result[variant] = {"test": test, "val": val, "train": train}
+        arrays[f"test_logits_{variant}"] = test_logits
+    del probe, f
+    keras.backend.clear_session()
+    gc.collect()
+    return result, arrays
+
+
 # --------------------------------------------------------------------------- the run (GPU for the encoders)
 
 def run(drive_root, lesion_root, audit_dir, out_dir, *, repo_dir=None, work_dir="/content/ddr_probe_work", seeds=SEEDS,
@@ -317,21 +373,7 @@ def run(drive_root, lesion_root, audit_dir, out_dir, *, repo_dir=None, work_dir=
                                     checkpoints=identity["checkpoints"], seeds=[int(s) for s in seeds],
                                     feature_policy=ep.PROBE["feature_policy"]))
     # frames (Stage 2 once per image) and targets
-    frames, targets = {}, {}
-    for split in SPLITS:
-        path = os.path.join(work_dir, f"frames_{split}.npy")
-        done = os.path.join(work_dir, f"frames_{split}.done")
-        if not os.path.exists(done):
-            store = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(len(ids[split]), 512, 512, 3))
-            for n, name in enumerate(ids[split]):
-                store[n] = frame_from_raw(image_path(lesion_root, split, name))
-                if (n + 1) % 50 == 0 or n + 1 == len(ids[split]):
-                    log(f"  frames {split} {n + 1}/{len(ids[split])}  {ep._ram()}")
-            store.flush()
-            del store
-            open(done, "w").close()
-        frames[split] = np.load(path, mmap_mode="r")
-        targets[split] = np.stack([load_targets(lesion_root, split, name) for name in ids[split]]).astype(np.float32)
+    frames, targets = prepare_data(lesion_root, ids, work_dir, log)
     prior = targets["train"].mean(axis=(0, 1, 2)).astype(np.float64).tolist()
     np.savez_compressed(os.path.join(out_dir, "targets.npz"), **{f"{s}_targets": targets[s] for s in SPLITS},
                         **{f"{s}_ids": np.asarray(ids[s]) for s in SPLITS})
@@ -355,34 +397,15 @@ def run(drive_root, lesion_root, audit_dir, out_dir, *, repo_dir=None, work_dir=
                     log(f"  {key}: already done -- kept")
                     continue
                 log(f"  {key}: frozen features  {ep._ram()}")
-                features, full = ep.build_frozen_encoder("p" if model == "p" else "e1", seed, path, [0.1] * 4, reference_arrays)
-                f = {}
-                for split in SPLITS:
-                    chunks = []
-                    for s in range(0, len(ids[split]), ep.EXTRACT_BATCH):
-                        rgb = np.ascontiguousarray(frames[split][s:s + ep.EXTRACT_BATCH])
-                        chunks.append(np.asarray(features.predict_on_batch({"rgb": rgb})).astype(np.float16))
-                    f[split] = np.concatenate(chunks, 0)
-                del features, full
-                keras.backend.clear_session()
-                gc.collect()
-                probe, weights, behaviour = train_probes(seed, prior, f["train"], targets["train"], f["val"], targets["val"], log=log)
-                result = {"weights_sha256": sha, "behaviour": behaviour}
-                arrays = {"test_ids": np.asarray(ids["test"])}
-                for variant in VARIANTS:                         # the only two test predictions of this probe
-                    test_logits, test = evaluate_probe(probe, weights[variant], f["test"], targets["test"])
-                    _, val = evaluate_probe(probe, weights[variant], f["val"], targets["val"])
-                    _, train = evaluate_probe(probe, weights[variant], f["train"], targets["train"])
-                    result[variant] = {"test": test, "val": val, "train": train}
-                    arrays[f"test_logits_{variant}"] = test_logits
+                result, arrays = probe_encoder("p" if model == "p" else "e1", seed, path, reference_arrays, frames, ids,
+                                               targets, prior, log)
+                result = {"weights_sha256": sha, **result}
+                behaviour = result["behaviour"]
                 np.savez_compressed(saved, **arrays)
                 summary["results"][key] = result
                 log(f"  {key}: test mean cell AUROC five-epoch {result['five_epoch']['test']['scores']['mean']:.4f} | converged "
                     f"{result['converged']['test']['scores']['mean']:.4f} (epoch {behaviour['converged_epoch']} of "
                     f"{behaviour['epochs_run']}, {behaviour['stopped_by']})")
-                del probe, f
-                keras.backend.clear_session()
-                gc.collect()
                 with open(summary_path + ".tmp", "w") as fh:
                     json.dump(summary, fh, indent=1, default=float)
                 os.replace(summary_path + ".tmp", summary_path)
@@ -393,12 +416,19 @@ def run(drive_root, lesion_root, audit_dir, out_dir, *, repo_dir=None, work_dir=
 
 # --------------------------------------------------------------------------- the pre-registered comparison
 
-def analyse(out_dir, seeds=SEEDS, n_boot=N_BOOT, boot_seed=BOOT_SEED):
+def analyse(out_dir, seeds=SEEDS, n_boot=N_BOOT, boot_seed=BOOT_SEED, *, models=MODELS, contrasts=None, primary=PRIMARY,
+            result_name="ddr_probe_result.json", criterion=None, sources=None):
     """P, E1, E2 on the DDR test split for both probe variants; E1 - P, E2 - P, E1 - E2 per seed and for the
     three-seed mean, with a paired bootstrap over the test images (the same resamples for every model, seed and
     variant); and the §68 criterion on the five-epoch result: E1 - P positive in 3 / 3 seeds and the interval of
-    the three-seed mean excluding zero."""
+    the three-seed mean excluding zero.
+
+    The keyword arguments exist for the same analysis on other encoders (ddr_probe_ep): `models` and `contrasts`
+    name them, `primary` is the contrast the criterion is evaluated on, `sources` maps a model to the directory
+    holding its saved test logits (default `out_dir`). The defaults are the recorded §68 analysis."""
     import e2_control as e2
+    contrasts = CONTRASTS if contrasts is None else contrasts
+    sources = sources or {}
     with np.load(os.path.join(out_dir, "targets.npz")) as data:
         targets, ids = data["test_targets"], [str(i) for i in data["test_ids"]]
     positive = targets >= 0.5
@@ -410,8 +440,8 @@ def analyse(out_dir, seeds=SEEDS, n_boot=N_BOOT, boot_seed=BOOT_SEED):
     for variant in VARIANTS:
         point, draws = {}, {}
         for seed in seeds:
-            for model in MODELS:
-                with np.load(os.path.join(out_dir, f"probe_{model}_seed{int(seed)}.npz")) as data:
+            for model in models:
+                with np.load(os.path.join(sources.get(model, out_dir), f"probe_{model}_seed{int(seed)}.npz")) as data:
                     if [str(i) for i in data["test_ids"]] != ids:
                         raise RuntimeError(f"{model}-{seed}: other test images")
                     z = data[f"test_logits_{variant}"].astype(np.float32)
@@ -425,16 +455,16 @@ def analyse(out_dir, seeds=SEEDS, n_boot=N_BOOT, boot_seed=BOOT_SEED):
         out = {"per_seed": {}, "mean": {}}
         for seed in seeds:
             seed = int(seed)
-            row = {m: point[(m, seed)] for m in MODELS}
-            for name, (a, b) in CONTRASTS.items():
+            row = {m: point[(m, seed)] for m in models}
+            for name, (a, b) in contrasts.items():
                 d = draws[(a, seed)] - draws[(b, seed)]
                 row[name] = {**{k: point[(a, seed)][k] - point[(b, seed)][k] for k in point[(a, seed)]},
                              "mean_ci": interval(d.mean(axis=1)),
                              "class_ci": {c: interval(d[:, i]) for i, c in enumerate(CLASSES)}}
             out["per_seed"][seed] = row
-        for m in MODELS:
+        for m in models:
             out["mean"][m] = {k: float(np.mean([point[(m, int(s))][k] for s in seeds])) for k in point[(m, int(seeds[0]))]}
-        for name, (a, b) in CONTRASTS.items():
+        for name, (a, b) in contrasts.items():
             d = np.mean(np.stack([draws[(a, int(s))] - draws[(b, int(s))] for s in seeds]), axis=0)
             per_seed = [out["per_seed"][int(s)][name]["mean"] for s in seeds]
             ci = interval(d.mean(axis=1))
@@ -443,12 +473,12 @@ def analyse(out_dir, seeds=SEEDS, n_boot=N_BOOT, boot_seed=BOOT_SEED):
                                  "ci_excludes_zero": bool(ci[0] > 0 or ci[1] < 0),
                                  "per_class": {c: {"mean": float(np.mean([out["per_seed"][int(s)][name][c] for s in seeds])),
                                                    "ci": interval(d[:, i])} for i, c in enumerate(CLASSES)}}
-        primary = out["mean"][PRIMARY]
-        out["criterion_met"] = bool(primary["positive_seeds"] == len(seeds) and primary["ci"][0] > 0)
+        first = out["mean"][primary]
+        out["criterion_met"] = bool(first["positive_seeds"] == len(seeds) and first["ci"][0] > 0)
         result["variants"][variant] = out
     result["primary_variant"] = "five_epoch"
-    result["criterion"] = "E1 - P positive in 3/3 seeds AND the 95% paired bootstrap interval of the three-seed mean excludes zero"
+    result["criterion"] = criterion or "E1 - P positive in 3/3 seeds AND the 95% paired bootstrap interval of the three-seed mean excludes zero"
     result["criterion_met"] = result["variants"]["five_epoch"]["criterion_met"]
-    with open(os.path.join(out_dir, "ddr_probe_result.json"), "w") as fh:
+    with open(os.path.join(out_dir, result_name), "w") as fh:
         json.dump(result, fh, indent=1, default=float)
     return result

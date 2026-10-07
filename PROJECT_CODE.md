@@ -72,8 +72,7 @@ section numbers below refer to it.
    stored predictions are reused. Run once and recorded (§67); IDRiD batch 1 is consumed.
 3. **DDR** download, verification and overlap screen (expert lesion masks, independent of Stage 4) — done (§66, §66.1).
 4. **Ground-truth lesion probe:** the same frozen-encoder probe on P, E1 and E2 against DDR's real masks.
-   Pre-run record §68; implementation, tests and data staging complete (§68.1: `ddr_probe.py`,
-   `colab/notebooks/ddr_lesion_probe.ipynb`); the GPU run is pending.
+   Done and recorded (§68 protocol, §70 result).
 5. **EyePACS adaptation:** exactly ONE supervised adaptation run of P's model (seed 42) on the pinned
    patient-level split, selected by EyePACS validation QWK; checkpoint pinned by hash. APTOS is never read
    in this phase. Protocol §69 + §69.2; implementation §69.3 (`eyepacs_adaptation_data.py`,
@@ -84,6 +83,7 @@ section numbers below refer to it.
 7. **P-EP and E1-EP** on APTOS (`ep_aptos_train.py`): three seeds each from the same pinned adapted encoder
    with a fresh CORN head, unchanged P / E1 protocol. Both are mandatory; E1-EP runs after P-EP.
 8. **Probe of the EP arms** on DDR's expert masks (the §68 method); criterion E1-EP − P-EP as in §69.2.
+   Runner implemented, not run (§71: `ddr_probe_ep.py`, `colab/notebooks/ddr_lesion_probe_ep.ipynb`).
 9. **E2-EP** only if that criterion is met (enforced in code).
 10. **IDRiD batch 2** for the EP arms.
 

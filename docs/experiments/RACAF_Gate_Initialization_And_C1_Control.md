@@ -4750,3 +4750,45 @@ Per class, E1 − P: MA +0.049 (+0.041 … +0.058), HE +0.029 (+0.024 … +0.035
 **Consequences.** None is drawn here beyond the reading. E1 is not claimed to improve grading (§63, §67 stand). No protocol is changed by this result: §68's criterion, §69 – §69.3 and the E2-EP condition of §69.2 stay as written. One observation for the record, without changing anything: the E2-EP condition uses the five-epoch contrast E1-EP − P-EP, the same kind of contrast whose size this section found to depend on probe convergence.
 
 **Status.** §68 is complete. The DDR test split has now been used once for P, E1 and E2; it remains evaluation-only for the EP arms under the same method.
+
+
+## 69.4 EyePACS frame caches — build path checked and hardened (2026-10-08; implementation facts only)
+
+Protocol: §69 – §69.3, unchanged (float16 frames, 1,000-frame shards, Stage 2 + the 512 frame, bound to manifest hash, preprocessing version, dtype, shard layout, per-shard hash and per-image source hash).
+
+**The two caches are separate, and the code enforces it.** `cache_set` accepts a set of manifest rows only if it is exactly the adaptation split (training + validation) or exactly the held-out test set; a mixture or a partial set is refused by the builder and by the verifier. Each command-line set reads its own pinned manifest and nothing else (`--set adaptation`: `eyepacs_adaptation_split_v1.csv`; `--set heldout-test`: `eyepacs_heldout_test_v1.csv`, which holds image names and grades — no quality column exists in it). A folder that holds one cache refuses the other set (build, preflight and verification), and the existing cache's files are left untouched (tested by file hash).
+
+**Preflight.** `python eyepacs_adaptation_data.py check --cache-dir <dir>` builds nothing: it verifies the pinned manifest, that every image of the manifest exists, the expected size against the free space, and what the folder already holds (a foreign cache or a non-empty folder without an index is refused). `build` runs the same check first. For the adaptation set it reports 35,122 images in 36 shards and 55,242,134,016 bytes (51.4 GiB).
+
+**One change to how a shard is written; none to what is written.** As committed in `f3692f1` the builder held a whole shard of float32 frames in memory several times over (about 8 GB), which the 7.9 GB laptop that builds the caches cannot do. Frames are now written into the shard's `.npy` file a few at a time. The file is byte-identical to the one the previous writer produced for the same frames (checked), and the index, the identity and the hashes are unchanged.
+
+**Tests.** `tests/test_eyepacs_adaptation_data.py` 15 (was 14): set recognition and refusal of mixtures, expected size, preflight (ready / missing source image / foreign or junk folder / builds nothing), each cache refusing the other set with its files unchanged, independent verification of both.
+
+**Safe sequence (laptop, then T4).**
+1. `python eyepacs_adaptation_data.py check --cache-dir <adaptation dir>` — manifest hash, images, disk space.
+2. `python eyepacs_adaptation_data.py build --cache-dir <adaptation dir>` — resumable; finished shards are kept.
+3. `python eyepacs_adaptation_data.py verify --cache-dir <adaptation dir> --sources` — every shard hash and every source image.
+4. Upload the folder to Drive `datasets/EyePACS/adaptation_frames_v1` and compare hashes (`rclone check`).
+5. Fresh T4: notebook `eyepacs_adaptation.ipynb`, `STAGE_CACHE = True` (copies and hashes every shard, then verifies against the split).
+6. `RUN_SPEED_CHECK = True` — ten steps of a throwaway model.
+7. Only then `RUN_ADAPTATION = True` with its phrase.
+
+The held-out test cache (`--set heldout-test`, about 25 GB, Drive `datasets/EyePACS/heldout_test_frames_v1`) is a separate operation and a separate T4 session: a fresh T4 runtime has about 71 GB free of 113 GB, enough for the 55 GB adaptation cache but not for both.
+
+## 71. DDR ground-truth probe for the EP arms — runner implemented (2026-10-08; NO RESULT: no EP checkpoint exists)
+
+**What this is.** The runner that applies the probe of §68 to the pinned P-EP and E1-EP checkpoints (and to E2-EP only under the rule of §69.2). It is a downstream analysis, not a new method, and it has not been run: there is no P-EP or E1-EP model yet. §68, §69 – §69.3 and §70 are unchanged.
+
+**Reuse, and one behaviour-preserving refactor of `ddr_probe.py`.** So that the EP runner uses the recorded probe instead of a copy, two blocks of `ddr_probe.run` became functions — `prepare_data` (Stage 2 + 512 frames, cell targets) and `probe_encoder` (frozen features, the probe, the two test predictions) — and `ddr_probe.analyse` takes its list of encoders, its contrasts and its output file name as keyword arguments whose defaults are the §68 analysis. Check that nothing changed for P, E1 and E2: the refactored `analyse`, run on the saved test logits of §70, reproduces the recorded `ddr_probe_result.json` **byte for byte**; the 14 tests of `tests/test_ddr_probe.py` pass (one of them now inspects `probe_encoder`, where the two test predictions moved).
+
+**`ddr_probe_ep.py` (new).** It defines no target, probe, stopping rule or bootstrap of its own: the manifest reader, data preparation, per-encoder step and analysis are `ddr_probe`'s, and the bootstrap size and seed are not parameters of its analysis.
+- *Checkpoint manifest.* `build_checkpoint_manifest` lists, from the pinned EP runs, one entry per arm and seed (arm, seed, model type, run directory, weights path, SHA-256) together with the probe-protocol version, the DDR manifest hash, the adapted encoder's hash and the commit. No checkpoint hash is hard-coded. `verify_checkpoint_manifest` refuses: a missing field; another probe-protocol version; another DDR manifest hash; no P-EP or no E1-EP entries; a missing, repeated or foreign seed; a model type that does not belong to the arm, in the entry or in the run; a run that is not a pinned run of the EP experiment for that arm and seed; a run that did not start from the manifest's adapted encoder with a fresh head; a weights file whose SHA-256 is not the pinned one; and any of the ten pinned P / E1 / E2 / ImageNet hashes.
+- *Run.* Per (arm, seed): checkpoint hash, arm, seed, model type, the probe's behaviour (curve, converged epoch, validation losses), loss and per-class and mean cell AUROC for both variants on training, validation and test, and the test logits of both variants; plus `configuration.json` (protocol version, manifest hash, checkpoints, probe, stopping rule, contrasts, criterion, bootstrap) and one `run_metadata.json` entry per invocation (commit, UTC time, Python / NumPy / TensorFlow / Keras versions, GPU, manifest and checkpoint hashes, bootstrap seed and size). Resumable; an output directory holds one configuration.
+- *Analysis.* P-EP and E1-EP means, E1-EP − P-EP per seed and for the three-seed mean with the paired bootstrap (2,000 resamples, seed 20260927), per class, for both variants; the criterion is evaluated on the five-epoch variant only, and the converged variant is reported next to it. Output `ddr_probe_ep_result.json` (the §70 file name is not used). `analyse_against_baseline` gives the descriptive Q3 comparison (P-EP against P, E1-EP against E1) from this run's logits and the saved §70 logits, with no criterion.
+- *E2-EP gate.* `record_e2_ep_gate` writes the E1-EP − P-EP criterion result where `ep_aptos_train.require_e2_ep_eligibility` reads it. E2-EP — its APTOS training and its probe — needs that record with the criterion met (3 / 3 positive seeds and an interval excluding zero, five-epoch variant) **and** an explicit confirmation phrase; eligibility alone starts nothing (`ep_aptos_train.run_arm` gained the `confirmation` argument for this).
+
+**Notebook** `colab/notebooks/ddr_lesion_probe_ep.ipynb`: `RUN_EP_PROBE = False`, `RUN_E2_EP = False`, each with a confirmation phrase; with the defaults it prints the protocol, the state of the EP runs and the E2-EP gate (open or closed, and why). The E2-EP probe writes to its own directory.
+
+**Tests** `tests/test_ddr_probe_ep.py` 13 (new; fabricated run directories and synthetic features — the probe training in them is the real `ddr_probe` code): the protocol constants and reuse, cell targets, the test split never entering training, the DDR manifest unchanged and only read; manifest parsing, the three seeds, missing / duplicate / foreign seeds, wrong checkpoint hash, tampered file, wrong DDR manifest hash, wrong protocol version, missing commit, incompatible architecture, non-EP runs and P / E1 / E2 hashes; the E2-EP gate (refused with no record and with a failed criterion, eligible when met, still refused without the phrase); run outputs and schema, resume, one configuration per directory; the criterion computed from the five-epoch variant, reproducibility, the gate record, the descriptive baseline comparison. `tests/test_ep_aptos_train.py` adds the same confirmation requirement for E2-EP training.
+
+**Status.** Implemented and tested. Not run. No P-EP or E1-EP probe result exists, and none is claimed.

@@ -305,6 +305,62 @@ def assert_not_aptos(path):
     return True
 
 
+#: The two caches are separate: one holds the adaptation split, the other the held-out test set. Never both.
+CACHE_SETS = {"adaptation": ("train", "val"), "heldout-test": ("test",)}
+
+
+def cache_set(rows):
+    """'adaptation' or 'heldout-test' for a set of manifest rows; mixed or partial sets are refused."""
+    found = tuple(s for s in SPLITS if any(r["split"] == s for r in rows))
+    for name, splits in CACHE_SETS.items():
+        if found == splits:
+            return name
+    raise RuntimeError(f"rows with splits {found} are neither the adaptation split nor the held-out test set; "
+                       "the two caches are never combined")
+
+
+def expected_cache_bytes(rows, shard_size=SHARD_SIZE):
+    """Size of the complete cache of `rows` (float16 frames plus one .npy header per shard)."""
+    shards = sum(len(v) for v in shard_plan(rows, shard_size).values())
+    return len(rows) * FRAME_SIZE * FRAME_SIZE * 3 * np.dtype(FRAME_DTYPE).itemsize + shards * 128
+
+
+def preflight(rows, image_dir, cache_dir, manifest_sha256, shard_size=SHARD_SIZE):
+    """Everything that can be checked before a build, without building: the set, that every image of the
+    manifest exists, the expected size against the free space at `cache_dir`, and what `cache_dir` already
+    holds. Raises if the folder holds a cache of another manifest or configuration. Returns a report."""
+    import shutil
+    which = cache_set(rows)
+    files = set(os.listdir(image_dir))
+    missing = sorted(r["image"] for r in rows if r["image"] not in files)
+    for r in rows[:1] + rows[-1:]:
+        assert_not_aptos(os.path.join(image_dir, r["image"]))
+    plan = shard_plan(rows, shard_size)
+    names = [f"frames_{split}_{k:03d}.npy" for split, shards in plan.items() for k in range(len(shards))]
+    done, index_path = [], os.path.join(cache_dir, "index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as fh:
+            old = json.load(fh)
+        identity = cache_identity(manifest_sha256, shard_size)
+        if any(old.get(k) != v for k, v in identity.items()):
+            raise RuntimeError(f"{cache_dir} holds a cache for another manifest or configuration; choose another folder")
+        done = [n for n in names if n in old["shards"] and os.path.exists(os.path.join(cache_dir, n))]
+    elif os.path.isdir(cache_dir) and os.listdir(cache_dir):
+        raise RuntimeError(f"{cache_dir} is not empty and holds no cache index; choose an empty folder")
+    probe = cache_dir
+    while not os.path.isdir(probe):
+        probe = os.path.dirname(os.path.abspath(probe))
+    free = shutil.disk_usage(probe).free
+    need = expected_cache_bytes(rows, shard_size)
+    remaining = int(need * (1 - len(done) / max(len(names), 1)))
+    report = {"set": which, "manifest_sha256": manifest_sha256, "images": len(rows), "splits": {k: sum(map(len, v)) for k, v in plan.items()},
+              "missing_images": len(missing), "first_missing": missing[:5], "shards": len(names), "shards_done": len(done),
+              "expected_bytes": need, "remaining_bytes": remaining, "free_bytes": int(free),
+              "enough_space": bool(free > remaining * 1.02), "identity": cache_identity(manifest_sha256, shard_size)}
+    report["ready"] = bool(not missing and report["enough_space"])
+    return report
+
+
 def cache_identity(manifest_sha256, shard_size=SHARD_SIZE):
     """What a cache is bound to. Two caches with different identities are never interchangeable."""
     import pipeline_v2_config as v2cfg
@@ -352,6 +408,7 @@ def build_cache(rows, train_dir, cache_dir, manifest_sha256, workers=4, shard_si
     a shard that exists with its recorded SHA-256 is kept. Stops on the first unreadable image and reports it
     (the inventory is never changed silently)."""
     from concurrent.futures import ThreadPoolExecutor
+    cache_set(rows)                                    # the adaptation split or the held-out test set, never a mixture
     os.makedirs(cache_dir, exist_ok=True)
     index_path = os.path.join(cache_dir, "index.json")
     identity = cache_identity(manifest_sha256, shard_size)
@@ -376,15 +433,23 @@ def build_cache(rows, train_dir, cache_dir, manifest_sha256, workers=4, shard_si
             paths = [os.path.join(train_dir, n) for n in names]
             for p in paths:
                 assert_not_aptos(p)
+            # Frames go straight into the shard file on disk, a few at a time: a whole shard of float32 frames
+            # does not fit in the memory of the machine that builds the cache. The file is a standard .npy.
+            block = np.lib.format.open_memmap(path + ".tmp.npy", mode="w+", dtype=np.dtype(FRAME_DTYPE),
+                                              shape=(len(names), FRAME_SIZE, FRAME_SIZE, 3))
+            hashes, step = [], max(1, 2 * int(workers))
             with ThreadPoolExecutor(workers) as ex:
-                results = list(ex.map(_frame_and_source_hash, paths))
-            block = np.stack([f for f, _ in results]).astype(np.float16)
-            if block.shape != (len(names), FRAME_SIZE, FRAME_SIZE, 3) or not np.isfinite(block).all():
-                raise RuntimeError(f"{name}: unexpected frames")
-            np.save(path + ".tmp.npy", block)
+                for start in range(0, len(paths), step):
+                    for offset, (frame, source_hash) in enumerate(ex.map(_frame_and_source_hash, paths[start:start + step])):
+                        if frame.shape != (FRAME_SIZE, FRAME_SIZE, 3) or not np.isfinite(frame).all():
+                            raise RuntimeError(f"{name}: unexpected frame for {names[start + offset]}")
+                        block[start + offset] = frame.astype(np.float16)
+                        hashes.append(source_hash)
+            block.flush()
+            del block
             os.replace(path + ".tmp.npy", path)
             index["shards"][name] = {"split": split, "images": names, "grades": [grade_of[n] for n in names],
-                                     "source_sha256": [h for _, h in results],
+                                     "source_sha256": hashes,
                                      "sha256": sha256_file(path), "bytes": os.path.getsize(path)}
             with open(index_path + ".tmp", "w") as fh:
                 json.dump(index, fh)
@@ -406,6 +471,7 @@ def verify_cache(cache_dir, rows, manifest_sha256, shard_size=SHARD_SIZE, check_
         raise RuntimeError(f"{cache_dir} holds no frame cache")
     with open(index_path) as fh:
         index = json.load(fh)
+    cache_set(rows)
     identity = cache_identity(manifest_sha256, shard_size)
     different = {k: (index.get(k), v) for k, v in identity.items() if index.get(k) != v}
     if different:
@@ -494,12 +560,13 @@ def stage_cache(drive_cache_dir, local_cache_dir, log=print, stage_files=None):
 # --------------------------------------------------------------------------- command line (CPU; no model)
 
 def main(argv=None):
-    """`build`: write (or resume) a frame cache from the raw EyePACS folder. `verify`: check a cache against its
+    """`check`: verify the pinned manifest, the source images, the free space and the target folder -- builds
+    nothing. `build`: write (or resume) a frame cache from the raw EyePACS folder. `verify`: check a cache against its
     pinned manifest, hashing every shard (and, with --sources, every source image). `--set adaptation` (default)
     is the pinned training / validation split; `--set heldout-test` is the pinned held-out test set."""
     import argparse
     parser = argparse.ArgumentParser(description="EyePACS frame caches (research record 69, 69.2)")
-    parser.add_argument("action", choices=("build", "verify"))
+    parser.add_argument("action", choices=("check", "build", "verify"))
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--set", dest="which", choices=("adaptation", "heldout-test"), default="adaptation")
     parser.add_argument("--image-dir", default=None, help="raw image folder (default: the set's folder under datasets/EyePACS/raw)")
@@ -513,6 +580,15 @@ def main(argv=None):
     else:
         rows, sha, folder = read_test_manifest(args.split_dir, TEST_MANIFEST_SHA256), TEST_MANIFEST_SHA256, "test"
     image_dir = args.image_dir or os.path.join(REPO, "datasets", "EyePACS", "raw", folder)
+    if cache_set(rows) != args.which:
+        raise RuntimeError("the manifest does not hold the requested set")
+    if args.action in ("check", "build"):
+        report = preflight(rows, image_dir, args.cache_dir, sha)
+        print(json.dumps(report, indent=1))
+        if args.action == "check":
+            return 0 if report["ready"] else 1
+        if not report["ready"]:
+            raise RuntimeError("not ready to build: images are missing or the disk is too small (see the report above)")
     if args.action == "build":
         build_cache(rows, image_dir, args.cache_dir, sha, workers=args.workers, limit_shards=args.limit_shards)
         if args.limit_shards is not None:

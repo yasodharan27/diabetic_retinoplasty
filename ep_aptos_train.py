@@ -43,6 +43,8 @@ E2_EP_CONDITION = {"contrast": "e1_ep_minus_p_ep", "primary_variant": "five_epoc
                    "criterion": "E1-EP - P-EP mean cell AUROC positive in 3/3 seeds AND the 95% paired bootstrap interval "
                                 "of the three-seed mean excludes zero (2,000 resamples, seed 20260927)"}
 ELIGIBILITY_NAME = "e1_ep_probe_criterion.json"
+#: Eligibility does not start E2-EP: the run also needs this phrase, typed by a person.
+E2_EP_CONFIRMATION = "TRAIN E2-EP ON APTOS"
 
 
 def _array_digest(array):
@@ -314,10 +316,11 @@ def seed_state(run_dir):
 
 
 def run_arm(arm, experiments_root, bundle, adapted, class_weights, *, repo_dir, staging_root, lesion_prior=None,
-            partner=None, eligibility=None, log=print, train_fn=None, evaluate_fn=None, grade_of=None):
+            partner=None, eligibility=None, confirmation=None, log=print, train_fn=None, evaluate_fn=None, grade_of=None):
     """Seeds 42 -> 123 -> 2026 of one arm, each from the same pinned adapted encoder with its own fresh head:
     train (or resume), pin BEST, evaluate, write result.json. Refuses to start an arm whose prerequisites are
-    not complete (E1-EP after P-EP; E2-EP after both AND with the eligibility record). A completed seed is kept."""
+    not complete (E1-EP after P-EP; E2-EP after both, with the eligibility record AND the explicit confirmation
+    phrase -- eligibility alone starts nothing). A completed seed is kept."""
     import gc
 
     import multiseed_runs as msr
@@ -328,6 +331,8 @@ def run_arm(arm, experiments_root, bundle, adapted, class_weights, *, repo_dir, 
         raise RuntimeError(f"{arm} cannot start: {missing} not complete for seeds {SEEDS}")
     if arm == "e2_ep":
         require_e2_ep_eligibility(eligibility)
+        if confirmation != E2_EP_CONFIRMATION:
+            raise RuntimeError(f"E2-EP is eligible but not confirmed: pass confirmation={E2_EP_CONFIRMATION!r}")
     results = {}
     for n, seed in enumerate(SEEDS, start=1):
         run_dir = run_dir_for(experiments_root, arm, adapted["sha256"], seed)

@@ -126,10 +126,68 @@ class HeldOutTestSetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ea.shard_plan([{"image": "1_left.jpeg", "patient": "1", "eye": "left", "split": "holdout"}])
 
+    def test_the_two_caches_are_separate_and_cannot_overwrite_each_other(self):
+        adaptation = [{"image": f"{p}_{eye}.jpeg", "patient": str(p), "eye": eye, "grade": p % 5, "patient_max_grade": p % 5,
+                       "split": "val" if p % 4 == 0 else "train"} for p in range(1, 13) for eye in ("left", "right")]
+        heldout = [{"image": f"{p}_left.jpeg", "patient": str(p), "eye": "left", "grade": p % 5, "patient_max_grade": p % 5,
+                    "split": "test"} for p in range(100, 110)]
+        self.assertEqual((ea.cache_set(adaptation), ea.cache_set(heldout)), ("adaptation", "heldout-test"))
+        for mixed in (adaptation + heldout, [r for r in adaptation if r["split"] == "train"], heldout + adaptation[:1]):
+            with self.assertRaises(RuntimeError):
+                ea.cache_set(mixed)                                        # a mixture or a partial set is not a cache
+        self.assertEqual(ea.expected_cache_bytes(adaptation, 16), 24 * 512 * 512 * 3 * 2 + 3 * 128)
+        original = ea.frame_from_raw
+        ea.frame_from_raw = lambda path: np.full((512, 512, 3), 0.25, np.float32)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sources = {"a": os.path.join(tmp, "train"), "t": os.path.join(tmp, "test")}
+                for key, rows in (("a", adaptation), ("t", heldout)):
+                    os.makedirs(sources[key])
+                    for r in rows:
+                        with open(os.path.join(sources[key], r["image"]), "w") as fh:
+                            fh.write(r["image"])
+                a_dir, t_dir = os.path.join(tmp, "cache_a"), os.path.join(tmp, "cache_t")
+                ready = ea.preflight(adaptation, sources["a"], a_dir, "a" * 64, 16)
+                self.assertEqual((ready["set"], ready["ready"], ready["missing_images"], ready["shards"], ready["shards_done"]),
+                                 ("adaptation", True, 0, 3, 0))
+                self.assertFalse(os.path.exists(a_dir))                    # the check builds nothing
+                ea.build_cache(adaptation, sources["a"], a_dir, "a" * 64, workers=2, shard_size=16, log=lambda *a: None)
+                ea.build_cache(heldout, sources["t"], t_dir, "t" * 64, workers=2, shard_size=16, log=lambda *a: None)
+                self.assertEqual(sorted(os.listdir(t_dir)), ["frames_test_000.npy", "index.json"])
+                self.assertEqual(sorted(os.listdir(a_dir)), ["frames_train_000.npy", "frames_train_001.npy", "frames_val_000.npy", "index.json"])
+                self.assertEqual(ea.preflight(adaptation, sources["a"], a_dir, "a" * 64, 16)["shards_done"], 3)
+                before = {n: ea.sha256_file(os.path.join(a_dir, n)) for n in os.listdir(a_dir)}
+                for call in (lambda: ea.build_cache(heldout, sources["t"], a_dir, "t" * 64, workers=2, shard_size=16, log=lambda *a: None),
+                             lambda: ea.preflight(heldout, sources["t"], a_dir, "t" * 64, 16),
+                             lambda: ea.build_cache(adaptation, sources["a"], t_dir, "a" * 64, workers=2, shard_size=16, log=lambda *a: None),
+                             lambda: ea.build_cache(adaptation + heldout, sources["a"], os.path.join(tmp, "both"), "a" * 64, shard_size=16),
+                             lambda: ea.verify_cache(a_dir, heldout, "t" * 64, shard_size=16),
+                             lambda: ea.verify_cache(t_dir, adaptation, "a" * 64, shard_size=16)):
+                    with self.assertRaises(RuntimeError):
+                        call()                                             # neither cache accepts the other set
+                self.assertEqual(before, {n: ea.sha256_file(os.path.join(a_dir, n)) for n in os.listdir(a_dir)})   # untouched
+                self.assertFalse(os.path.exists(os.path.join(tmp, "both")))
+                ea.verify_cache(a_dir, adaptation, "a" * 64, shard_size=16)   # each verifies independently
+                ea.verify_cache(t_dir, heldout, "t" * 64, shard_size=16)
+                self.assertEqual(ea.FrameCache(t_dir, heldout, "t" * 64, shard_size=16).report["frames"], {"test": 10})
+                os.remove(os.path.join(sources["a"], adaptation[0]["image"]))
+                self.assertFalse(ea.preflight(adaptation, sources["a"], a_dir, "a" * 64, 16)["ready"])   # a missing source image
+                junk = os.path.join(tmp, "junk")
+                os.makedirs(junk)
+                open(os.path.join(junk, "something.bin"), "w").close()
+                with self.assertRaises(RuntimeError):                      # a non-empty folder without a cache index
+                    ea.preflight(heldout, sources["t"], junk, "t" * 64, 16)
+        finally:
+            ea.frame_from_raw = original
+        main = inspect.getsource(ea.main)                                  # each set reads its own manifest only
+        self.assertIn("rows, sha, folder = read_split(args.split_dir, MANIFEST_SHA256), MANIFEST_SHA256, \"train\"", main)
+        self.assertIn("rows, sha, folder = read_test_manifest(args.split_dir, TEST_MANIFEST_SHA256), TEST_MANIFEST_SHA256, \"test\"", main)
+        self.assertNotIn("quality", inspect.getsource(ea.read_test_manifest) + inspect.getsource(ea.build_cache))
+
     def test_command_line_builds_the_adaptation_set_by_default(self):
         source = inspect.getsource(ea.main)
         self.assertIn('default="adaptation"', source)
-        self.assertIn('choices=("build", "verify")', source)
+        self.assertIn('choices=("check", "build", "verify")', source)
         with self.assertRaises(RuntimeError):                              # verify refuses a folder without a cache
             ea.main(["verify", "--cache-dir", os.path.join(tempfile.gettempdir(), "no_such_eyepacs_cache")])
 

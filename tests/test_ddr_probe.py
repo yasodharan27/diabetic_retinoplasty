@@ -99,7 +99,7 @@ class ManifestTests(unittest.TestCase):
         source = inspect.getsource(dp)
         for forbidden in ("verify_split", "Arch1Bundle", "idrid_root", "B. Disease Grading", "train_images", "DOWNSTREAM_SPLIT"):
             self.assertNotIn(forbidden, source)
-        run = inspect.getsource(dp.run)
+        run = inspect.getsource(dp.probe_encoder)                         # the per-encoder step of dp.run
         self.assertEqual(run.count('f["test"]'), 1)                        # the test features are read in one place:
         self.assertIn('evaluate_probe(probe, weights[variant], f["test"]', run)   # the two final predictions
         self.assertNotIn("test", inspect.getsource(dp.train_probes).replace("the test split is not an argument", ""))

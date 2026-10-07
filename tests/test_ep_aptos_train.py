@@ -225,6 +225,16 @@ class RunTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):                           # E2-EP without the criterion record
                 ep.run_arm("e2_ep", self.exp, bundle, adapted, CW, lesion_prior=PRIOR, partner=e2.derangement(bundle.train_ids),
                            train_fn=self.train, evaluate_fn=self.evaluate, **self.kw)
+            gate = os.path.join(self.tmp.name, ep.ELIGIBILITY_NAME)          # a met criterion makes E2-EP eligible ...
+            ep.write_e2_ep_eligibility(gate, {"variants": {"five_epoch": {"mean": {"e1_ep_minus_p_ep": {
+                "per_seed": [0.02], "mean": 0.02, "ci": [0.005, 0.03], "positive_seeds": 1}}}}})   # one seed in this test
+            started = []
+            for phrase in (None, "yes"):                                     # ... but nothing starts without the phrase
+                with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+                    ep.run_arm("e2_ep", self.exp, bundle, adapted, CW, lesion_prior=PRIOR, partner=e2.derangement(bundle.train_ids),
+                               eligibility=gate, confirmation=phrase, train_fn=lambda *a, **k: started.append(a),
+                               evaluate_fn=self.evaluate, **self.kw)
+            self.assertEqual((started, ep.E2_EP_CONFIRMATION), ([], "TRAIN E2-EP ON APTOS"))
             with self.assertRaises(RuntimeError):
                 ep.train_seed("e2_ep", os.path.join(self.tmp.name, "e2"), bundle, 42, adapted, CW, repo_dir=REPO,
                               staging_dir=os.path.join(self.tmp.name, "s"), lesion_prior=PRIOR,
