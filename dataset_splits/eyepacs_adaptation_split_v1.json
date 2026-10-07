@@ -1,0 +1,59 @@
+{
+ "seed": 20261008,
+ "val_fraction": 0.1,
+ "stratified_by": "the higher grade of the patient's eyes",
+ "images": {
+  "train": 31610,
+  "val": 3512,
+  "total": 35122
+ },
+ "patients": {
+  "train": 15807,
+  "val": 1756,
+  "total": 17563
+ },
+ "grade_counts": {
+  "train": [
+   23209,
+   2209,
+   4768,
+   782,
+   642
+  ],
+  "val": [
+   2599,
+   232,
+   524,
+   91,
+   66
+  ]
+ },
+ "patient_max_grade_counts": {
+  "train": [
+   10939,
+   1298,
+   2720,
+   449,
+   401
+  ],
+  "val": [
+   1216,
+   144,
+   302,
+   50,
+   44
+  ]
+ },
+ "patients_in_both_splits": 0,
+ "patients_with_one_usable_eye": 4,
+ "patients_with_two_usable_eyes": 17559,
+ "manifest": "eyepacs_adaptation_split_v1.csv",
+ "manifest_sha256": "c5f7e41501b9b803be3cc4fdbaf655942366a961531e1b0570ae5fec9a13fd86",
+ "excluded_blank": [
+  "1986_left.jpeg",
+  "32253_right.jpeg",
+  "34689_left.jpeg",
+  "43457_left.jpeg"
+ ],
+ "quality_filter": "none (no EyeQ label and no Stage-1 prediction is used)"
+}

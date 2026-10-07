@@ -4508,3 +4508,138 @@ E1 − P QWK −0.0648 (−0.1440 to −0.0016); E2 − P +0.0073 (−0.0439 to 
 - Limits: 100 images; 34 grade-0 images drive the QWK difference; 19 grade-3 and 13 grade-4 (one image = 0.053 / 0.077 of recall); P's predictions from another runtime; three seeds.
 
 **Closed.** IDRiD batch 1 has been used. It is not rerun, and nothing about P, E1, E2 or the approved plan is changed on the basis of this result. Batch 2 (EP models) remains the only other declared use of this test set.
+
+
+## 68. DDR ground-truth lesion probe — pre-run record (2026-10-07; written before any DDR probe exists; nothing run)
+
+**Position.** After §67 the open question about E1 is no longer grading (comparable on APTOS, lower than P in decoded grades on IDRiD) but what its representation contains. §63.2 showed that E1's features make *Stage-4 pseudo-labels* much more readable; this probe asks the same of **expert-annotated lesions on images and annotations that neither Stage 4 nor any grader has seen**. The IDRiD result does not alter this design and is not an input to it. Workstream B (§69) runs in parallel and independently.
+
+**Question.** Does E1's frozen representation contain more information predictive of real, expert-annotated retinal lesions than P's?
+
+### Locked design
+
+- **Encoders.** The nine pinned BEST checkpoints, frozen: P seeds 42 / 123 / 2026 (`7d6f5498…`, `e5f4d386…`, `d7d7d95f…`, §60) and E1 / E2 seeds 42 / 123 / 2026 (§65). All are run through E1's graph (Gate 1: it reproduces P bit for bit); only the final 16×16×768 feature map is used. No encoder is fine-tuned; no grader is trained; no trained lesion head or grading head is used.
+- **Data.** DDR lesion subset from the pinned Hugging Face revision (§66). Probe set: **756 images — train 383, validation 148, test 225**; `007-5869-300.jpg` (validation) is excluded (§66.1). Manifest `datasets/DDR/audit/ddr_probe_manifest.csv`, SHA-256 `2f3e4a40fa17e0af8706c859002163a18d56d594ca43f856a54cac65dbdcc2d0`; every image is checked against its SHA-256 at run time.
+- **Preprocessing.** Stage 2 (DR profile) once at native size, then the full-frame resize to 512×512 — the functions used for APTOS and IDRiD. Nothing is adapted to DDR.
+- **Targets.** DDR's masks are binary single-channel images at the native size, one per class. The image is used full-frame, so cell (r, c) of the 16×16 grid covers native rows ⌊rH/16⌋ … ⌊(r+1)H/16⌋ and the corresponding columns; **the target is 1 if any lesion pixel lies in the cell, otherwise 0.** Four separate channels in E1's order MA, HE, EX, SE. (The APTOS probe used soft teacher probabilities; these targets are hard because the annotations are.)
+- **Probe.** The fresh 1×1 probe of §63.2 (`e1_probe.build_probe`: Conv2D(4, 1×1) on the feature map, float32, GlorotUniform(seed) kernel, bias = logit of the per-class mean **DDR training** target), lesion loss only, Adam 1e-3, batch 16, a seeded permutation of the training images per epoch, no augmentation. The probe seed is the run seed; kernel, bias and batch order are identical for the P, E1 and E2 probes of a seed. Features are taken under `mixed_float16`.
+  - **Five-epoch probe** — the §63.2 protocol unchanged: the weights after epoch 5. **This is the pre-declared primary result.**
+  - **Converged probe** — the same probe continued with the same optimiser and batch-order rule until the validation loss has not improved by more than 1e-4 for 5 consecutive epochs (not before epoch 5; cap 100 epochs); the weights of the epoch with the lowest validation loss. Reported next to the five-epoch result as a robustness analysis; it does not replace it. (§63.2 found P-type probes unconverged at five epochs; this is the answer to that objection, fixed in advance.)
+- **Roles of the splits.** Train: fit the probe. Validation: only the stopping decision above and the reported curves. **Test: predicted exactly twice per probe — once with each of the two weight sets — after the stopping decision is final.** No epoch, learning rate, architecture, threshold or preprocessing choice is made from test performance, and the test split is not an argument of the training function.
+
+### Reported and criterion
+
+- For P, E1 and E2, each seed and the three-seed mean, both variants: cell-level AUROC on the test split per class (MA, HE, EX, SE; positive = cell target 1) and the mean of the four. Differences **E1 − P**, **E2 − P**, **E1 − E2**, per seed and for the three-seed mean, per class and for the mean.
+- Intervals: paired bootstrap over the 225 test images, 2,000 resamples, seed 20260927, the same resamples for every model, seed and variant, computed from exact per-image-pair counts (§63.3). The resampling is **not** grade-stratified: grades are not the probe's label and two test images have none in the DDR lists. This differs from §63.2's stratified resamples and is fixed here.
+- **Primary criterion (mirrors §62): on the five-epoch probe, E1 − P in mean AUROC is positive in 3 / 3 seeds and the 95 % interval of the three-seed mean excludes zero.** No other criterion is introduced after the result.
+- Also reported, used for no choice: validation curves, the converged epoch, training and validation scores of both variants.
+
+### Reading rules (fixed now)
+
+- **Criterion met:** "E1's representation contains more information predictive of expert-annotated lesion masks than P's." Not "E1 learns true lesions": the probe shows information is available in the features, not that the grading head uses it.
+- **Criterion not met:** the mechanism claim is not extended: "E1's increased readability of Stage-4 targets on APTOS did not translate into stronger prediction of independently annotated DDR lesions."
+- **E2 close to P while E1 exceeds P:** strengthens the reading that image-aligned supervision, not generic auxiliary training, produced the change. **E2 also exceeds P:** reported as such; the specificity of the aligned-supervision reading is weakened.
+- If the five-epoch and converged results disagree in sign or in whether an interval excludes zero, both are reported and the disagreement is stated; the five-epoch result remains the pre-declared primary one.
+- Limits stated in advance: DDR is one source (Chinese hospitals, 42 camera types); the annotated images are all DR grade 1–4 (no healthy eyes); no patient identifiers, so the split is image-level as far as can be shown; the download is a mirror with an unreliable card (§66); cell targets at 16×16 are coarse; three seeds; the bootstrap covers test-image resampling only.
+
+### Implementation (written, not run)
+
+`ddr_probe.py` (targets, manifest and checkpoint verification, the two-variant probe, the resumable run, the comparison), `tests/test_ddr_probe.py` (11 tests, synthetic masks and features), `colab/notebooks/ddr_lesion_probe.ipynb`. Tests confirm: cell targets equal a brute-force implementation on non-divisible image sizes; the pinned manifest is the 756-image set without `007-5869-300`; a changed manifest is refused; the five-epoch weights reproduce `e1_probe.train_probe` (the §63.2 trainer) exactly; the stopping rule and its determinism; the test split is not a parameter of training; the bootstrap weights reproduce the AUROC of a resampled test set; the criterion is evaluated on the five-epoch result. No DDR image was decoded by the tests and no probe has been fitted on DDR.
+
+**Status.** Pre-run record complete. The probe has not been run.
+
+## 69. EyePACS adaptation — data preparation and pre-run record (2026-10-07; no model trained, no APTOS file read, no EyeQ label used)
+
+**Purpose (unchanged from the design audit of 2026-10-08).** EyePACS is a controlled factor, not a replacement of the baseline. **Q1:** does much more DR-specific supervised data improve the RGB grader — P-EP against P. **Q2:** after that adaptation, does image-aligned lesion supervision still change the representation — E1-EP against P-EP, with the lesion probe as the primary outcome. E2-EP runs only if E1-EP meets the probe criterion. The DDR probe (§68) does not gate this workstream and its result will not change it.
+
+### Inventory and exclusion (verified on the local files)
+
+- `trainLabels.csv`: **35,126** labelled images, grades 25,810 / 2,443 / 5,292 / 873 / 708; **17,563 patients**, every one with a `left` and a `right` image; every label has its file and every file its label.
+- **Excluded: exactly four blank photographs** — `1986_left`, `32253_right`, `34689_left`, `43457_left` (labels 0, 1, 0, 1). They are readable files in which every grey value is at most 22 of 255 (no fundus); found by the screen of §64 and inspected one by one. Their fellow eyes are kept. Nothing else is removed. If a further unreadable file appears during frame generation the run stops and reports it; the inventory is not changed silently.
+- **Usable: 35,122 images, 17,563 patients** (four patients with one usable eye).
+- **No quality filtering.** No EyeQ quality label and no Stage-1 prediction is read. EyePACS images were used earlier to build EyeQ for Stage 1; that is provenance, not a dependency of any grader.
+
+### Patient-level split (written once; immutable)
+
+By patient, 90 % / 10 %, stratified by the higher grade of the patient's two eyes; within each stratum patients are sorted by numeric id and permuted with a generator seeded by (20261008, stratum). Deterministic in the set of usable images alone (verified: independent of row order).
+
+| | images | patients | grade 0 | grade 1 | grade 2 | grade 3 | grade 4 |
+|---|---|---|---|---|---|---|---|
+| training | 31,610 | 15,807 | 23,209 | 2,209 | 4,768 | 782 | 642 |
+| validation | 3,512 | 1,756 | 2,599 | 232 | 524 | 91 | 66 |
+
+Patients by stratum (higher grade), training / validation: 10,939 / 1,216; 1,298 / 144; 2,720 / 302; 449 / 50; 401 / 44. No patient is in both parts; both eyes are always together. Manifest `dataset_splits/eyepacs_adaptation_split_v1.csv`, **SHA-256 `c5f7e41501b9b803be3cc4fdbaf655942366a961531e1b0570ae5fec9a13fd86`**; the writer refuses to overwrite it with different content.
+
+### Preprocessing
+
+- **Path.** P's: Stage 2 (DR profile) once at native size, then the full-frame resize to 512×512 — `stage4_v2_data.stage2_rgb` and `stage4_v2_aptos_cache.recompute_rgb_512`, the same two functions that produce the APTOS cache and the IDRiD inputs.
+- **Integrity check (12 images spread over the manifest, label-blind choice):** shape 512×512×3 float32, values within [0, 1], recomputation bit-identical in 12 / 12.
+- **Cache, and one stated deviation.** Stage 2 costs about 1–2.5 s per image on a CPU, so frames cannot be computed inside the training loop; they are generated once and stored as shards of 1,000 frames. They are stored as **float16**, not float32 (APTOS's cache is float32): the largest rounding error measured is 0.00024, and under `mixed_float16` the model's first layer converts its input to float16 in any case. Storage is about 55 GB instead of 110 GB. The cache is bound to the manifest hash and verified per shard; only files named `<patient>_<left|right>.jpeg` outside any APTOS path can enter it. **The full cache has not been generated**; at the measured rate it is roughly 3–5 hours on the laptop with four workers.
+
+### The adaptation run (later; fixed now)
+
+| item | value |
+|---|---|
+| input | the 31,610 training frames; validation 3,512 |
+| model | P's: ImageNet ConvNeXt-Tiny, average pooling, LayerNorm, CORN Dense 768→4 |
+| loss | weighted CORN; class weights from the EyePACS **training** counts by P's formula: 0.6450 / 2.0906 / 1.4230 / 3.5138 / 3.8780 |
+| optimiser | AdamW 1e-4, weight decay 0.05 (none on 1-D parameters), as P |
+| batch size | **16** — the one protocol change, in this phase only (P's 2 is impractical at this size) |
+| augmentation | P's: flips and rot90, brightness / contrast ±0.1 |
+| precision | `mixed_float16` |
+| epochs | cap and early-stopping patience to be stated in the training module's pre-run note before the run; P's values (50 / 12 with LR reduction 4, 0.5, 1e-6) unless stated otherwise there |
+| checkpoint selection | **EyePACS validation QWK only** |
+| APTOS | **never read** in this phase — not for selection, monitoring or anything else |
+| after training | the selected weights are frozen and pinned by SHA-256; the EyePACS validation part is not used again |
+| runs | one (its own variance is a stated limitation; a second seed is optional, not required) |
+
+**APTOS phase (unchanged protocol).** P-EP and E1-EP: the exact P / E1 protocol, same split, same three seeds, same evaluation, the CORN head re-initialised per seed; only the encoder initialisation differs. E2-EP only if E1-EP meets the §62-form probe criterion against P-EP.
+
+**Evaluations declared now.** (1) The 16,249 EyeQ-labelled EyePACS **test** images, once: for P, E1, E2 a cross-dataset evaluation; for the EP models "EyePACS held-out test evaluation for the EyePACS-adapted models" — in-domain, never called an independent external test, never used for selection. (2) IDRiD batch 2 (§65), the only set external to every arm. (3) Secondary: the DDR ground-truth probe of §68, unchanged, on P-EP and E1-EP (and E2-EP if it exists), to ask whether DR-specific adaptation alone makes lesion information more readable (P-EP against P) and whether aligned supervision adds to it (E1-EP against P-EP). That later use does not alter §68.
+
+**Leakage statements.** No copy of an APTOS image was found among the EyePACS images (§64, §64.1); patient-level independence between the datasets cannot be shown. The split is by patient. APTOS validation remains every APTOS model's selection set.
+
+### Implementation (written; adaptation trainer not yet written)
+
+`eyepacs_adaptation_data.py` (inventory, the four-image exclusion, the split and its immutable manifest, class weights, the frame function, the shard cache) and `tests/test_eyepacs_adaptation_data.py` (9 tests on synthetic labels and fake frames). The module contains no reference to APTOS's split, to EyeQ labels or to a quality model (tested). Preparation report: `results/EyePACS_adaptation/preparation_report.json`.
+
+**Status.** Inventory, exclusion, split and manifest: done. Preprocessing: implemented and checked on a sample; full cache not generated. Adaptation: not started.
+
+
+## 68.1 DDR probe — implementation completed and data staged (2026-10-07; no probe run, no DDR test image scored)
+
+Protocol: §68, unchanged. This section records only what is now true of the implementation and the data.
+
+**Data on Drive (verified).** `datasets/DDR/raw/lesion_segmentation`: 3,785 files (757 images, 3,028 masks, 885 MB), compared file by file with the local copy — 0 differences, no duplicate names. `datasets/DDR/audit`: the probe manifest (SHA-256 on Drive `2f3e4a40fa17e0af8706c859002163a18d56d594ca43f856a54cac65dbdcc2d0`, the pinned value), the exclusions file, the lesion manifest and the verification report.
+
+**Added to the implementation since §68.**
+- `ddr_probe.environment` / `record_invocation`: every invocation of the run appends the commit, UTC time, Python / NumPy / TensorFlow / Keras versions, the GPU, the manifest hash, the ImageNet-weights hash, the nine checkpoint hashes and the feature precision to `run_metadata.json`. It is kept apart from `configuration.json`, which still binds an output directory to one configuration.
+- Tests, now 14 (were 11): the three splits share no image name and no image hash; an image whose bytes differ from the manifest is refused; the module contains no APTOS-split, IDRiD-image or bundle reader, and the test features are read in exactly one place (the two final predictions per probe); the analysis output has a fixed schema, is identical when repeated with the same bootstrap seed, and changes its interval but not its point estimate with another seed; the invocation record.
+- Already covered before: frozen encoders have no trainable variable and P's features in E1's graph are P's (`tests/test_e1_probe.py`); the probe is identical for the three encoders of a seed; cell targets equal a brute-force implementation; the five-epoch weights reproduce the §63.2 trainer.
+
+**Outputs of the run (when it is made).** `experiments/DDRProbe/ddr_ground_truth_probe_v1/`: `configuration.json`, `run_metadata.json`, `targets.npz`, `probe_<model>_seed<seed>.npz` (test logits of both variants), `summary.json`; then, from the laptop, `ddr_probe_result.json` (`ddr_probe.analyse`).
+
+**Completed validation:** unit tests (CPU, synthetic features and masks) and the manifest / file checks. **Pending:** the GPU run and its analysis. Nothing in §68 has been changed.
+
+## 69.1 EyePACS adaptation — cache verification, loader and trainer implemented (2026-10-07; no cache built, nothing trained)
+
+Protocol: §69. Confirmed by the user on 2026-10-07 and now fixed: **epoch cap 50, early-stopping patience 12** (with P's learning-rate reduction: patience 4, factor 0.5, floor 1e-6), weight decay 0.05, and the **float16 frame cache** as an accepted, declared deviation from P's float32 APTOS cache (rounding error at most 0.00024 on the sample of §69; about 55 GB instead of 110 GB).
+
+**Implemented.**
+- `eyepacs_adaptation_data.py` (extended). The cache is bound to the split-manifest SHA-256, the preprocessing version (`pipeline_v2_config.PREPROC_VERSION` = `stage2-DR-profile/full-frame-direct-resize/v1`), the cache version string, the dtype, the frame size and the shard layout. Every shard records its images in order, their grades, the SHA-256 of each source JPEG and the SHA-256 of the shard file. `verify_cache` refuses a cache that is incomplete, has an unplanned shard, was built for another manifest, preprocessing version or layout, holds other images / another order / other grades than the manifest, or (with hashing) whose shard files differ from their recorded hashes. `FrameCache` gives the trainer verified read access; `stage_cache` copies a cache from Drive to local disk with a hash check per shard. Command line: `python eyepacs_adaptation_data.py build|verify --cache-dir <dir>`.
+- `eyepacs_adaptation_train.py` (new). The model is `pl_convnext.build_pl_model("P", seed, ImageNet arrays)` compiled by `pl_convnext.compile_pl_model` — P's own two functions — and the loop is P's (the structure of `arch1_train.train_seed`: generation checkpoints, BEST published on validation QWK, early stopping, learning-rate reduction, mixed precision, P's seeded epoch order and per-image augmentation generator, P's augmentation). The protocol object is `arch1_train.P_PROTOCOL` with `batch_size` 16 and nothing else changed (tested). Class weights are computed from the manifest's training part and must equal the recorded 0.6450 / 2.0906 / 1.4230 / 3.5138 / 3.8780. A lock heartbeat inside the epoch is added because an EyePACS epoch outlasts the run lock.
+- Selection and freezing. `freeze_checkpoint` requires a finished run whose BEST is the first epoch with the highest EyePACS validation QWK, then writes `frozen_checkpoint.json` (weights path, SHA-256, epoch, validation QWK, manifest hash, cache fingerprint, configuration hash) once; a different file is never accepted in its place. `read_frozen` / `load_frozen` refuse weights that are not the pinned file. `adapted_backbone_arrays` hands the adapted encoder to the existing APTOS code as `reference_arrays`, so `pl_convnext.build_pl_model` builds P-EP with the adapted encoder and a CORN head re-initialised from the APTOS seed (tested: encoder identical, head equal to the seed initialisation, the EyePACS-trained head not carried over).
+- Evaluation hooks. `evaluate_run` scores BEST and LAST on the EyePACS validation part in P's per-sample schema (labelled as the selection set); `predict_logits` scores any image set whose frames come from the locked path.
+- `colab/notebooks/eyepacs_adaptation.ipynb`: inputs and assertions, cache staging and verification, a ten-step memory / speed check of a throwaway model, and the run cell with `RUN_ADAPTATION = False`.
+
+**Tests.** `tests/test_eyepacs_adaptation_data.py` 11 (were 9; added: cache verification and its refusals, staging, and preprocessing parity — the frame function is bit-identical to the APTOS / IDRiD path and to the DDR probe's on a synthetic photograph). `tests/test_eyepacs_adaptation_train.py` 10: the protocol, the class weights from the pinned manifest, absence of any APTOS / IDRiD / quality-label dependency, the model being P with P's optimiser, P's three-input contract, P's epoch order and augmentation, the first-maximum selection rule, and a two-epoch synthetic run through checkpointing, selection, freezing, the refusal of altered weights and of a second configuration in a run directory.
+
+**No APTOS read.** Neither module references the APTOS split, an APTOS path or a bundle reader; the cache accepts only files named `<patient>_<left|right>.jpeg` outside any APTOS folder; the trainer reads frames only through the verified cache.
+
+**Not done.** The frame cache has not been built (laptop, about 3–5 hours with four workers, then about 55 GB to Drive; 498 GB free locally, 4.7 TiB free on Drive). No adaptation run, no P-EP / E1-EP / E2-EP, no EyePACS test evaluation, no IDRiD batch 2. The APTOS-phase trainers for P-EP and E1-EP are not written. T4 memory and speed at batch 16 are unmeasured; the notebook's check cell measures them before any run.
+
+**Open points between §69 and the instruction of 2026-10-07 — to be fixed in this record before the adaptation run; the code decides none of them.**
+1. *Number of adaptation runs.* §69 fixes one EyePACS run whose encoder initialises three APTOS seeds. The instruction says "Train P-EP for 3 seeds" and "freeze / SHA all P-EP checkpoints". `run_sequence` therefore takes the seeds as a required argument and supports either reading. With three EyePACS runs the pairing (EyePACS seed *s* → APTOS seed *s*) and the roughly three-fold GPU time must be accepted explicitly.
+2. *What P-EP is on APTOS.* §69: the P protocol on APTOS from the adapted encoder, three seeds. The instruction's "evaluate P-EP on APTOS using the exact frozen APTOS split/protocol" can also be read as scoring the EyePACS-trained model on APTOS without APTOS training. These are different models.
+3. *Condition for E1-EP.* §69 runs E1-EP together with P-EP and makes only E2-EP conditional (on E1-EP's probe criterion against P-EP). The instruction makes E1-EP itself conditional on "the approved E1-EP probe criterion", which cannot be evaluated before E1-EP exists; the criterion meant (for example the DDR criterion of §68 for E1 against P) has to be named.
+4. *EyePACS test before or after the APTOS phase* (instruction steps E–F) — order only; no effect on selection in either order.

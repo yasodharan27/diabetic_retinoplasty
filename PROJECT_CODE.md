@@ -69,11 +69,16 @@ section numbers below refer to it.
 
 1. Pre-run record for IDRiD batch 1 — written (§65).
 2. **IDRiD batch 1:** E1 and E2 on the locked IDRiD protocol (100-image primary set, 103 as sensitivity); P's
-   stored predictions are reused. Evaluator implemented (§65.1); gates and the one-time run are pending on the T4.
+   stored predictions are reused. Run once and recorded (§67); IDRiD batch 1 is consumed.
 3. **DDR** download, verification and overlap screen (expert lesion masks, independent of Stage 4) — done (§66, §66.1).
 4. **Ground-truth lesion probe:** the same frozen-encoder probe on P, E1 and E2 against DDR's real masks.
+   Pre-run record §68; implementation, tests and data staging complete (§68.1: `ddr_probe.py`,
+   `colab/notebooks/ddr_lesion_probe.ipynb`); the GPU run is pending.
 5. **EyePACS adaptation:** Stage 2 on EyePACS, patient-level 90/10 split, one supervised adaptation run of P's
-   model, checkpoint pinned by hash. APTOS is never read in this phase.
+   model, checkpoint pinned by hash. APTOS is never read in this phase. Split manifest, cache verification,
+   loader and trainer implemented (§69, §69.1: `eyepacs_adaptation_data.py`, `eyepacs_adaptation_train.py`,
+   `colab/notebooks/eyepacs_adaptation.ipynb`); the frame cache is not built and nothing is trained. Four
+   points of the run plan are open in §69.1 and must be fixed there first.
 6. **P-EP and E1-EP** on APTOS (three seeds each, unchanged P / E1 protocol), with probes on both.
 7. **E2-EP** only if the E1-EP probe criterion passes.
 8. One-shot evaluations of the EP models: the labelled EyePACS test subset and IDRiD batch 2.
