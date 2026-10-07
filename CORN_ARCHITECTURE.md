@@ -1,5 +1,9 @@
 # CORN Ordinal Classification (Stage 08)
 
+> **Status note (2026-10-08).** CORN is trained and in use: it is the ordinal head of every current grader (P, E1,
+> E2), as `Dense(768 → 4)` on ConvNeXt-Tiny's pooled feature with the weighted CORN loss (`weighted_corn.py`), in
+> addition to the original `Dense(256 → 4)` on RACAF's output described below.
+
 **Status:** Authoritative specification for CORN, the final stage of the downstream pipeline.
 **Implemented and unit-tested** (`corn.py`, `tests/test_corn.py`). **Not trained; not frozen** —
 its `Dense(256→4)` weights do not exist yet; no training has been run.

@@ -1,5 +1,11 @@
 # Segmentation Stage — Architecture Design Document
 
+> **Status note (2026-10-08).** Stage 3 (LWNet) is integrated and frozen as specified. Stage 4 as specified here
+> (Attention U-Net, Experiment 2C) is **superseded** by Stage 4 v2: an SE-ResNet-101 U-Net for MA / HE / EX / SE,
+> trained on IDRiD segmentation + TJDR, inference at 1536 × 1536 with exact 3 × 3 mean + max pooling to a
+> 512 × 512 × 8 cache (`stage4_v2*.py`, `stage34_cache_v2.py`; research record §40–§48). The old model's outputs
+> are deny-listed and are not read by any current code path.
+
 **Status:** Frozen architecture specification for pipeline stages 3 (Vessel Segmentation) and 4 (Lesion Segmentation), plus the interface/shape contract connecting them to stages 5–8 (Local Feature Extraction → Global Feature Extraction → Feature Fusion → Ordinal Classification). **Vessel Segmentation uses a pretrained, externally-sourced model (LWNet) for inference only — it is not trained within this project.** **Lesion Segmentation is trained within this project**, on IDRiD's segmentation subset, and is now **finalized and frozen** as Experiment 2C — see §3.5. An earlier design trained Vessel Segmentation within this project on DRIVE + CHASE_DB1 instead; that design was itself adopted, then superseded again by the current pretrained-LWNet design, and is retained only in the Appendix (Design History) for context.
 
 This document does not describe or redesign RACAF (Reliability-Aware Cross-Attention Fusion),

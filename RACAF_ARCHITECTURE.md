@@ -1,5 +1,10 @@
 # Reliability-Aware Cross-Attention Fusion (RACAF)
 
+> **Status note (2026-10-08): closed.** RACAF was trained and compared with its no-RACAF control in a six-run matched
+> experiment. The result was inconclusive (mean paired difference −0.0072) and the gate was never meaningfully
+> learned; the constant-gate and residual variants were gray-zone. The pathway is closed (`docs/experiments/Multiseed_Improved_Training_Report.md`; research record §1–§5).
+> This document remains the specification of what was built.
+
 **Status:** Authoritative specification for the single approved downstream research innovation
 referenced by `PROJECT_CODE.md`'s Approved Research Innovation section and
 `IMPLEMENTATION_PLAN.md`'s roadmap. **Implemented and unit-tested** (`racaf.py`,

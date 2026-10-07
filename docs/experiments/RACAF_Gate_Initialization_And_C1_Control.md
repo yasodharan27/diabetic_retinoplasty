@@ -4392,3 +4392,119 @@ A new evaluator module and lock file for this batch, reusing `idrid_grading_eval
 **IDRiD batch 2** (P-EP, E1-EP and, if run, E2-EP) is declared now as the only other planned use of this test set, under the same protocol and with its own lock; nothing in batch 1 depends on it.
 
 **Status.** Pre-run record complete. No code written, no inference run. Awaiting the user's approval to implement and execute.
+
+
+### 65.1 IDRiD batch 1 — evaluator implemented (2026-10-08, commit `7773fcb`; no IDRiD image read, nothing run on a GPU)
+
+New files only: `idrid_batch1_protocol.json`, `idrid_batch1_eval.py`, `tests/test_idrid_batch1_eval.py`, `colab/notebooks/idrid_batch1_e1e2.ipynb`. The earlier evaluator (`idrid_grading_eval.py`), its lock and its output directory are unchanged. The implementation follows §65; tests (10, laptop CPU, synthetic tables and fake models) pass: the six checkpoint hashes, the three P-table hashes and the parent protocol hash are those of §65; a changed parent protocol, checkpoint, BEST slot or P table is refused; paired differences equal direct per-seed differences and are zero for identical models; the run refuses without the token or without official passed gates, writes its lock before predictions, copies the P tables byte for byte, never builds P, never loads Stage 3 / 4, leaves the earlier run's directory unchanged, and refuses a second run without a written technical reason. The gates and the one-time run need the Colab T4 and have **not** been executed.
+
+## 66. DDR — acquisition and verification for the planned ground-truth lesion probe (2026-10-08; read-only; no probe, no model)
+
+**Isolation.** This section was produced in parallel with §65 and independently of it: nothing here changed the IDRiD batch-1 protocol, and no IDRiD result exists yet. No probe was trained and no probe setting was chosen from the data.
+
+**Source.** Hugging Face dataset `ctmedtech/DDR-dataset`, revision `50541319cfcdc963e3edc8b15508bc822d6b3ab5` (public, not gated, licence stated as CC BY 4.0), downloaded 2026-10-08 to `datasets/DDR/raw`. Downloaded: `lesion_segmentation/**`, `lesion_detection/**`, the three `DR_grading/*.txt` lists, `rm_images/**`, `README.md` — 4,551 files, none missing against the repository listing (saved as `datasets/DDR/hf_repo_listing_50541319.json`). **Not downloaded:** the 13,673 grading images and `simple_segmentation/**` (not needed for the probe). Audit output: `datasets/DDR/audit/` (`ddr_verification.json`, `ddr_lesion_manifest.csv` with a SHA-256 per image, signatures, contact sheet).
+
+**Provenance — a discrepancy to state.** The repository is a re-upload of a Kaggle mirror (`mariaherrerot/ddrdataset`), not the authors' own release (`nkicsl/DDR-dataset` on GitHub, which links to external storage). Its dataset card is unreliable: it names other authors, another paper title and "about 10,000 images". The file structure and counts, however, are those of the published DDR description: grading lists 6,835 / 2,733 / 4,105 = 13,673 images with labels 0–5 (5 = ungradable), and 757 lesion-annotated images split 383 / 149 / 225. Byte-level identity with the authors' release has not been verified. The claim that the masks are expert annotations rests on the DDR paper (Li et al., Information Sciences 501, 2019), not on anything in the download.
+
+**Verification of the lesion subset.**
+
+| check | result |
+|---|---|
+| annotated images | **757, all present**: train 383, val 149, test 225 (the test annotation folder is named `tet`) |
+| image ↔ mask correspondence | every image has exactly one mask per class (EX, HE, MA, SE): 3,028 masks; no mask without an image; no name in two splits |
+| readability | 0 unreadable or corrupt images or masks |
+| images | JPG, 35 distinct sizes (2592×1728 most common; 1380×1382 to 3888×2592) |
+| masks | single-channel 8-bit TIF, same size as the image in all 3,028 cases; values {0, 255} (1,896 masks) or all 0 (1,132 masks) — binary, one file per class |
+| lesion classes | EX, HE, MA, SE — the four Stage-4 classes |
+| images with a lesion, train / val / test | MA 314 / 132 / 124; HE 294 / 113 / 194; EX 245 / 70 / 171; SE 111 / 86 / 42; no image without any lesion |
+| mean positive pixel fraction | HE 0.35 %, EX 0.19 %, SE 0.06 %, MA 0.02 % |
+| DR grades of the annotated images (from the grading lists) | grades 1–4 only (no grade 0): train 57 / 275 / 16 / 35, val 22 / 110 / 6 / 11, test 20 / 163 / 12 / 28; two test images are not in the grading lists |
+| same images as `lesion_detection` | yes, in all three splits |
+| patient identifiers | **none.** File names are `007-<number>-<100…400>` or a timestamp; nothing identifies a patient or an eye, so the split cannot be shown to be patient-level |
+| relation to the grading split | **not aligned**: e.g. 152 of the 225 lesion-test images are in the grading *training* list and 118 of the 149 lesion-val images in the grading *test* list. Irrelevant for a probe that uses only the lesion split; it would matter if DDR's grading test were ever used with these images |
+| used by Stage 4 or any project model | no — Stage 4 v2 was trained on IDRiD segmentation and TJDR only; DDR was not in the project before today |
+
+**Overlap screen** (signature and scale of §64 / §64.1: copies and re-encodings below 0.01, different photographs above 0.06).
+
+| DDR lesion images (757) against | images | minimum distance | below 0.02 | below 0.05 |
+|---|---|---|---|---|
+| themselves | 757 | 0.047 | 0 | 2 (one pair) |
+| APTOS train / test | 3,662 / 1,928 | 0.115 / 0.139 | 0 | 0 |
+| EyePACS train / EyeQ-labelled test | 35,122 / 16,244 | 0.080 / 0.090 | 0 | 0 |
+| IDRiD grading train / test | 413 / 103 | 0.216 / 0.234 | 0 | 0 |
+| IDRiD segmentation train / test | 54 / 27 | 0.235 / 0.255 | 0 | 0 |
+| IDRiD localization train / test | 413 / 103 | 0.216 / 0.234 | 0 | 0 |
+| TJDR train / test | 448 / 113 | 0.168 / 0.178 | 0 | 0 |
+
+- No byte-identical images inside the lesion subset; no DDR image has a neighbour in the copy band in any dataset.
+- The closest cross-dataset pair (DDR `20170505163758832` and EyePACS `13609_left`, 0.080) was viewed: different eyes, different cameras.
+- **One within-DDR pair needs a decision before the probe split is fixed:** `007-5869-300` (val) and `007-2809-100` (test) at 0.047 — outside the copy band (below 0.01) but below the 0.06 at which APTOS's different photographs begin. Viewed at reduced size they look like different eyes from the same camera type (different vessel arcades), but this was judged by eye on a thumbnail and is not certain.
+- The screen detects copies of a photograph; it cannot detect another photograph of the same eye and cannot establish patient-level independence, here or across datasets.
+
+**Verdict.** Acquisition: complete for the lesion subset. Verification: passed, with three points to carry into the probe design — (1) provenance is a mirror with an unreliable card; (2) no patient identifiers, so the official 383 / 149 / 225 split is image-level as far as can be shown; (3) one val / test pair at 0.047 to be handled explicitly. Overlap with APTOS, EyePACS, IDRiD and TJDR: none found. The probe design is not yet locked and the probe has not been run.
+
+
+### 66.1 DDR probe set — exclusion decided (2026-10-08; user decision; no probe run, design still not locked)
+
+The one within-DDR pair below 0.06 (§66) is resolved by dropping its validation-side image from the planned lesion probe: **`007-5869-300` (val) is excluded; its neighbour `007-2809-100` (test) is kept.** Reason: the pair is at signature distance 0.047 — outside the copy band but below the level at which different photographs begin in the APTOS calibration — and it straddles the val / test boundary; removing one image of 757 removes the question at negligible cost. The decision was taken before any probe was trained and without any probe or IDRiD result.
+
+- Probe set: **756 images — train 383, val 148, test 225.** The official split is otherwise unchanged.
+- Recorded in `datasets/DDR/audit/ddr_probe_exclusions.json` and `ddr_probe_manifest.csv` (757 rows with an `in_probe_set` flag; SHA-256 `2f3e4a40fa17e0af…`). The raw DDR files are not modified.
+- The other two points of §66 stand as stated limitations: the mirror's provenance, and the absence of patient identifiers (the split is image-level as far as can be shown).
+
+
+## 67. IDRiD batch 1 — cross-dataset evaluation of E1 and E2: result (run once 2026-10-07 14:13 UTC; read under the rules of §65)
+
+**Run.** `colab/notebooks/idrid_batch1_e1e2.ipynb`, commit `7773fcb`, batch protocol `656dde8932eb…`, parent protocol `f93c1237…`; Tesla T4, `mixed_float16`, TensorFlow 2.21.0, Keras 3.13.2. Output `experiments/IDRiDGrading/idrid_batch1_e1e2_656dde8932eb_2026-10-07_14-13-11/`. Lock written with no previous run and no rerun reason. Verified locally from the downloaded output: the six checkpoint hashes are the pinned ones; the three P tables in the output are byte-identical to the pinned tables of the earlier run; P was not run, Stage 3 / 4 were not run; the manifest has 103 images with `IDRiD_088`, `IDRiD_089`, `IDRiD_091` outside the primary set; the primary QWK of every E1 / E2 seed recomputes from the per-image tables.
+
+**Gates (official, same runtime and commit, no IDRiD image read): PASS.** All six models built in float16. Ten raw APTOS images: Stage 2 identical to the stored files (10 / 10), RGB frame difference 0. All 730 validation images against the stored tables: logits at most 0.0156 (tolerance 0.05), probabilities at most 0.00023 (0.01), decoded grades identical, validation QWK reproduced exactly for all six.
+
+**Disclosures (as fixed in §65).** IDRiD had been used once before for the earlier pipeline; E1 and E2 were never evaluated, tuned or selected on it; Stage 4, E1's teacher, was trained on IDRiD's camera domain, an indirect exposure P does not share; P's predictions are those of the earlier run (TensorFlow 2.20.0); APTOS validation was every model's selection set. This is a cross-dataset evaluation of models fixed beforehand, not an untouched project-level test.
+
+### Primary result — 100 images (grades 34 / 5 / 29 / 19 / 13)
+
+| mean ± SD over seeds 42, 123, 2026 | P (stored) | E1 | E2 |
+|---|---|---|---|
+| QWK | 0.6418 ± 0.0904 | 0.5757 ± 0.0326 | 0.6460 ± 0.0611 |
+| per seed | 0.5379 / 0.7022 / 0.6852 | 0.6079 / 0.5765 / 0.5426 | 0.5974 / 0.7146 / 0.6260 |
+| AUROC ≥1 | 0.8876 | 0.8518 | 0.8955 |
+| AUROC ≥2 | 0.8952 | 0.8693 | 0.9016 |
+| AUROC ≥3 | 0.8929 | 0.9121 | 0.9159 |
+| AUROC ≥4 | 0.8612 | 0.9290 | 0.9181 |
+| recall, grade 0 | 0.510 | 0.294 | 0.402 |
+| recall, grade 1 | 0.333 | 0.533 | 0.400 |
+| recall, grade 2 | 0.724 | 0.655 | 0.690 |
+| recall, grade 3 | 0.298 | 0.228 | 0.316 |
+| recall, grade 4 | 0.205 | 0.256 | 0.154 |
+| false-urgent rate | 0.0049 | 0.0000 | 0.0098 |
+| 95 % interval of the seed-mean QWK | 0.532 to 0.732 | 0.450 to 0.679 | 0.554 to 0.726 |
+
+| paired, same images and seed (95 % interval of the seed mean) | Δ QWK | per seed | Δ mean AUROC, four cuts | Δ AUROC ≥1 / ≥2 / ≥3 / ≥4 (per-seed sign) |
+|---|---|---|---|---|
+| **E1 − P** (primary) | **−0.0661 (−0.1441 to −0.0048)** | +0.070 / −0.126 / −0.143 | +0.0063 (−0.0118 to +0.0247) | −0.036 (−, +, −) / −0.026 (−, −, −) / +0.019 (+, −, −) / +0.068 (+, +, +) |
+| **E2 − P** (primary) | +0.0042 (−0.0450 to +0.0537) | +0.060 / +0.012 / −0.059 | **+0.0236 (+0.0080 to +0.0410)** | +0.008 (+, +, −) / +0.006 (+, +, −) / +0.023 (+, −, −) / +0.057 (+, +, +) |
+| E2 − E1 (secondary, descriptive) | +0.0703 (+0.0126 to +0.1367) | −0.010 / +0.138 / +0.083 | +0.0172 (−0.0002 to +0.0361) | +0.044 (+, +, +) / +0.032 (+, +, +) / +0.004 / −0.011 |
+
+Decoded grades differ from P in 19 / 33 / 26 images (E1) and 23 / 31 / 21 (E2) of 100. Confusion matrices and per-image tables are in the output folder.
+
+### Sensitivity analysis only — 103 images
+
+E1 − P QWK −0.0648 (−0.1440 to −0.0016); E2 − P +0.0073 (−0.0439 to +0.0569); E2 − E1 +0.0721 (+0.0117 to +0.1359). The same picture; it does not replace the primary result.
+
+### Reading (rules of §65)
+
+- **E1 versus P — outcome C on decoded grades: E1 is lower.** Δ QWK −0.066 with an interval below zero. It is not consistent across seeds (E1 is higher in seed 42, where P is at its weakest, and lower in the other two), and the interval's upper end is −0.005; the interval resamples images and does not include seed-to-seed variation, which is large here (P's SD 0.09). **Ranking is comparable:** Δ mean AUROC +0.006, interval spanning zero.
+- **Where E1 loses.** At the low end: grade-0 recall falls from 0.51 to 0.29 (seeds 123 and 2026 call 22 and 16 of 34 grade-0 images grade 1), and AUROC ≥1 and ≥2 are lower (≥2 in all three seeds). At the high end E1's ranking is higher (AUROC ≥4 +0.068, positive in 3 / 3 seeds). So E1 on IDRiD over-calls mild disease in healthy eyes and separates grade 4 better; with quadratic weighting and 34 grade-0 images, the first dominates QWK.
+- **E2 versus P: comparable in decoded grades, higher in ranking.** Δ QWK +0.004 (interval spanning zero); Δ mean AUROC +0.024 with an interval above zero.
+- **E2 versus E1 — outcome E, in the direction that does not favour alignment.** Descriptively E2's QWK is higher than E1's (+0.070, interval above zero), and its AUROC ≥1 and ≥2 are higher in all three seeds. The shuffled-target control transferred to IDRiD at least as well as the aligned model. **The representation change shown on APTOS (§63.2, §63.4) did not carry over to an external grading advantage; on this set aligned supervision coincides with worse decoded grading.**
+- **The higher grade-4 ranking is not specific to alignment.** AUROC ≥4 rises against P in both E1 (+0.068) and E2 (+0.057), in all three seeds each, so it cannot be attributed to image-aligned lesion supervision; it is common to both models trained with the auxiliary head and loss (or to chance in 13 grade-4 images).
+- **The teacher-domain exposure does not explain this result away.** It could only have favoured E1 on IDRiD, and E1 is the lower model.
+- As in §61, decoded grades are poor for every model (grade-0 recall 0.29–0.51, grade-4 recall 0.15–0.26) while per-cut AUROC stays at 0.85–0.93: the fixed 0.5 decision points do not transfer; nothing is re-thresholded.
+
+### What can and cannot be claimed
+
+- Can: on this external set, with models fixed beforehand, E1's decoded grading was lower than P's and its ranking comparable; the shuffled control was comparable to P in decoded grading and higher in ranking; E1's better lesion readability did not produce better external grading.
+- Cannot: that aligned supervision harms generalisation in general (100 images, three seeds, inconsistent sign across seeds, one camera domain); that E2 is better than P (no decoded-grade difference; the ranking difference is one metric on one set); any equivalence or non-inferiority statement; anything about untouched data.
+- Limits: 100 images; 34 grade-0 images drive the QWK difference; 19 grade-3 and 13 grade-4 (one image = 0.053 / 0.077 of recall); P's predictions from another runtime; three seeds.
+
+**Closed.** IDRiD batch 1 has been used. It is not rerun, and nothing about P, E1, E2 or the approved plan is changed on the basis of this result. Batch 2 (EP models) remains the only other declared use of this test set.

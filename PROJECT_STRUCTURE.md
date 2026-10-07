@@ -1,5 +1,13 @@
 # Project Structure
 
+> **Status note (2026-10-08).** The stage descriptions below document the original Stage 5–8 design, which was
+> implemented, trained and closed. Modules added since then live at the repository root: `pl_convnext.py` (P / PL),
+> `stage4_v2*.py`, `stage34_cache_v2.py`, `pipeline_v2_config.py` (Stage 4 v2 and its caches), `arch1_*.py`
+> (Architecture 1), `pathology_grader_*.py` (pathology grader and fusions), `idrid_grading_eval.py` +
+> `idrid_grading_protocol.json` (locked IDRiD evaluation), `e1_model.py`, `e1_data.py`, `e1_train.py`, `e1_gates.py`,
+> `e1_probe.py` (E1 and its mechanism probe) and `e2_control.py` (shuffled-target control). Results are mirrored
+> locally under the git-ignored `results/`. Current state and plan: `PROJECT_CODE.md` → "Current Project State and Plan".
+
 Master architectural reference for this repository. `PROJECT_CODE.md` defines the target
 architecture and development rules; `IMPLEMENTATION_PLAN.md` tracks the gap between the baseline
 and that target; this document describes **where everything actually lives** and **how the

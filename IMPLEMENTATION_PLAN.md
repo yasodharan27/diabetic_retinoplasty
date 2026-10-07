@@ -1,5 +1,11 @@
 # Implementation Plan — Diabetic Retinopathy Detection
 
+> **Status note (2026-10-08).** This plan describes the original build order and is kept as history. Stages 1–4 are
+> complete (Stage 4 as v2, SE-ResNet-101 U-Net); Stages 5–8 and RACAF were implemented and trained as planned, and
+> the RACAF comparison closed without a supported benefit. The graders in use (P, E1, E2), all results and the
+> approved next phase are in `PROJECT_CODE.md` → "Current Project State and Plan" and in the research record
+> `docs/experiments/RACAF_Gate_Initialization_And_C1_Control.md`. Steps 9–11 below have not been started.
+
 This document compares the current baseline repository against the target architecture defined in `PROJECT_CODE.md` and lays out a module-by-module roadmap to close the gap. Sections describing the pre-refactor baseline (§1) are historical and unaffected by the architecture freeze; sections describing the target architecture (§2 onward) reflect the frozen design in `PROJECT_CODE.md` / `SEGMENTATION_ARCHITECTURE.md` / `PROJECT_STRUCTURE.md`.
 
 ---

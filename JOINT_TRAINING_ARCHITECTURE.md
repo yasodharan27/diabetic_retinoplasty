@@ -1,5 +1,9 @@
 # Joint Training Architecture — Stages 5–8 + RACAF
 
+> **Status note (2026-10-08).** The joint Stage 5–8 (+ RACAF) training described here was run (six matched runs,
+> validation QWK about 0.83) and that line is closed. The current graders are P, E1 and E2 (`pl_convnext.py`,
+> `e1_*.py`, `e2_control.py`); see `PROJECT_CODE.md` → "Current Project State and Plan".
+
 **Status:** Authoritative design document for the joint Stage 05–08 + RACAF training run.
 **Design, infrastructure, joint dataset loader, and joint model builder are implemented and
 unit-tested** (`joint_training_dataset.py`, `joint_training_model.py`,

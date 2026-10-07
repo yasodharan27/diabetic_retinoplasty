@@ -42,6 +42,14 @@ A hybrid deep learning framework for automated diabetic retinopathy detection wi
 
 ## 🏛️ Repository Status & Target Architecture
 
+> **Status (updated 2026-10-08).** Stages 1–4 are built and frozen (Stage 4 as the v2 SE-ResNet-101 U-Net).
+> The original Stage 5–8 design below (multi-kernel CNN, Swin, cross-attention, RACAF) was implemented and
+> trained; RACAF closed without a supported benefit. The reference grader is now **P** (ImageNet ConvNeXt-Tiny +
+> CORN, RGB; APTOS validation QWK 0.917) and the current research model is **E1** (P + an auxiliary lesion head
+> trained on Stage-4 targets; QWK 0.918, comparable to P, with a demonstrated change in the representation).
+> The authoritative summary of results and the approved plan is `PROJECT_CODE.md`, section "Current Project State
+> and Plan"; the full evidence is `docs/experiments/RACAF_Gate_Initialization_And_C1_Control.md`.
+
 The target architecture is an 11-stage, end-to-end diabetic retinopathy pipeline -- full detail
 in `PROJECT_CODE.md` (rules and target design), `PROJECT_STRUCTURE.md` (master architectural
 reference: every folder's purpose, every stage's input/output/dataset/status, output locations,
@@ -51,7 +59,8 @@ including tensor contracts). This section is a summary; those documents are auth
 ### Master Pipeline
 
 This is the repository's single, canonical end-to-end architecture diagram — every other document
-references this one rather than repeating a diverging copy.
+references this one rather than repeating a diverging copy. It shows the **original design**; the pipeline as
+built is given directly after it.
 
 ```
  [1] Image Quality Assessment  --(Good/Usable only)-->  [2] Image Preprocessing
@@ -86,14 +95,33 @@ references this one rather than repeating a diverging copy.
 
 Every stage depends only on the stage(s) immediately before it — no stage bypasses another. See `PROJECT_STRUCTURE.md`'s "Stage Dependencies" section for the explicit dependency chain.
 
+**Pipeline as built (2026-10-08):**
+
+```
+ [1] IQA (EfficientNetB0, frozen; not in the grading graph)
+ [2] Preprocessing: gamma + CLAHE, once, native size  -->  full-frame resize to 512 x 512 RGB
+        |                                   |
+        |                                   +--> [3] LWNet vessel map (frozen)      } teachers / inputs of the
+        |                                   +--> [4] Stage-4 v2 lesion maps (frozen) } segmentation-based models
+        v
+ Graders (CORN ordinal decoding):
+   P   ConvNeXt-Tiny on RGB                                              reference baseline
+   E1  P + 1x1 lesion head on the final feature map, Stage-4 targets     current research model
+   E2  E1 with shuffled lesion targets                                   control
+   (earlier lines, completed: original Stage 5-8 +/- RACAF, PL, Architecture 1, pathology grader, fixed fusions)
+ [9]-[11] uncertainty, explainability, final evaluation: not started for the current models
+```
+
 ### Dataset Summary
 
 | Dataset | Used by | Status |
 |---|---|---|
 | **EyeQ** | Stage 1 (Image Quality Assessment) — used only for Stage 1 | Local copy present, verified (`colab/common/verify_dataset.py`) |
-| **APTOS 2019** | Stage 8 (CORN Classification); also the pre-refactor baseline below | Local copy present |
-| **IDRiD** | Stage 4 (Lesion Segmentation) and downstream grading tasks | Local copy present, not yet consumed by any implemented stage |
-| **EyePACS** | Historical only | Used once, outside this repository, to reconstruct EyeQ. Not present under `datasets/`; not required to run anything here. |
+| **APTOS 2019** | All grading models (fixed split 2,921 / 730); also the pre-refactor baseline below | Local copy present |
+| **IDRiD** | Segmentation set: Stage 4 training and its one-time test gate. Grading test set: evaluation only | Local copy present. Grading test used once (frozen pipeline); two further pre-declared batches allowed |
+| **TJDR** | Stage 4 v2 training only | Local copy present, verified |
+| **EyePACS** | Reconstruction of EyeQ; approved 2026-10-08 as a controlled factor for grading (supervised adaptation, held-out labelled test subset) | Local copy present under `datasets/EyePACS`; not yet preprocessed or used for grading |
+| **DDR** | Planned ground-truth for the lesion probe (757 expert-annotated images) | Approved, not yet downloaded |
 
 Stage 3 (Vessel Segmentation) needs no project dataset: it integrates a pretrained, externally-sourced model (LWNet) for inference only, not trained within this project. DRIVE and CHASE_DB1 were approved under an earlier, since-superseded design that trained Vessel Segmentation within this project; neither is a project dataset today. See `PROJECT_STRUCTURE.md`'s Dataset Organization for current usage per dataset, and `SEGMENTATION_ARCHITECTURE.md`'s design-history appendix for why this reversal happened.
 
@@ -149,9 +177,11 @@ same folder. See `colab/README.md`'s "How experiments are organized".
 | Stage | Status |
 |---|---|
 | 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end in Google Colab; see Stage 1 Baseline Results below. |
-| 2. Image Preprocessing | **Frozen, implementation-ready.** RGB → Gamma Correction → CLAHE only (`image_preprocessing.py`); no green-channel extraction, Ben Graham, median denoising, resizing, or augmentation. Not yet wired into a Colab notebook. |
-| 3. Vessel Segmentation | **Design finalized, not yet implemented.** Pretrained LWNet, inference only — not trained within this project. See `SEGMENTATION_ARCHITECTURE.md`. |
-| 4-11 | Not implemented (design for 3-4 exists in `SEGMENTATION_ARCHITECTURE.md`; template notebooks exist under `colab/notebooks/`) |
+| 2. Image Preprocessing | **Complete, frozen.** RGB → Gamma Correction → CLAHE only (`image_preprocessing.py`); applied once per dataset. |
+| 3. Vessel Segmentation | **Complete, frozen.** Pretrained LWNet, inference only. |
+| 4. Lesion Segmentation | **Complete, frozen (v2).** SE-ResNet-101 U-Net for MA / HE / EX / SE, trained on IDRiD + TJDR; one-time IDRiD gate passed. The earlier Attention U-Net is superseded. |
+| 5–8. Grading | **Original design implemented, trained and closed** (RACAF not supported). **Current graders:** P (QWK 0.917), E1 (0.918), E2 control (0.914) on APTOS validation; frozen dual-branch pipeline evaluated once on IDRiD (QWK 0.629; P 0.642). |
+| 9–11. Uncertainty, explainability, evaluation | Not started for the current models. |
 
 ### Stage 1 Baseline Results
 
@@ -176,8 +206,11 @@ are claimed as part of this baseline.
 
 ### Future Roadmap
 
-Implement Stages 2-11 one at a time, per `PROJECT_CODE.md`'s "one module at a time, wait for
-approval" rule -- see `IMPLEMENTATION_PLAN.md` for the detailed gap analysis driving this order.
+The approved next phase (2026-10-08), in order: IDRiD batch 1 (E1 and E2 on the locked protocol); DDR
+download and a ground-truth lesion probe on P / E1 / E2; one supervised EyePACS adaptation run; P-EP and E1-EP on
+APTOS; a conditional shuffled control; one-shot evaluations of the adapted models. Details and rules are in
+`PROJECT_CODE.md` ("Current Project State and Plan") and research record §65. `IMPLEMENTATION_PLAN.md` describes
+the original build order and is kept as history.
 
 ---
 
