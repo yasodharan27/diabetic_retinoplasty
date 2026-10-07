@@ -1,0 +1,75 @@
+{
+ "name": "IDRiD batch 1 -- cross-dataset evaluation of the frozen E1 and E2 graders (P reused from the earlier run)",
+ "prepared": "2026-10-08",
+ "research_record_section": "§65",
+ "parent_protocol": {
+  "file": "idrid_grading_protocol.json",
+  "sha256": "f93c1237eb81ab20397dea8bc6d9079871d6308578304f793dfabee17938587e",
+  "note": "the dataset (image-set and label-file hashes, the three primary exclusions), Stage-2 preprocessing, the 512 RGB frame, the inference settings, the decoding rule, the bootstrap and the parity tolerances are the parent protocol's, unchanged"
+ },
+ "seeds": [42, 123, 2026],
+ "models": {
+  "p": "ImageNet ConvNeXt-Tiny + CORN, RGB. NOT run: the per-image tables stored by the earlier one-time run are reused",
+  "e1": "P's grading path + 1x1 lesion head trained on aligned Stage-4 targets (e1_model). Only the grading output is read",
+  "e2": "E1 trained with shuffled lesion targets (e2_control). Same model definition. Only the grading output is read"
+ },
+ "checkpoints": {
+  "e1_seed42": {"path": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed42/checkpoints/best_a/model.weights.h5", "sha256": "a6101cf44629384335d767fff8c3f6270d349a676be8b07059c332cdd3bca971", "run_dir": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed42", "best_slot": "best_a", "best_epoch_index": 23},
+  "e1_seed123": {"path": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed123/checkpoints/best_a/model.weights.h5", "sha256": "0667b16c9faf95e3f942f171134c5cd14128467b1cb314df96e34e0dba1ac7fc", "run_dir": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed123", "best_slot": "best_a", "best_epoch_index": 8},
+  "e1_seed2026": {"path": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed2026/checkpoints/best_a/model.weights.h5", "sha256": "840aa468458362463f008fecf4337d14089d06aba2b05011f2d28c4934f0d95f", "run_dir": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed2026", "best_slot": "best_a", "best_epoch_index": 19},
+  "e2_seed42": {"path": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed42/checkpoints/best_b/model.weights.h5", "sha256": "540ef5a1a528293d792eedafcf774acb11971c57541591f4cde8c954898b640e", "run_dir": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed42", "best_slot": "best_b", "best_epoch_index": 13},
+  "e2_seed123": {"path": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed123/checkpoints/best_a/model.weights.h5", "sha256": "967429ce04d1654d1b4a40cb3292c19ddf92415d6e1878edc84003cdd90d3f9e", "run_dir": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed123", "best_slot": "best_a", "best_epoch_index": 8},
+  "e2_seed2026": {"path": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed2026/checkpoints/best_b/model.weights.h5", "sha256": "291dbfcd5aadffdd7869f132716ce986abb097c6db3e461cfd3d7d48342e4e3b", "run_dir": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed2026", "best_slot": "best_b", "best_epoch_index": 8}
+ },
+ "stored_p_tables": {
+  "source_run": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16",
+  "p_seed42": {"path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed42.csv", "sha256": "579d4079d1df8912c800d0c0ea25a4021d2230bf71c8da54511a956ce5b47822"},
+  "p_seed123": {"path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed123.csv", "sha256": "070f15898b6694f03d1b4dd0574ae3001fbd5d7d0276b460e6f4a79855ac4aa9"},
+  "p_seed2026": {"path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed2026.csv", "sha256": "cedd6563278e164c425091f0f08e5d449faef065c34c1d850b29d2cea6cc99b0"},
+  "note": "made at commit 6a88636 under TensorFlow 2.20.0 / Keras 3.13.2; float16 differences of about one logit step are possible between runtimes"
+ },
+ "stored_validation_tables": {
+  "e1": "experiments/E1MultiTask/e1_cb5fc7a8d370_seed{seed}/metrics/per_sample_best.csv",
+  "e2": "experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed{seed}/metrics/per_sample_best.csv"
+ },
+ "pipeline": {
+  "stage2": "stage4_v2_data.stage2_rgb: DR profile, once, native size",
+  "rgb_frame": "stage4_v2_aptos_cache.recompute_rgb_512: full-frame direct resize to 512x512 (no crop), float32 [0,1]",
+  "stage3": "not run (E1 and E2 take RGB only)",
+  "stage4": "not run (E1 and E2 take RGB only); no Stage-3 or Stage-4 cache is read",
+  "model": "e1_model.build_e1_model under mixed_float16; BEST weights; output 0 (CORN logits)",
+  "decode": "cumulative p_k = cumprod(sigmoid(logits)); grade = number of k with p_k > 0.5"
+ },
+ "parity": {
+  "raw_subset": "the first two images of every grade in the authoritative 730-image validation order (10 images), from the RAW files: Stage 2 exact against the stored Stage-2 file, RGB frame within rgb_max_abs of the cache",
+  "full_validation": "all 730 validation images from the cached RGB frames against each model's stored BEST validation table, authoritative order",
+  "tolerances": "parent protocol: rgb_max_abs 1e-06, logit_max_abs 0.05, probability_max_abs 0.01, grades identical"
+ },
+ "comparisons": {
+  "primary": ["e1_minus_p", "e2_minus_p"],
+  "secondary_descriptive": ["e2_minus_e1"],
+  "note": "paired on the same images and the same seed; E2 - E1 is descriptive and is not a primary hypothesis"
+ },
+ "analysis_sets": {
+  "primary": "100 images (103 minus IDRiD_088, IDRiD_089, IDRiD_091)",
+  "sensitivity": "all 103 images, computed after the primary result and labelled as sensitivity"
+ },
+ "disclosures": [
+  "IDRiD's grading test set was used once before (research record §61) to evaluate an earlier frozen pipeline and its P reference.",
+  "The E1 and E2 checkpoints were never evaluated on IDRiD before this run and were not tuned, selected or modified using IDRiD.",
+  "This is therefore a cross-dataset evaluation of models fixed beforehand, on a dataset the project had already used once -- not an untouched project-level test.",
+  "Stage 4, which supplied the lesion targets of E1 (and, shuffled, of E2), was trained on IDRiD segmentation images and so on IDRiD's camera domain. E1 and E2 never saw an IDRiD image, but this indirect exposure is not shared by P and is a limitation.",
+  "The three test images that are copies of Stage-4 training images are excluded from the primary analysis.",
+  "P's predictions are those stored by the earlier run (another TensorFlow version); P was not run again.",
+  "APTOS validation was the checkpoint-selection set of every model here.",
+  "No non-inferiority or equivalence margin was pre-specified; none is tested or claimed."
+ ],
+ "rules": [
+  "evaluation only", "no tuning", "no threshold changes", "no preprocessing changes", "no retraining",
+  "no checkpoint or seed selection", "no change to decoding", "no repeated runs for better numbers",
+  "a rerun only for a technical failure, with the reason recorded",
+  "nothing about P, E1, E2 or any later experiment is changed on the basis of this result"
+ ],
+ "confirmation_token": "RUN_IDRID_BATCH_1_E1_E2_ONCE",
+ "outputs": "experiments/IDRiDGrading/idrid_batch1_e1e2_<protocol sha12>_<UTC time>/"
+}

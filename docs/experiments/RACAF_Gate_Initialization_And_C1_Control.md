@@ -4239,3 +4239,156 @@ Intervals: paired bootstrap, 2,000 grade-stratified image resamples, seed 202609
 - *Grading.* E2's QWK / AUROC against same-seed P is reported descriptively; it is not used to choose anything.
 
 **Status.** Nothing trained. E3 is not run.
+
+
+### 63.4 E2 — shuffled-target control: result (runs finished 2026-10-07; read under §63.3; E1's grading conclusion unchanged)
+
+**Runs.** `experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed{42,123,2026}/`, commit `fe98715`; probe in `experiments/E2ShuffledTargets/mechanism_probe/`. Analysis: `results/E2ShuffledTargets/e2_analysis.json`. No IDRiD; nothing tuned; E3 not run.
+
+**Integrity (from the downloaded outputs).** One derangement in all three runs (seed 20261001, SHA-256 `9ecaa1a7…`, 2,921 images, 0 fixed points). Every protocol field of each E2 `config.json` equals E1's of the same seed (λ, prior, batch, learning rate, weight decay, epochs, patience, class weights, monitor, target definition, augmentation, bundle, Stage-4 model, split); the only recorded difference is the shuffled training targets; validation targets are recorded as aligned. Gates recorded as passed. Checkpoint monitor `val_QWK` in every BEST. The BEST tables hold the same 730 images in the same order as P and E1 and reproduce the stored QWK. Early stopping in all three: 26 / 21 / 21 epochs, BEST at epoch index 13 / 8 / 8. Probe encoders are the evaluated E2 models (grading logits reproduce the stored tables to one float16 step; weights hashes match).
+
+### The probe: P, E1 and E2 (validation cell AUROC, target ≥ 0.5; the same fresh probe, protocol, images and resamples as §63.2)
+
+| | | MA | HE | EX | SE | mean |
+|---|---|---|---|---|---|---|
+| seed 42 | P | 0.7954 | 0.9476 | 0.8685 | 0.9758 | 0.8968 |
+| | E1 | 0.9559 | 0.9865 | 0.9647 | 0.9956 | 0.9757 |
+| | E2 | 0.8090 | 0.9539 | 0.8742 | 0.9827 | 0.9050 |
+| seed 123 | P | 0.8206 | 0.9466 | 0.8824 | 0.9752 | 0.9062 |
+| | E1 | 0.9457 | 0.9830 | 0.9553 | 0.9939 | 0.9695 |
+| | E2 | 0.8574 | 0.9511 | 0.8847 | 0.9794 | 0.9181 |
+| seed 2026 | P | 0.8206 | 0.9580 | 0.8883 | 0.9805 | 0.9119 |
+| | E1 | 0.9541 | 0.9865 | 0.9647 | 0.9955 | 0.9752 |
+| | E2 | 0.8161 | 0.9564 | 0.8901 | 0.9851 | 0.9119 |
+
+| difference in mean AUROC (95 % paired bootstrap interval) | seed 42 | seed 123 | seed 2026 | three-seed mean |
+|---|---|---|---|---|
+| E1 − P (§63.2, recomputed identically) | +0.0789 (0.0757 to 0.0822) | +0.0633 (0.0604 to 0.0666) | +0.0633 (0.0606 to 0.0663) | +0.0685 (0.0659 to 0.0715) |
+| **E2 − P** | +0.0081 (0.0056 to 0.0106) | +0.0119 (0.0097 to 0.0141) | +0.0001 (−0.0018 to +0.0019) | **+0.0067 (0.0053 to 0.0082)** |
+| **E2 − E1** | −0.0707 (−0.0738 to −0.0676) | −0.0514 (−0.0541 to −0.0488) | −0.0633 (−0.0661 to −0.0606) | **−0.0618 (−0.0644 to −0.0594)** |
+
+Per class, three-seed mean: E2 − P = MA +0.015, HE +0.003, EX +0.003, SE +0.005; E2 − E1 = MA −0.124, HE −0.032, EX −0.079, SE −0.013. **E2 reproduces 9.8 % of E1's gain** ((E2 − P) / (E1 − P) = 0.0067 / 0.0685).
+
+**Probe behaviour.** E2's probes behave like P's, not like E1's: validation mean AUROC 0.867 → 0.905, 0.879 → 0.918, 0.878 → 0.912 over the five epochs, still rising in the last epoch (+0.005 / +0.007 / +0.009) with the loss still falling; training ≈ validation (no over-fit). So the E2 and P probes are under-trained to a similar degree and are compared on equal terms; E1's probes had converged by epoch 2–3. Mean absolute feature value 0.63–0.72 (P 1.4–1.8, E1 0.9–1.1).
+
+**E2's own trained lesion head, against the true targets (descriptive).** Mean cell AUROC 0.636 / 0.616 / 0.596, with MA below chance (0.38–0.46): trained on other images' maps it learned no image-specific lesion prediction, as intended.
+
+### Reading (§63.3 framework): **A — IMAGE-ALIGNED SUPERVISION REQUIRED**
+
+E1 shows the large probe improvement and E2 does not reproduce it: E2 − E1 is negative in 3 / 3 seeds with an interval far from zero, and E2 recovers about a tenth of the gain. The result is not intermediate. The representation change of §63.2 therefore depends on the lesion targets belonging to the image; an auxiliary spatial loss of the same form, with the same target distribution, optimiser and schedule, does not produce it.
+
+The small remainder (E2 − P = +0.0067, interval above zero, but +0.0001 in seed 2026) is consistent with the dataset-level prior that shuffled targets still carry (§63.3) or with ordinary differences between two trained models; it is not interpreted further.
+
+### Grading (descriptive only; not used to choose anything)
+
+| BEST, 730 validation images | seed 42 | seed 123 | seed 2026 | E2 mean ± SD | P mean | E1 mean |
+|---|---|---|---|---|---|---|
+| QWK, E2 (P) | 0.9139 (0.9184) | 0.9100 (0.9148) | 0.9180 (0.9176) | 0.9140 ± 0.0040 | 0.9170 | 0.9180 |
+| AUROC grade 4 vs 0–2 | 0.9550 (0.9588) | 0.9462 (0.9489) | 0.9550 (0.9410) | 0.9521 | 0.9496 | 0.9555 |
+| mean AUROC, four cuts | 0.9729 (0.9752) | 0.9701 (0.9678) | 0.9711 (0.9665) | 0.9713 | 0.9698 | 0.9719 |
+| grade-3 recall | 0.538 (0.615) | 0.718 (0.513) | 0.641 (0.513) | 0.632 | 0.547 | 0.530 |
+| grade-4 recall | 0.586 (0.672) | 0.483 (0.414) | 0.483 (0.638) | 0.517 | 0.575 | 0.575 |
+| false-urgent rate | 0.041 (0.038) | 0.081 (0.032) | 0.062 (0.036) | 0.061 | 0.035 | 0.038 |
+
+E2 − P, three-seed mean: QWK −0.0030 (−0.0114 to +0.0056); AUROC grade 4 vs 0–2 +0.0025 (−0.0064 to +0.0120); mean AUROC +0.0015 (−0.0030 to +0.0067). E2 − E1: QWK −0.0040 (−0.0125 to +0.0047). The QWK, AUROC and grade-3 tolerances of §54 hold against P in 3 / 3 seeds; the false-urgent tolerance (+0.02) is exceeded in seeds 123 (+0.049) and 2026 (+0.025). Ranking is unchanged; the decoded grades of E2 shift upward (more grade 0–2 images called 3 or above, more grade-3 recall, less grade-4 recall), i.e. a decision-threshold shift. Three seeds; the intervals of the QWK and AUROC differences include zero.
+
+### What the E1 line now establishes, and what it does not
+
+- Established: image-aligned supervision from the Stage-4 maps changes the grader's final feature map so that those maps become much more linearly readable (§63.2), and this needs the targets to belong to the image (this section). E1 does this at no measurable cost in grading (§63).
+- Not established: any grading benefit — E1 remains COMPARABLE to P. The changed representation did not grade better. "Lesion-relevant" means agreement with Stage 4, not with lesion ground truth.
+- Limits: APTOS validation only (the set used for checkpoint selection); three seeds; the probes of P and E2 are not converged at the pre-registered five epochs, so the sizes of the gaps to E1 are overstated; no external evaluation exists for E1 or E2.
+
+**Closed here.** E2 is complete. E3 is not run, no further experiment is launched and no architecture is proposed; the next step is the user's decision.
+
+
+## 64. EyePACS as a controlled factor — data inventory and APTOS overlap screen (2026-10-08; read-only; no decision, nothing trained)
+
+**Context.** After §63.4 the user asked for the next phase to be designed with supervised EyePACS adaptation treated as a controlled factor (P / P-EP / E1 / E1-EP, with E2-EP conditional), alongside an IDRiD evaluation of E1 / E2 and a ground-truth lesion probe. This section records only what was inspected; the design is not yet approved and `PROJECT_CODE.md` still excludes EyePACS from grading.
+
+**Inventory (local `datasets/EyePACS/raw`, `datasets/EyeQ/official_repo/data`).**
+- EyePACS train: 35,126 images with grades 0–4 = 25,810 / 2,443 / 5,292 / 873 / 708; 17,563 patients, every one with a left and a right eye. Test: 53,576 images; the Kaggle test labels are not on disk.
+- No Stage-2 output exists for EyePACS (`processed/` is empty).
+- EyeQ labels: 12,543 training images (quality good / usable / reject = 8,347 / 1,876 / 2,320; grades identical to `trainLabels.csv`) and 16,249 **test** images with both a quality label and a DR grade (grades 11,362 / 1,398 / 2,644 / 448 / 397; quality 8,471 / 4,558 / 3,220). The latter is a labelled EyePACS set disjoint from the training images.
+- Prior use in this project: EyePACS images were used once to reconstruct EyeQ for the Stage-1 quality model. Never used for grading, Stage 3 or Stage 4.
+
+**Overlap screen (label-free).** Every APTOS image (3,662 train, 1,928 unlabelled test) against the 35,126 EyePACS training images and the 16,249 EyeQ-labelled test images. Signature: fundus bounding-box crop, grey, 32 × 32, standardised; distance = L2 / 32. Output `results/EyePACS_APTOS_overlap/`.
+
+| nearest-neighbour distance | minimum | 0.1 % | 1 % | median |
+|---|---|---|---|---|
+| within APTOS train (calibration) | 0.000 | 0.000 | 0.000 | 0.213 |
+| APTOS train → EyePACS train | 0.098 | 0.106 | 0.119 | 0.294 |
+| APTOS train → EyePACS test (EyeQ) | 0.102 | 0.109 | 0.122 | 0.314 |
+| APTOS test → EyePACS train | 0.110 | 0.118 | 0.146 | 0.638 |
+| APTOS test → EyePACS test (EyeQ) | 0.116 | 0.120 | 0.151 | 0.663 |
+
+- Calibration: APTOS contains known duplicate photographs. Under this signature 270 APTOS training images have a nearest neighbour below 0.02 and **none** lies between 0.02 and 0.05; from 0.05 upward the neighbours are different eyes that merely look alike at 32 × 32. Duplicates therefore sit below 0.02.
+- No APTOS image has an EyePACS neighbour below 0.098. The three closest cross-dataset pairs were viewed: different eyes (different vessel patterns, colour and field).
+- 4 EyePACS training and 5 test images were unreadable or blank and were not screened.
+- **Reading.** No duplicate or near-duplicate between APTOS and the usable EyePACS images was found. The screen detects copies of a photograph (also resized or recompressed); it would not detect a different photograph of the same eye, and it cannot prove the two datasets share no patients. The sources are different (EyePACS: United States screening programme; APTOS: Aravind Eye Hospital, India).
+
+
+### 64.1 Overlap screen — calibration against byte-identical APTOS images (2026-10-08; read-only)
+
+The duplicate band of §64 was checked against file hashes. APTOS training holds 251 images in 123 byte-identical groups; all 251 have a nearest neighbour below 0.0015 under the signature. A further 19 images lie below 0.02 (0.0005 to 0.0092) without being byte-identical; the ten inspected are the same size as their neighbour with slightly different pixels (re-encoded copies). Nothing lies between 0.0092 and 0.0603. The signature therefore separates copies and re-encodings of a photograph (below 0.01) from different photographs (above 0.06), and the closest APTOS–EyePACS pair (0.098) is in the second group.
+
+Not tested: sensitivity to cropping, flipping or rotation of a copy, and photographs of the same eye taken at another time. The supported statement is "no copy or re-encoded copy of an APTOS image was found among the screened EyePACS images", not patient-level independence.
+
+
+## 65. IDRiD batch 1 — cross-dataset evaluation of E1 and E2: pre-run record (2026-10-08; written before any E1 / E2 prediction on IDRiD exists; nothing coded or run yet)
+
+**Decision context.** The design audit of 2026-10-08 ended in "proceed with modifications"; the approved sequence is: this record → IDRiD batch 1 (E1, E2) → DDR acquisition and ground-truth lesion probe → EyePACS adaptation → P-EP / E1-EP → conditional E2-EP → one-shot EP evaluations (labelled EyePACS test; IDRiD batch 2). Only the first two steps are in scope here. Nothing below may be changed after an IDRiD result for E1 or E2 has been seen.
+
+### What is evaluated
+
+| model | what it is | checkpoints (BEST by APTOS validation QWK; fixed before this record) |
+|---|---|---|
+| P | ImageNet ConvNeXt-Tiny + CORN, RGB | **not run again.** The per-image predictions stored by the one-time run of §61 are reused: `experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed{42,123,2026}.csv` (SHA-256 `579d4079…47822`, `070f1589…c4aa9`, `cedd6563…c99b0`) |
+| E1 | P's grading path + 1×1 lesion head, aligned Stage-4 targets (§62–§63) | seed 42 `best_a` epoch index 23, `a6101cf44629384335d767fff8c3f6270d349a676be8b07059c332cdd3bca971`; seed 123 `best_a` 8, `0667b16c9faf95e3f942f171134c5cd14128467b1cb314df96e34e0dba1ac7fc`; seed 2026 `best_a` 19, `840aa468458362463f008fecf4337d14089d06aba2b05011f2d28c4934f0d95f` |
+| E2 | E1 with shuffled training targets (§63.3–§63.4) | seed 42 `best_b` 13, `540ef5a1a528293d792eedafcf774acb11971c57541591f4cde8c954898b640e`; seed 123 `best_a` 8, `967429ce04d1654d1b4a40cb3292c19ddf92415d6e1878edc84003cdd90d3f9e`; seed 2026 `best_b` 8, `291dbfcd5aadffdd7869f132716ce986abb097c6db3e461cfd3d7d48342e4e3b` |
+
+Paths: `experiments/E1MultiTask/e1_cb5fc7a8d370_seed{N}/checkpoints/<slot>/model.weights.h5` and `experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed{N}/checkpoints/<slot>/model.weights.h5`. No retraining, no other checkpoint, no LAST. Only the grading output is used; the lesion head's output is not read.
+
+### Dataset (unchanged from §60)
+
+IDRiD, B. Disease Grading, Testing Set, raw JPG; image-set hash `879e0680…8d32c733`, label-file hash `ced1cb8f…bff8ff602` (verified at run time by `idrid_grading_eval.read_idrid`). **Primary set: 100 images** (grades 34 / 5 / 29 / 19 / 13) — `IDRiD_088`, `IDRiD_089`, `IDRiD_091` stay excluded as copies of Stage-4 training images. **Sensitivity set: all 103**, computed after the primary result and labelled as such.
+
+### Inference (the locked protocol of §60, the part E1 / E2 need)
+
+Raw image → `stage4_v2_data.stage2_rgb` (DR profile, once, native size) → `stage4_v2_aptos_cache.recompute_rgb_512` (full-frame direct resize to 512 × 512, no crop) → model under `mixed_float16` on a Tesla T4, batch 8 → CORN decode (cumulative p_k = cumprod sigmoid; grade = number of k with p_k > 0.5). E1 and E2 take RGB only, so **Stage 3 and Stage 4 are not run and no Stage-3 / Stage-4 cache is read** in this batch. No threshold, preprocessing, decoding or checkpoint choice is made on IDRiD.
+
+### Gates before any IDRiD image is read
+
+1. Six checkpoint files match the hashes above; the stored P tables match theirs.
+2. **APTOS parity for E1 and E2**, on the runtime that will run IDRiD: (a) the 10-image subset of §60 (first two images of every grade in the authoritative validation order) from the RAW files through Stage 2 and the 512 resize — Stage 2 exact against the stored Stage-2 file, RGB frame within 1e-6 of the cache; (b) all 730 validation images from the cached RGB frames — grading logits within 0.05, cumulative probabilities within 0.01 and decoded grades identical to each model's stored BEST validation table, images in the authoritative order. Tolerances are those of §60.
+3. The models are verified to be built in mixed precision (the policy is set after `clear_session`, §62.2).
+4. A confirmation token and a lock file written before any prediction; a second run is refused except for a technical failure with the reason recorded.
+
+A failed gate stops the run; no tolerance is loosened.
+
+### Reported
+
+Per seed and as mean ± SD over seeds 42 / 123 / 2026 (no ensemble, no seed selection), for P, E1 and E2: QWK; AUROC ≥1, ≥2, ≥3, ≥4; recall for grades 0–4; false-urgent rate; confusion matrices. Paired differences on the same images, same seed: **E1 − P**, **E2 − P**, and E2 − E1 (the last added so that outcomes "E2 behaves like / unlike E1" can be read from a paired quantity). Intervals: the project's 95 % grade-stratified bootstrap over the test images (2,000 resamples, seed 20260927) of the seed mean and of the seed-mean paired differences. Primary analysis on the 100 images; the 103-image analysis is the sensitivity analysis.
+
+### Reading rules (fixed now)
+
+- **A, E1 higher than P:** report magnitude and interval; no claim of general improvement; state the teacher-domain limitation.
+- **B, E1 comparable to P** (interval of E1 − P includes zero): consistent with the representation change not harming transfer; no grading advantage shown. Not "equivalent" and not "non-inferior" — no margin was pre-specified and none is tested.
+- **C, E1 lower than P:** reported as it is; the representation change does not carry over to external grading.
+- **D, E2 behaves like E1:** weakens the reading that image alignment matters for external grading. **E, E2 differs from E1:** reported as evidence on alignment outside APTOS, with its interval.
+- No seed, grade or metric is singled out. Expected resolution is low: 100 images, 19 grade-3 and 13 grade-4 (one image = 0.053 / 0.077 of recall), and P's seed-to-seed SD of QWK on this set was 0.09 (§61); small differences will not be distinguishable.
+- Nothing about E1, E2, P or any later experiment is changed on the basis of this result.
+
+### Disclosures that travel with the result
+
+1. **Prior use of the dataset.** IDRiD's grading test set was used once before (§61) to evaluate the earlier frozen dual-branch pipeline and its P reference. The E1 and E2 checkpoints have never been evaluated on it and were not tuned, selected or modified with it. This is a cross-dataset evaluation of models fixed beforehand, on a dataset the project had already used once — not an untouched project-level test.
+2. **Teacher-domain exposure.** Stage 4, which supplied the lesion targets of E1 (and, shuffled, of E2), was trained on IDRiD segmentation images and so on IDRiD's camera domain. E1 never saw an IDRiD image, but its targets carry knowledge fitted to that domain; this indirect exposure could favour E1 over P on IDRiD and is not shared equally by P. It is a limitation of this evaluation, not a detail.
+3. **P's predictions come from the earlier run** (TensorFlow 2.20.0, Keras 3.13.2, commit `6a88636`); E1 and E2 will be run on the current Colab runtime (TensorFlow 2.21.0 at the last sessions). Same checkpoints, same protocol; float16 differences of the order of one logit step are possible between runtimes (§62.2 measured 0.0078 on APTOS).
+4. APTOS validation was the checkpoint-selection set for every model here.
+
+### Implementation plan (not yet written)
+
+A new evaluator module and lock file for this batch, reusing `idrid_grading_eval` (dataset reader and hash checks, environment record, parity subset), `arch1_posthoc` (metrics, bootstrap, paired differences), `e1_model` / `e1_probe.e1_best_weights` (model and checkpoint identity) and the existing table schema. The earlier evaluator and its lock are not modified; the earlier output directory is not written to. Output: `experiments/IDRiDGrading/idrid_batch1_e1e2_<protocol sha12>_<UTC time>/` with the lock record, hashes, image manifest, per-image tables for E1 and E2, a copy of the P tables with their hashes, primary and sensitivity metrics, paired results, intervals, confusion matrices and the environment.
+
+**IDRiD batch 2** (P-EP, E1-EP and, if run, E2-EP) is declared now as the only other planned use of this test set, under the same protocol and with its own lock; nothing in batch 1 depends on it.
+
+**Status.** Pre-run record complete. No code written, no inference run. Awaiting the user's approval to implement and execute.
