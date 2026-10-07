@@ -20,6 +20,10 @@ preprocessed:
 
 The split manifest is written once and is immutable: `write_split` refuses to overwrite a different one.
 
+The held-out test set (record §69.2) is a second, separate set with its own immutable manifest and its own
+cache: the Kaggle EyePACS TEST images that carry a DR grade in the EyeQ repository's label file. Only the image
+name and the grade are read from that file -- never its quality column. It is evaluation-only.
+
 Declared deviation from P's APTOS cache: frames are stored as float16, not float32 (largest rounding error
 measured 0.00024; about 55 GB instead of 110 GB). Under mixed_float16 the model computes in float16 anyway.
 """
@@ -45,6 +49,14 @@ MANIFEST_FIELDS = ("image", "patient", "eye", "grade", "patient_max_grade", "spl
 FRAME_SIZE = 512
 FRAME_DTYPE = "float16"
 SHARD_SIZE = 1000
+SPLITS = ("train", "val", "test")
+#: Held-out labelled EyePACS test set (record §69.2): evaluation only, never selection.
+TEST_LABELS_SHA256 = "5e3a80415311b9513a957da351bb04b16b9ef661db6ef2161794d5b7da6aaaae"   # EyeQ repo, Label_EyeQ_test.csv
+TEST_MANIFEST_NAME = "eyepacs_heldout_test_v1.csv"
+TEST_SUMMARY_NAME = "eyepacs_heldout_test_v1.json"
+TEST_MANIFEST_SHA256 = "84a344ab1c780899170def378b0efbc021ae642005ba585512a772b2268b7e6d"
+EXPECTED_TEST_IMAGES = 16249
+EXPECTED_TEST_GRADE_COUNTS = (11362, 1398, 2644, 448, 397)
 CACHE_VERSION = "eyepacs-frames-v1: stage4_v2_data.stage2_rgb -> stage4_v2_aptos_cache.recompute_rgb_512 -> float16"
 
 
@@ -192,6 +204,88 @@ def class_weights(rows):
     return counts.tolist(), [float(w) for w in weighted_corn.class_weights_from_counts(counts)]
 
 
+# --------------------------------------------------------------------------- held-out test set (labels only)
+
+def read_test_labels(labels_csv, test_dir=None):
+    """Rows {image, patient, eye, grade, patient_max_grade, split='test'} for the EyePACS test images that have a
+    DR grade in the EyeQ label file. The file must be the pinned one. Its `quality` column is not read: nothing
+    is filtered or weighted by quality, and no image is excluded. With `test_dir`, every image must exist."""
+    if sha256_file(labels_csv) != TEST_LABELS_SHA256:
+        raise RuntimeError("the EyePACS test label file is not the pinned Label_EyeQ_test.csv")
+    rows = []
+    with open(labels_csv, newline="") as fh:
+        for r in csv.DictReader(fh):
+            patient, eye = parse_name(r["image"])
+            grade = int(r["DR_grade"])
+            if grade not in range(5):
+                raise ValueError(f"{r['image']}: grade {grade}")
+            rows.append({"image": r["image"], "patient": patient, "eye": eye, "grade": grade, "split": "test"})
+    if len({r["image"] for r in rows}) != len(rows):
+        raise ValueError("repeated image names in the test label file")
+    counts = tuple(np.bincount([r["grade"] for r in rows], minlength=5).tolist())
+    if len(rows) != EXPECTED_TEST_IMAGES or counts != EXPECTED_TEST_GRADE_COUNTS:
+        raise RuntimeError(f"test set is {len(rows)} images with grades {counts}, not the recorded set")
+    best = {}
+    for r in rows:
+        best[r["patient"]] = max(best.get(r["patient"], 0), r["grade"])
+    rows = [dict(r, patient_max_grade=best[r["patient"]]) for r in rows]
+    if test_dir is not None:
+        files = set(os.listdir(test_dir))
+        missing = sorted(r["image"] for r in rows if r["image"] not in files)
+        if missing:
+            raise ValueError(f"{len(missing)} test images have no file (first {missing[:3]})")
+    return rows
+
+
+def assert_disjoint_patients(test_rows, adaptation_rows):
+    """No patient of the held-out test set may be in the adaptation data (training or validation)."""
+    shared = {r["patient"] for r in test_rows} & {r["patient"] for r in adaptation_rows}
+    if shared:
+        raise RuntimeError(f"{len(shared)} patients are in both the adaptation data and the held-out test set")
+    return True
+
+
+def write_test_manifest(rows, out_dir):
+    """Writes the held-out test manifest and its summary ONCE (immutable, like the split manifest)."""
+    if any(r["split"] != "test" for r in rows):
+        raise ValueError("the held-out manifest holds test rows only")
+    os.makedirs(out_dir, exist_ok=True)
+    path, tmp = os.path.join(out_dir, TEST_MANIFEST_NAME), os.path.join(out_dir, TEST_MANIFEST_NAME + ".tmp")
+    with open(tmp, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=MANIFEST_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(sorted(rows, key=lambda r: (int(r["patient"]), r["eye"])))
+    sha = sha256_file(tmp)
+    if os.path.exists(path):
+        if sha256_file(path) != sha:
+            os.remove(tmp)
+            raise RuntimeError(f"{path} exists and differs: the held-out test manifest is immutable")
+        os.remove(tmp)
+    else:
+        os.replace(tmp, path)
+    summary = {"manifest": TEST_MANIFEST_NAME, "manifest_sha256": sha, "images": len(rows),
+               "patients": len({r["patient"] for r in rows}),
+               "grade_counts": np.bincount([r["grade"] for r in rows], minlength=5).tolist(),
+               "label_file": "EyeQ repository data/Label_EyeQ_test.csv (columns image, DR_grade only)",
+               "label_file_sha256": TEST_LABELS_SHA256, "excluded": [],
+               "quality_filter": "none (the quality column is not read)",
+               "role": "held-out evaluation of the frozen adaptation model; never selection"}
+    with open(os.path.join(out_dir, TEST_SUMMARY_NAME), "w") as fh:
+        json.dump(summary, fh, indent=1)
+    return path, summary
+
+
+def read_test_manifest(out_dir, expected_sha256=None):
+    path = os.path.join(out_dir, TEST_MANIFEST_NAME)
+    if expected_sha256 is not None and sha256_file(path) != expected_sha256:
+        raise RuntimeError("the held-out EyePACS test manifest is not the pinned manifest")
+    with open(path, newline="") as fh:
+        rows = [dict(r, grade=int(r["grade"]), patient_max_grade=int(r["patient_max_grade"])) for r in csv.DictReader(fh)]
+    if any(r["split"] != "test" for r in rows):
+        raise RuntimeError("the held-out manifest holds a row that is not a test row")
+    return rows
+
+
 # --------------------------------------------------------------------------- frames (P's image path)
 
 def frame_from_raw(raw_path):
@@ -223,12 +317,34 @@ def _frame_and_source_hash(path):
 
 
 def shard_plan(rows, shard_size=SHARD_SIZE):
-    """{split: [[image, ...] per shard]} in manifest order (patient id, eye)."""
+    """{split: [[image, ...] per shard]} in manifest order (patient id, eye), for the splits present in `rows`."""
+    unknown = {r["split"] for r in rows} - set(SPLITS)
+    if unknown:
+        raise ValueError(f"unknown splits {sorted(unknown)}")
     plan = {}
-    for split in ("train", "val"):
+    for split in SPLITS:
         names = [r["image"] for r in sorted(rows, key=lambda r: (int(r["patient"]), r["eye"])) if r["split"] == split]
-        plan[split] = [names[i:i + shard_size] for i in range(0, len(names), shard_size)]
+        if names:
+            plan[split] = [names[i:i + shard_size] for i in range(0, len(names), shard_size)]
     return plan
+
+
+def verify_sources(cache_dir, image_dir, log=None):
+    """Re-hashes every source image a cache was built from and compares with the hashes recorded per shard.
+    Raises on the first image that is missing or differs (the cache then no longer describes those files)."""
+    with open(os.path.join(cache_dir, "index.json")) as fh:
+        shards = json.load(fh)["shards"]
+    checked = 0
+    for name in sorted(shards):
+        entry = shards[name]
+        for image, recorded in zip(entry["images"], entry["source_sha256"]):
+            path = os.path.join(image_dir, image)
+            if not os.path.exists(path) or sha256_file(path) != recorded:
+                raise RuntimeError(f"{image}: the source image is missing or differs from the one the cache was built from")
+            checked += 1
+        if log:
+            log(f"  sources of {name} match")
+    return checked
 
 
 def build_cache(rows, train_dir, cache_dir, manifest_sha256, workers=4, shard_size=SHARD_SIZE, limit_shards=None, log=print):
@@ -301,7 +417,7 @@ def verify_cache(cache_dir, rows, manifest_sha256, shard_size=SHARD_SIZE, check_
     missing = sorted(set(expected) - set(index["shards"]))
     if extra or missing:
         raise RuntimeError(f"{cache_dir}: {len(missing)} shards missing (first {missing[:3]}), {len(extra)} unexpected (first {extra[:3]})")
-    frames = {"train": 0, "val": 0}
+    frames = {split: 0 for split in plan}
     total = 0
     for n, (name, (split, names)) in enumerate(sorted(expected.items())):
         entry = index["shards"][name]
@@ -333,7 +449,7 @@ class FrameCache:
         self.manifest_sha256 = manifest_sha256
         index, self.report = verify_cache(cache_dir, rows, manifest_sha256, shard_size, check_hashes, log)
         self.fingerprint = self.report["fingerprint"]
-        self._where, self._entries = {}, {"train": [], "val": []}
+        self._where, self._entries = {}, {split: [] for split in self.report["frames"]}
         for name in sorted(index["shards"]):
             entry = index["shards"][name]
             for row, (image, grade) in enumerate(zip(entry["images"], entry["grades"])):
@@ -378,23 +494,32 @@ def stage_cache(drive_cache_dir, local_cache_dir, log=print, stage_files=None):
 # --------------------------------------------------------------------------- command line (CPU; no model)
 
 def main(argv=None):
-    """`build`: write (or resume) the frame cache of the pinned split from the raw EyePACS training folder.
-    `verify`: check a cache against the pinned split, hashing every shard."""
+    """`build`: write (or resume) a frame cache from the raw EyePACS folder. `verify`: check a cache against its
+    pinned manifest, hashing every shard (and, with --sources, every source image). `--set adaptation` (default)
+    is the pinned training / validation split; `--set heldout-test` is the pinned held-out test set."""
     import argparse
-    parser = argparse.ArgumentParser(description="EyePACS adaptation frame cache (research record 69)")
+    parser = argparse.ArgumentParser(description="EyePACS frame caches (research record 69, 69.2)")
     parser.add_argument("action", choices=("build", "verify"))
     parser.add_argument("--cache-dir", required=True)
-    parser.add_argument("--train-dir", default=os.path.join(REPO, "datasets", "EyePACS", "raw", "train"))
+    parser.add_argument("--set", dest="which", choices=("adaptation", "heldout-test"), default="adaptation")
+    parser.add_argument("--image-dir", default=None, help="raw image folder (default: the set's folder under datasets/EyePACS/raw)")
     parser.add_argument("--split-dir", default=os.path.join(REPO, "dataset_splits"))
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit-shards", type=int, default=None)
+    parser.add_argument("--sources", action="store_true", help="verify: also re-hash every source image")
     args = parser.parse_args(argv)
-    rows = read_split(args.split_dir, MANIFEST_SHA256)
+    if args.which == "adaptation":
+        rows, sha, folder = read_split(args.split_dir, MANIFEST_SHA256), MANIFEST_SHA256, "train"
+    else:
+        rows, sha, folder = read_test_manifest(args.split_dir, TEST_MANIFEST_SHA256), TEST_MANIFEST_SHA256, "test"
+    image_dir = args.image_dir or os.path.join(REPO, "datasets", "EyePACS", "raw", folder)
     if args.action == "build":
-        build_cache(rows, args.train_dir, args.cache_dir, MANIFEST_SHA256, workers=args.workers, limit_shards=args.limit_shards)
+        build_cache(rows, image_dir, args.cache_dir, sha, workers=args.workers, limit_shards=args.limit_shards)
         if args.limit_shards is not None:
             return 0
-    _, report = verify_cache(args.cache_dir, rows, MANIFEST_SHA256, log=print)
+    _, report = verify_cache(args.cache_dir, rows, sha, log=print)
+    if args.sources:
+        report["sources_checked"] = verify_sources(args.cache_dir, image_dir, log=print)
     print(json.dumps(report, indent=1))
     return 0
 

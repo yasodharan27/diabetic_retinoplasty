@@ -74,14 +74,18 @@ section numbers below refer to it.
 4. **Ground-truth lesion probe:** the same frozen-encoder probe on P, E1 and E2 against DDR's real masks.
    Pre-run record §68; implementation, tests and data staging complete (§68.1: `ddr_probe.py`,
    `colab/notebooks/ddr_lesion_probe.ipynb`); the GPU run is pending.
-5. **EyePACS adaptation:** Stage 2 on EyePACS, patient-level 90/10 split, one supervised adaptation run of P's
-   model, checkpoint pinned by hash. APTOS is never read in this phase. Split manifest, cache verification,
-   loader and trainer implemented (§69, §69.1: `eyepacs_adaptation_data.py`, `eyepacs_adaptation_train.py`,
-   `colab/notebooks/eyepacs_adaptation.ipynb`); the frame cache is not built and nothing is trained. Four
-   points of the run plan are open in §69.1 and must be fixed there first.
-6. **P-EP and E1-EP** on APTOS (three seeds each, unchanged P / E1 protocol), with probes on both.
-7. **E2-EP** only if the E1-EP probe criterion passes.
-8. One-shot evaluations of the EP models: the labelled EyePACS test subset and IDRiD batch 2.
+5. **EyePACS adaptation:** exactly ONE supervised adaptation run of P's model (seed 42) on the pinned
+   patient-level split, selected by EyePACS validation QWK; checkpoint pinned by hash. APTOS is never read
+   in this phase. Protocol §69 + §69.2; implementation §69.3 (`eyepacs_adaptation_data.py`,
+   `eyepacs_adaptation_train.py`, `colab/notebooks/eyepacs_adaptation.ipynb`, every switch off). The frame
+   cache is not built and nothing is trained.
+6. **Held-out EyePACS test:** the pinned adaptation model scored once on the 16,249 labelled EyePACS test
+   images (pinned manifest; no quality filter). Evaluation only; it precedes the APTOS runs and selects nothing.
+7. **P-EP and E1-EP** on APTOS (`ep_aptos_train.py`): three seeds each from the same pinned adapted encoder
+   with a fresh CORN head, unchanged P / E1 protocol. Both are mandatory; E1-EP runs after P-EP.
+8. **Probe of the EP arms** on DDR's expert masks (the §68 method); criterion E1-EP − P-EP as in §69.2.
+9. **E2-EP** only if that criterion is met (enforced in code).
+10. **IDRiD batch 2** for the EP arms.
 
 Not planned: any further fusion, gating, routing or graph module; E3; backbone or foundation-model swaps; λ
 sweeps before the steps above; a new architecture.

@@ -73,8 +73,65 @@ class InventoryTests(unittest.TestCase):
 
     def test_no_quality_label_or_stage1_dependency(self):
         source = inspect.getsource(ea)
-        for forbidden in ("Label_EyeQ", "quality_assessment", "iqa", "import pl_convnext", "DOWNSTREAM_SPLIT", "load_split"):
+        # The EyeQ file with the test images' DR grades is named (record §69.2); its quality column is never read,
+        # and the EyeQ training labels (the quality labels of adaptation images) are not referenced at all.
+        for forbidden in ("Label_EyeQ_train", '["quality"]', "['quality']", "quality_assessment", "iqa", "import pl_convnext",
+                          "DOWNSTREAM_SPLIT", "load_split"):
             self.assertNotIn(forbidden, source)
+        for function in (ea.inventory, ea.read_labels, ea.build_split, ea.split_report, ea.read_split, ea.class_weights):
+            self.assertNotIn("EyeQ", inspect.getsource(function))          # nothing of EyeQ in the adaptation data
+
+
+class HeldOutTestSetTests(unittest.TestCase):
+    """The held-out labelled EyePACS test set: a pinned manifest, labels only, evaluation only."""
+    SPLITS = os.path.join(os.path.dirname(os.path.abspath(ea.__file__)), "dataset_splits")
+
+    def test_pinned_manifest_is_the_recorded_set_and_shares_no_patient_with_the_adaptation_data(self):
+        rows = ea.read_test_manifest(self.SPLITS, ea.TEST_MANIFEST_SHA256)
+        self.assertEqual(len(rows), 16249)
+        self.assertEqual(np.bincount([r["grade"] for r in rows], minlength=5).tolist(), [11362, 1398, 2644, 448, 397])
+        self.assertEqual(len({r["patient"] for r in rows}), 12048)
+        self.assertEqual({r["split"] for r in rows}, {"test"})
+        adaptation = ea.read_split(self.SPLITS, ea.MANIFEST_SHA256)
+        self.assertTrue(ea.assert_disjoint_patients(rows, adaptation))
+        self.assertFalse({r["image"] for r in rows} & {r["image"] for r in adaptation})
+        with self.assertRaises(RuntimeError):
+            ea.assert_disjoint_patients(rows[:1] + [dict(rows[0], patient=adaptation[0]["patient"])], adaptation)
+        with self.assertRaises(RuntimeError):
+            ea.read_test_manifest(self.SPLITS, "0" * 64)
+        with open(os.path.join(self.SPLITS, ea.TEST_SUMMARY_NAME)) as fh:
+            summary = json.load(fh)
+        self.assertEqual((summary["manifest_sha256"], summary["excluded"], summary["label_file_sha256"]),
+                         (ea.TEST_MANIFEST_SHA256, [], ea.TEST_LABELS_SHA256))
+        plan = ea.shard_plan(rows)                                         # its own cache: test shards only
+        self.assertEqual((list(plan), len(plan["test"]), sum(map(len, plan["test"]))), (["test"], 17, 16249))
+        self.assertEqual(list(ea.shard_plan(adaptation)), ["train", "val"])
+
+    def test_only_the_pinned_label_file_is_accepted_and_the_manifest_is_immutable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "labels.csv")
+            with open(path, "w", newline="") as fh:
+                fh.write(",image,quality,DR_grade\n0,1_right.jpeg,1,0\n")
+            with self.assertRaises(RuntimeError):
+                ea.read_test_labels(path)                                  # another label file
+            rows = [{"image": f"{p}_left.jpeg", "patient": str(p), "eye": "left", "grade": p % 5, "patient_max_grade": p % 5,
+                     "split": "test"} for p in range(1, 30)]
+            _, summary = ea.write_test_manifest(rows, tmp)
+            self.assertEqual(ea.write_test_manifest(rows, tmp)[1]["manifest_sha256"], summary["manifest_sha256"])
+            with self.assertRaises(RuntimeError):
+                ea.write_test_manifest(rows[:-1], tmp)                     # another set: refused
+            with self.assertRaises(ValueError):
+                ea.write_test_manifest([dict(rows[0], split="train")], tmp)
+            self.assertEqual(len(ea.read_test_manifest(tmp, summary["manifest_sha256"])), 29)
+        with self.assertRaises(ValueError):
+            ea.shard_plan([{"image": "1_left.jpeg", "patient": "1", "eye": "left", "split": "holdout"}])
+
+    def test_command_line_builds_the_adaptation_set_by_default(self):
+        source = inspect.getsource(ea.main)
+        self.assertIn('default="adaptation"', source)
+        self.assertIn('choices=("build", "verify")', source)
+        with self.assertRaises(RuntimeError):                              # verify refuses a folder without a cache
+            ea.main(["verify", "--cache-dir", os.path.join(tempfile.gettempdir(), "no_such_eyepacs_cache")])
 
 
 class SplitTests(unittest.TestCase):
@@ -195,6 +252,19 @@ class CacheTests(unittest.TestCase):
 
     def _verification(self, tmp, cache, rows, plan):
         """verify_cache / FrameCache accept exactly the complete cache of this split and identity."""
+        sources = os.path.join(tmp, "train")
+        self.assertEqual(ea.verify_sources(cache, sources), len(rows))     # every source image matches its recorded hash
+        changed = os.path.join(sources, plan["train"][0][0])
+        with open(changed, "a") as fh:
+            fh.write("!")
+        with self.assertRaises(RuntimeError):                              # a modified source image is detected
+            ea.verify_sources(cache, sources)
+        with open(changed, "w") as fh:
+            fh.write(plan["train"][0][0])
+        os.rename(changed, changed + ".gone")
+        with self.assertRaises(RuntimeError):                              # and so is a missing one
+            ea.verify_sources(cache, sources)
+        os.rename(changed + ".gone", changed)
         index, report = ea.verify_cache(cache, rows, "a" * 64, shard_size=16)
         self.assertEqual(report["frames"], {"train": sum(map(len, plan["train"])), "val": sum(map(len, plan["val"]))})
         self.assertEqual(report["identity"]["preproc_version"], "stage2-DR-profile/full-frame-direct-resize/v1")

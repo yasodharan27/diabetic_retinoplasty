@@ -1,23 +1,24 @@
-"""EyePACS adaptation of P (research record §69): the trainer. Colab, GPU. Nothing here reads an APTOS file.
+"""EyePACS adaptation of P (research record §69, §69.2): the trainer. Colab, GPU. Nothing here reads an APTOS file.
 
-The model is P itself (pl_convnext.build_pl_model("P", ...): ImageNet ConvNeXt-Tiny, average pooling, LayerNorm,
-CORN Dense 768 -> 4) compiled by P's own function (pl_convnext.compile_pl_model: AdamW with no decay on 1-D
-parameters, weighted CORN, QWK and unweighted CORN loss as metrics). The loop is P's (arch1_train.train_seed):
-generation-based checkpoints (training.Trainer), BEST published by validation QWK, early stopping and
-ReduceLROnPlateau on validation QWK, mixed precision, P's epoch order and per-image augmentation RNG
-(improved_training_data), P's augmentation (flips, rot90, brightness / contrast).
+ONE adaptation run (seed ADAPTATION_SEED). The model is P itself (pl_convnext.build_pl_model("P", ...): ImageNet
+ConvNeXt-Tiny, average pooling, LayerNorm, CORN Dense 768 -> 4) compiled by P's own function
+(pl_convnext.compile_pl_model: AdamW with no decay on 1-D parameters, weighted CORN, QWK and unweighted CORN loss
+as metrics). The loop is P's: generation-based checkpoints (training.Trainer), BEST published by validation QWK,
+early stopping and ReduceLROnPlateau on validation QWK, mixed precision, P's epoch order and per-image
+augmentation RNG (improved_training_data), P's augmentation (flips, rot90, brightness / contrast).
 
 What differs from P, and only this:
-  * the data     -- the EyePACS frame cache (eyepacs_adaptation_data.FrameCache), bound to the split manifest;
-  * batch size   -- 16 (P: 2);
+  * the data      -- the EyePACS frame cache (eyepacs_adaptation_data.FrameCache), bound to the split manifest;
+  * batch size    -- 16 (P: 2);
   * class weights -- P's formula on the EyePACS TRAINING counts.
 
-Checkpoint selection is by EyePACS validation QWK only. `freeze_checkpoint` then pins the selected weights by
-SHA-256 (frozen_checkpoint.json, written once); everything downstream loads them through `load_frozen`, which
-refuses a file that is not the pinned one. `adapted_backbone_arrays` hands the adapted encoder to the existing
-APTOS code as `reference_arrays` (pl_convnext.build_pl_model re-initialises the CORN head from its seed).
+Order (§69.2 D): train on the EyePACS training / validation parts -> `pin_checkpoint` pins the selected weights
+by SHA-256 (frozen_checkpoint.json, written once) -> `evaluate_heldout_test` scores that pinned model once on
+the held-out labelled EyePACS test images -> only then do the APTOS runs (ep_aptos_train) start from the pinned
+encoder. The held-out result is read by no other step.
 
-The loop is repeated here rather than parameterised in arch1_train / e1_train because those modules belong to
+`training_loop` is the one resumable loop of this phase; the adaptation run and the APTOS runs of the EP arms
+both use it. It follows arch1_train.train_seed / e1_train.train_seed step for step; those modules belong to
 completed experiments and are not modified.
 """
 import json
@@ -31,7 +32,8 @@ import eyepacs_adaptation_data as ea
 
 EXPERIMENT = "EyePACSAdaptation"
 PREFIX = "p_eyepacs"
-SEEDS = at.SEEDS
+ADAPTATION_SEED = 42                       # exactly one adaptation run (record §69.2 A)
+ADAPTATION_RUNS = 1
 #: P's protocol with the one approved change (batch 16).
 PROTOCOL = dict(at.P_PROTOCOL, batch_size=16)
 #: The class weights recorded in §69 (P's formula on the EyePACS training counts), to four decimals.
@@ -39,7 +41,12 @@ APPROVED_CLASS_WEIGHTS = (0.6450, 2.0906, 1.4230, 3.5138, 3.8780)
 EVAL_BATCH = 8
 HEARTBEAT_EVERY_BATCHES = 200
 FROZEN_NAME = "frozen_checkpoint.json"
+HELDOUT_DIR = "heldout_test"
 SELECTION = "EyePACS validation QWK only (no APTOS image is read in this phase)"
+HELDOUT_ROLE = "held-out evaluation of the frozen adaptation model; in-domain; never used for any selection"
+#: config.json keys copied into a pinned-checkpoint record when present.
+IDENTITY_KEYS = ("split_manifest_sha256", "frame_cache_fingerprint", "split_sha256", "bundle_fingerprint", "arm",
+                 "adapted_encoder_sha256", "checkpoint_selection")
 
 
 def class_weights(rows):
@@ -48,6 +55,39 @@ def class_weights(rows):
     if not np.allclose(weights, APPROVED_CLASS_WEIGHTS, atol=5e-5):
         raise RuntimeError(f"class weights {weights} are not the recorded {APPROVED_CLASS_WEIGHTS}")
     return counts, weights
+
+
+def environment(repo_dir=None):
+    """Commit, library versions, device and time of an invocation (descriptive; never part of a config hash)."""
+    import datetime
+    import platform
+    import sys
+    out = {"utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "git_commit": at.git_commit(repo_dir), "python": sys.version.split()[0], "platform": platform.platform(),
+           "numpy": np.__version__}
+    try:
+        import keras
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices("GPU")
+        out.update(tensorflow=tf.__version__, keras=keras.__version__,
+                   gpus=[tf.config.experimental.get_device_details(g).get("device_name", g.name) for g in gpus])
+    except Exception as error:  # noqa: BLE001
+        out["tensorflow_error"] = repr(error)
+    return out
+
+
+def record_invocation(run_dir, record):
+    """Appends one invocation to run_metadata.json (a resumed run has several)."""
+    path = posixpath.join(run_dir, "run_metadata.json")
+    runs = []
+    if os.path.exists(path):
+        with open(path) as fh:
+            runs = json.load(fh)["invocations"]
+    runs.append(record)
+    with open(path + ".tmp", "w") as fh:
+        json.dump({"invocations": runs}, fh, indent=1)
+    os.replace(path + ".tmp", path)
+    return runs
 
 
 # --------------------------------------------------------------------------- inputs (P's three-input contract)
@@ -80,8 +120,8 @@ def epoch_order(entries, run_seed, epoch, augment):
 
 def make_epoch_sequence(frames, entries, epoch, run_seed, batch_size, augment, workers=1):
     """A keras PyDataset for ONE epoch yielding (P's inputs, grades). `frames`: an object with
-    `frame(image) -> float32 (S, S, 3)` (eyepacs_adaptation_data.FrameCache). Every batch is a pure function of
-    (run seed, epoch, batch index), so the result does not depend on `workers`."""
+    `frame(image) -> float32 (S, S, 3)`. Every batch is a pure function of (run seed, epoch, batch index), so the
+    result does not depend on `workers`."""
     import keras
 
     import improved_training_data as itd
@@ -107,7 +147,7 @@ def make_epoch_sequence(frames, entries, epoch, run_seed, batch_size, augment, w
 # --------------------------------------------------------------------------- model + identity
 
 def build_compiled_model(seed, reference_arrays, weights, protocol=PROTOCOL, mixed_precision=True, image_size=None):
-    """P for one seed, compiled exactly like P (pl_convnext.compile_pl_model)."""
+    """P for one seed from `reference_arrays` (the encoder it starts from), compiled exactly like P."""
     import pl_convnext as pl
     from training import enable_mixed_precision
     enable_mixed_precision(bool(mixed_precision))
@@ -115,10 +155,11 @@ def build_compiled_model(seed, reference_arrays, weights, protocol=PROTOCOL, mix
     return pl.compile_pl_model(model, list(weights), protocol["learning_rate"], protocol["weight_decay"])
 
 
-def run_mapping(frames, seed, weights, protocol=PROTOCOL, repo_dir=None):
-    """Everything that identifies a run (written to config.json and hashed into the checkpoint config)."""
+def run_mapping(frames, weights, protocol=PROTOCOL, repo_dir=None):
+    """Everything that identifies the adaptation run (written to config.json and hashed into the checkpoints)."""
     import pl_convnext as pl
-    return {"experiment": EXPERIMENT, "arch": "P: convnext_tiny (ImageNet) + GAP + LayerNorm + CORN", "seed": int(seed),
+    return {"experiment": EXPERIMENT, "arch": "P: convnext_tiny (ImageNet) + GAP + LayerNorm + CORN",
+            "seed": ADAPTATION_SEED, "adaptation_runs": ADAPTATION_RUNS,
             "data": "EyePACS (Kaggle training set), patient-level split", "split_manifest_sha256": frames.manifest_sha256,
             "frame_cache_fingerprint": frames.fingerprint, "frame_cache_version": ea.CACHE_VERSION,
             "frame_dtype": ea.FRAME_DTYPE, "excluded_blank": list(ea.BLANK_TRAINING_IMAGES),
@@ -129,16 +170,15 @@ def run_mapping(frames, seed, weights, protocol=PROTOCOL, repo_dir=None):
             "git_commit": at.git_commit(repo_dir)}
 
 
-def run_dir_for(experiments_root, manifest_sha256, seed):
-    if int(seed) not in SEEDS:
-        raise ValueError(f"seed must be one of {SEEDS}, got {seed!r}")
-    return posixpath.join(experiments_root, EXPERIMENT, f"{PREFIX}_{manifest_sha256[:12]}_seed{int(seed)}")
+def run_dir_for(experiments_root, manifest_sha256):
+    """The one adaptation run directory."""
+    return posixpath.join(experiments_root, EXPERIMENT, f"{PREFIX}_{manifest_sha256[:12]}_seed{ADAPTATION_SEED}")
 
 
-# --------------------------------------------------------------------------- training (P's loop)
+# --------------------------------------------------------------------------- the resumable loop (P's)
 
 def _heartbeat_callback(run_dir):
-    """An EyePACS epoch is longer than the run lock's lifetime: refresh the lock inside the epoch."""
+    """A long epoch can outlast the run lock: refresh the lock inside the epoch."""
     import keras
 
     import multiseed_runs as msr
@@ -154,17 +194,25 @@ def _heartbeat_callback(run_dir):
     return LockHeartbeat()
 
 
-def train_seed(run_dir, frames, seed, reference_arrays, weights, *, repo_dir, staging_dir, protocol=PROTOCOL, log=print,
-               max_epochs=None, mixed_precision=True, image_size=None, workers=2):
-    """One resumable adaptation run, structured exactly like arch1_train.train_seed."""
+def training_loop(run_dir, mapping, build_model, train_sequence, val_sequence, *, experiment_id, dataset_version,
+                  protocol, repo_dir, staging_dir, log=print, max_epochs=None, mixed_precision=True,
+                  wrap_callbacks=None, initialisation=None):
+    """One resumable run, step for step the loop of arch1_train.train_seed / e1_train.train_seed.
+
+    `mapping` identifies the run (a directory holds one configuration); `build_model()` returns the compiled
+    model; `train_sequence(epoch)` and `val_sequence()` return the epoch's data; `wrap_callbacks` (E1: the log
+    aliases) may put callbacks before the trainer's; `initialisation(model)` returns extra facts recorded in
+    initialization.json for a fresh run. Checkpoint selection is the trainer's: BEST = highest validation QWK."""
     import tensorflow as tf
 
     import multiseed_runs as msr
     from training import CheckpointOptions, Trainer, TrainingConfig, TrainingStateCheckpoint
     from training import checkpointing as ckpt
+    if protocol["monitor"] != "val_QWK" or protocol["mode"] != "max":
+        raise RuntimeError("the run must be selected by validation QWK")
     epochs = int(max_epochs or protocol["max_epochs"])
     msr.ensure_run_dir(run_dir)
-    chash = at.ensure_run_config(run_dir, run_mapping(frames, seed, weights, protocol, repo_dir))
+    chash = at.ensure_run_config(run_dir, mapping)
     if msr.read_stop_decision(run_dir) is not None:
         log("  run already stopped")
         return
@@ -173,9 +221,10 @@ def train_seed(run_dir, frames, seed, reference_arrays, weights, *, repo_dir, st
         msr.write_stop_decision(run_dir, sealed[0], sealed[1])
         return
     tf.keras.backend.clear_session()
-    model = build_compiled_model(seed, reference_arrays, weights, protocol, mixed_precision, image_size)
+    model = build_model()
     at.acquire_lock_waiting(run_dir, log)
     try:
+        record_invocation(run_dir, dict(environment(repo_dir), config_hash=chash))
         trainer = Trainer(TrainingConfig(
             run_dir=run_dir, epochs=epochs, monitor=protocol["monitor"], mode=protocol["mode"],
             mixed_precision=bool(mixed_precision),
@@ -183,36 +232,37 @@ def train_seed(run_dir, frames, seed, reference_arrays, weights, *, repo_dir, st
             reduce_lr_patience=protocol["reduce_lr_patience"], reduce_lr_factor=protocol["reduce_lr_factor"],
             min_lr=protocol["min_lr"], precision_check="error", repo_dir=repo_dir,
             checkpoint_options=CheckpointOptions(
-                experiment_id=f"{EXPERIMENT}/seed_{seed}", config_hash=chash,
-                dataset_version=f"eyepacs:{frames.manifest_sha256[:16]}:{frames.fingerprint[:16]}",
+                experiment_id=experiment_id, config_hash=chash, dataset_version=dataset_version,
                 staging_dir=staging_dir, keep_generations=2, verbose=1)))
         trainer.prepare(model)
         initial_epoch = trainer.resolve_initial_epoch()
         if initial_epoch > 0:
             trainer.restore(model)
             log(f"  resumed at epoch {initial_epoch}")
-        else:                                       # a fresh model: record what this seed started from
+        else:                                       # a fresh model: record what this run started from
+            facts = {"seed": int(mapping["seed"]), "initial_epoch": 0, "weights_sha256": at.weights_sha256(model),
+                     "pretrained_backbone_file_sha256": at._pretrained_sha256()}
+            facts.update(initialisation(model) if initialisation else {})
             with open(posixpath.join(run_dir, "initialization.json"), "w") as fh:
-                json.dump({"seed": int(seed), "initial_epoch": 0, "weights_sha256": at.weights_sha256(model),
-                           "pretrained_backbone_file_sha256": at._pretrained_sha256()}, fh, indent=1)
+                json.dump(facts, fh, indent=1)
         if initial_epoch >= epochs:
             msr.write_stop_decision(run_dir, initial_epoch, "epoch_cap")
             return
         early = next(c for c in trainer.callbacks if isinstance(c, tf.keras.callbacks.EarlyStopping))
         state_cb = next(c for c in trainer.callbacks if isinstance(c, TrainingStateCheckpoint))
-        callbacks = list(trainer.callbacks) + [_heartbeat_callback(run_dir)]
-        train_entries, val_entries = frames.entries("train"), frames.entries("val")
-        val_seq = make_epoch_sequence(frames, val_entries, 0, seed, protocol["batch_size"], augment=False, workers=workers)
+        callbacks = (wrap_callbacks(trainer.callbacks) if wrap_callbacks else list(trainer.callbacks)) + [_heartbeat_callback(run_dir)]
+        val_seq = val_sequence()
         for epoch in range(initial_epoch, epochs):
             msr.heartbeat_lock(run_dir, owner_id=msr.OWNER_ID)
-            train_seq = make_epoch_sequence(frames, train_entries, epoch, seed, protocol["batch_size"], augment=True,
-                                            workers=workers)
-            model.fit(train_seq, validation_data=val_seq, epochs=epoch + 1, initial_epoch=epoch,
+            model.fit(train_sequence(epoch), validation_data=val_seq, epochs=epoch + 1, initial_epoch=epoch,
                       callbacks=callbacks, verbose=1)
             generation = state_cb.last_generation_dir
             if generation is None:
                 raise RuntimeError(f"epoch {epoch}: no checkpoint generation written")
             state = ckpt.read_state(generation)
+            if state.monitor != "val_QWK" or state.best_metric is None or \
+                    (state.extra or {}).get("epoch_logs", {}).get("val_QWK") is None:
+                raise RuntimeError(f"epoch {epoch}: the checkpoint state does not hold val_QWK as its monitor")
             msr.write_epoch_history(run_dir, state)
             if state.best_epoch == epoch:
                 msr.publish_best(run_dir, generation, state, repo_dir=repo_dir, verbose=1)
@@ -226,11 +276,28 @@ def train_seed(run_dir, frames, seed, reference_arrays, weights, *, repo_dir, st
         msr.release_lock(run_dir, owner_id=msr.OWNER_ID)
 
 
-# --------------------------------------------------------------------------- evaluation (EyePACS validation only)
+def train(run_dir, frames, reference_arrays, weights, *, repo_dir, staging_dir, protocol=PROTOCOL, log=print,
+          max_epochs=None, mixed_precision=True, image_size=None, workers=2):
+    """The adaptation run: P from the ImageNet arrays on the EyePACS training part, validated on the EyePACS
+    validation part. Only those two parts are arguments; no test set can be passed."""
+    if set(getattr(frames, "report", {}).get("frames", ("train", "val"))) != {"train", "val"}:
+        raise RuntimeError("the adaptation run takes the training / validation cache only")
+    train_entries, val_entries = frames.entries("train"), frames.entries("val")
+    return training_loop(
+        run_dir, run_mapping(frames, weights, protocol, repo_dir),
+        lambda: build_compiled_model(ADAPTATION_SEED, reference_arrays, weights, protocol, mixed_precision, image_size),
+        lambda epoch: make_epoch_sequence(frames, train_entries, epoch, ADAPTATION_SEED, protocol["batch_size"], True, workers),
+        lambda: make_epoch_sequence(frames, val_entries, 0, ADAPTATION_SEED, protocol["batch_size"], False, workers),
+        experiment_id=f"{EXPERIMENT}/seed_{ADAPTATION_SEED}",
+        dataset_version=f"eyepacs:{frames.manifest_sha256[:16]}:{frames.fingerprint[:16]}",
+        protocol=protocol, repo_dir=repo_dir, staging_dir=staging_dir, log=log, max_epochs=max_epochs,
+        mixed_precision=mixed_precision)
+
+
+# --------------------------------------------------------------------------- evaluation
 
 def predict_logits(model, frames, images, batch_size=EVAL_BATCH):
-    """CORN logits (N, 4) float64 for `images` in order, unaugmented. `frames.frame(image)` supplies the frame,
-    so the same function evaluates any set whose frames come from the locked Stage 2 + 512 path."""
+    """CORN logits (N, 4) float64 for `images` in order, unaugmented, through P's inputs."""
     out = []
     images = [str(i) for i in images]
     for s in range(0, len(images), batch_size):
@@ -239,16 +306,15 @@ def predict_logits(model, frames, images, batch_size=EVAL_BATCH):
     return np.concatenate(out, 0)
 
 
-def evaluate_run(run_dir, frames, seed, reference_arrays, weights, protocol=PROTOCOL, mixed_precision=True, image_size=None):
-    """BEST and LAST checkpoints on the EyePACS validation part: per-sample tables (P's schema) and metrics,
-    written under run_dir/metrics. This is the selection set, never reported as a test result."""
+def evaluate_checkpoints(run_dir, build_model, frames, entries, set_name):
+    """BEST and LAST checkpoints of a P-type run on `entries`: per-sample tables (P's schema) and metrics under
+    run_dir/metrics."""
     import pandas as pd
     import tensorflow as tf
 
     import multiseed_runs as msr
     from training import checkpointing as ckpt
-    entries = frames.entries("val")
-    ids, grades = [i for i, _ in entries], [g for _, g in entries]
+    ids, grades = [str(i) for i, _ in entries], [int(g) for _, g in entries]
     out_dir = posixpath.join(run_dir, "metrics")
     os.makedirs(out_dir, exist_ok=True)
     results = {}
@@ -258,12 +324,12 @@ def evaluate_run(run_dir, frames, seed, reference_arrays, weights, protocol=PROT
         if gen_dir is None:
             raise RuntimeError(f"{run_dir}: no {which.upper()} checkpoint")
         tf.keras.backend.clear_session()
-        model = build_compiled_model(seed, reference_arrays, weights, protocol, mixed_precision, image_size)
+        model = build_model()
         path = os.path.join(gen_dir, ckpt.MODEL_WEIGHTS_FILENAME)
         ckpt.load_model_weights_only(model, path)
         metrics, rows = at.metrics_from_logits(ids, grades, predict_logits(model, frames, ids))
         state = ckpt.read_state(gen_dir)
-        res = {"set": "EyePACS adaptation validation (selection set)", "metrics": metrics,
+        res = {"set": set_name, "metrics": metrics,
                "checkpoint": {"which": which.upper(), "generation": gen_dir, "weights_sha256": at._sha256(path),
                               "completed_epoch": state.completed_epoch, "best_epoch": state.best_epoch,
                               "best_metric": state.best_metric, "monitor": state.monitor,
@@ -275,7 +341,14 @@ def evaluate_run(run_dir, frames, seed, reference_arrays, weights, protocol=PROT
     return results
 
 
-# --------------------------------------------------------------------------- freezing the selected checkpoint
+def evaluate_run(run_dir, frames, reference_arrays, weights, protocol=PROTOCOL, mixed_precision=True, image_size=None):
+    """The adaptation run on the EyePACS validation part (the selection set, never reported as a test)."""
+    return evaluate_checkpoints(
+        run_dir, lambda: build_compiled_model(ADAPTATION_SEED, reference_arrays, weights, protocol, mixed_precision, image_size),
+        frames, frames.entries("val"), "EyePACS adaptation validation (selection set)")
+
+
+# --------------------------------------------------------------------------- pinning the selected checkpoint
 
 def selected_epoch(history):
     """The epoch a max-QWK selection must have published: the FIRST epoch with the highest validation QWK."""
@@ -286,16 +359,15 @@ def selected_epoch(history):
     return min(e for v, e in values if v == top), float(top)
 
 
-def freeze_checkpoint(run_dir):
-    """Pins the run's BEST weights by SHA-256 in frozen_checkpoint.json. Requires a finished run whose BEST is
-    the first epoch with the highest EyePACS validation QWK. Written once: a second call must find the same
-    file hash, otherwise it raises."""
+def pin_checkpoint(run_dir, repo_dir=None):
+    """Pins a finished run's BEST weights by SHA-256 in frozen_checkpoint.json. BEST must be the first epoch
+    with the highest validation QWK. Written once: a later call must find the same file, otherwise it raises."""
     import multiseed_runs as msr
     from training import checkpointing as ckpt
     stop = msr.read_stop_decision(run_dir)
     if stop is None:
-        raise RuntimeError(f"{run_dir}: training has not finished; nothing is frozen")
-    best_dir, pointer = msr.read_best(run_dir)
+        raise RuntimeError(f"{run_dir}: training has not finished; nothing is pinned")
+    best_dir, _ = msr.read_best(run_dir)
     if best_dir is None:
         raise RuntimeError(f"{run_dir}: no BEST checkpoint")
     history = msr.read_history(run_dir)
@@ -307,18 +379,23 @@ def freeze_checkpoint(run_dir):
     weights_path = os.path.join(best_dir, ckpt.MODEL_WEIGHTS_FILENAME)
     with open(posixpath.join(run_dir, "config.json")) as fh:
         config = json.load(fh)
-    record = {"experiment": EXPERIMENT, "seed": config["seed"], "weights": posixpath.join("checkpoints", os.path.basename(best_dir),
-                                                                                         ckpt.MODEL_WEIGHTS_FILENAME),
+    record = {"experiment": config["experiment"], "seed": config["seed"],
+              "weights": posixpath.join("checkpoints", os.path.basename(best_dir), ckpt.MODEL_WEIGHTS_FILENAME),
               "sha256": at._sha256(weights_path), "best_epoch_index": state.best_epoch, "val_qwk": float(state.best_metric),
-              "selection": SELECTION, "stop": stop, "split_manifest_sha256": config["split_manifest_sha256"],
-              "frame_cache_fingerprint": config["frame_cache_fingerprint"], "config_hash": config["config_hash"],
-              "git_commit": config.get("git_commit")}
+              "epochs_run": len(history), "stop": stop, "config_hash": config["config_hash"],
+              "training_git_commit": config.get("git_commit"),
+              "identity": {k: config[k] for k in IDENTITY_KEYS if k in config},
+              "training_configuration": {k: config[k] for k in ("batch_size", "max_epochs", "learning_rate", "weight_decay",
+                                                                "early_stopping_patience", "reduce_lr_patience",
+                                                                "reduce_lr_factor", "min_lr", "class_weights",
+                                                                "mixed_precision") if k in config},
+              "pinned": environment(repo_dir)}
     path = posixpath.join(run_dir, FROZEN_NAME)
     if os.path.exists(path):
         with open(path) as fh:
             old = json.load(fh)
         if old["sha256"] != record["sha256"] or old["weights"] != record["weights"]:
-            raise RuntimeError(f"{run_dir}: a different checkpoint is already frozen; a frozen checkpoint is never replaced")
+            raise RuntimeError(f"{run_dir}: a different checkpoint is already pinned; a pinned checkpoint is never replaced")
         return old
     with open(path + ".tmp", "w") as fh:
         json.dump(record, fh, indent=1)
@@ -327,26 +404,28 @@ def freeze_checkpoint(run_dir):
 
 
 def read_frozen(run_dir):
-    """(absolute weights path, record) of a frozen run; the file must still have the pinned SHA-256."""
+    """(absolute weights path, record) of a pinned run; the file must still have the pinned SHA-256."""
     path = posixpath.join(run_dir, FROZEN_NAME)
     if not os.path.exists(path):
-        raise RuntimeError(f"{run_dir}: no frozen checkpoint")
+        raise RuntimeError(f"{run_dir}: no pinned checkpoint")
     with open(path) as fh:
         record = json.load(fh)
     weights_path = os.path.join(run_dir, *record["weights"].split("/"))
     if not os.path.exists(weights_path) or at._sha256(weights_path) != record["sha256"]:
-        raise RuntimeError(f"{run_dir}: the weights file is missing or is not the frozen checkpoint")
+        raise RuntimeError(f"{run_dir}: the weights file is missing or is not the pinned checkpoint")
     return weights_path, record
 
 
 def load_frozen(run_dir, reference_arrays, mixed_precision=True, image_size=None):
-    """The frozen adapted P model (uncompiled, not trainable) and its record."""
+    """The pinned adaptation model (P's graph, uncompiled, not trainable) and its record."""
     import keras
 
     import pl_convnext as pl
     from training import checkpointing as ckpt
     from training import enable_mixed_precision
     weights_path, record = read_frozen(run_dir)
+    if record["experiment"] != EXPERIMENT:
+        raise RuntimeError(f"{run_dir} is not the EyePACS adaptation run")
     keras.backend.clear_session()
     enable_mixed_precision(bool(mixed_precision))               # after clear_session (it resets the policy)
     model = pl.build_pl_model("P", int(record["seed"]), reference_arrays, image_size=image_size or pl.IMAGE_SIZE)
@@ -362,10 +441,56 @@ def adapted_backbone_arrays(model):
     return [np.asarray(v.numpy()) for v in model.get_layer(pl.BACKBONE_NAME).weights]
 
 
-# --------------------------------------------------------------------------- sequence
+# --------------------------------------------------------------------------- held-out EyePACS test (once)
 
-def seed_state(run_dir):
-    """"complete" (frozen and result written) | "trained" | "in_progress" | "new"."""
+def heldout_result(run_dir):
+    """The recorded held-out evaluation of a run, or None."""
+    path = posixpath.join(run_dir, HELDOUT_DIR, "metrics.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def evaluate_heldout_test(run_dir, test_frames, reference_arrays, *, repo_dir=None, mixed_precision=True, image_size=None,
+                          log=print):
+    """Scores the PINNED adaptation model once on the held-out labelled EyePACS test images and writes
+    heldout_test/{per_sample.csv, metrics.json}. Requires the pinned checkpoint; a recorded result is returned
+    as it is and never recomputed. Nothing is selected, tuned or decided from the output."""
+    import pandas as pd
+    recorded = heldout_result(run_dir)
+    _, frozen = read_frozen(run_dir)
+    if recorded is not None:
+        if recorded["checkpoint_sha256"] != frozen["sha256"]:
+            raise RuntimeError(f"{run_dir}: the recorded held-out result belongs to another checkpoint")
+        log("  held-out test: already evaluated -- kept as recorded")
+        return recorded
+    if test_frames.manifest_sha256 != ea.TEST_MANIFEST_SHA256 or set(test_frames.report["frames"]) != {"test"}:
+        raise RuntimeError("the frames are not the cache of the pinned held-out test manifest")
+    entries = test_frames.entries("test")
+    if len(entries) != ea.EXPECTED_TEST_IMAGES:
+        raise RuntimeError(f"{len(entries)} test images, expected {ea.EXPECTED_TEST_IMAGES}")
+    model, _ = load_frozen(run_dir, reference_arrays, mixed_precision, image_size)
+    ids, grades = [i for i, _ in entries], [g for _, g in entries]
+    metrics, rows = at.metrics_from_logits(ids, grades, predict_logits(model, test_frames, ids))
+    out_dir = posixpath.join(run_dir, HELDOUT_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    pd.DataFrame(rows).to_csv(posixpath.join(out_dir, "per_sample.csv"), index=False)
+    result = {"set": "EyePACS held-out labelled test images", "role": HELDOUT_ROLE, "images": len(ids),
+              "grade_counts": np.bincount(grades, minlength=5).tolist(), "test_manifest_sha256": test_frames.manifest_sha256,
+              "frame_cache_fingerprint": test_frames.fingerprint, "checkpoint_sha256": frozen["sha256"],
+              "checkpoint_selected_by": SELECTION, "metrics": metrics, "evaluated": environment(repo_dir)}
+    path = posixpath.join(out_dir, "metrics.json")
+    with open(path + ".tmp", "w") as fh:
+        json.dump(result, fh, indent=1, default=float)
+    os.replace(path + ".tmp", path)
+    return result
+
+
+# --------------------------------------------------------------------------- the one adaptation run, end to end
+
+def state(run_dir):
+    """"complete" (pinned, validation result written) | "trained" | "in_progress" | "new"."""
     import multiseed_runs as msr
     if os.path.exists(posixpath.join(run_dir, "result.json")):
         return "complete"
@@ -378,7 +503,7 @@ def write_result(run_dir, results, frozen):
     import multiseed_runs as msr
     with open(posixpath.join(run_dir, "config.json")) as fh:
         config = json.load(fh)
-    payload = {"experiment": EXPERIMENT, "seed": config["seed"], "config": config, "frozen": frozen,
+    payload = {"experiment": config["experiment"], "seed": config["seed"], "config": config, "frozen": frozen,
                "best": results["best"], "last": results["last"], "history": msr.read_history(run_dir),
                "stop": msr.read_stop_decision(run_dir)}
     path = posixpath.join(run_dir, "result.json")
@@ -388,34 +513,27 @@ def write_result(run_dir, results, frozen):
     return payload
 
 
-def run_sequence(experiments_root, frames, reference_arrays, weights, seeds, *, repo_dir, staging_root, log=print,
-                 train_fn=None, evaluate_fn=None):
-    """The given seeds one after another, each in its own run directory, each model built fresh from the
-    ImageNet weights: train (or resume), freeze the selected checkpoint, evaluate it on the EyePACS validation
-    part. `seeds` has no default: how many adaptation runs are made is fixed in the research record, not here.
-    Any exception stops the sequence. A completed seed is kept as recorded."""
-    import gc
-
+def run_adaptation(experiments_root, frames, reference_arrays, weights, *, repo_dir, staging_root, log=print,
+                   train_fn=None, evaluate_fn=None):
+    """THE adaptation run: train (or resume), pin the selected checkpoint, score it on the EyePACS validation
+    part. One run, one directory; a completed run is returned as recorded. The held-out test evaluation is a
+    separate call (`evaluate_heldout_test`) made after this returns."""
     import multiseed_runs as msr
-    results = {}
-    for n, seed in enumerate(seeds, start=1):
-        run_dir = run_dir_for(experiments_root, frames.manifest_sha256, seed)
-        log(f"=== [{n}/{len(seeds)}] seed {seed}: {seed_state(run_dir)} | {run_dir}")
-        if seed_state(run_dir) == "complete":
-            with open(posixpath.join(run_dir, "result.json")) as fh:
-                results[int(seed)] = json.load(fh)
-            read_frozen(run_dir)
-            continue
-        (train_fn or train_seed)(run_dir, frames, seed, reference_arrays, weights, repo_dir=repo_dir,
-                                 staging_dir=posixpath.join(staging_root, f"seed_{seed}"), log=log)
-        if msr.read_stop_decision(run_dir) is None:
-            raise RuntimeError(f"{run_dir}: seed {seed} returned without a stop decision -- training is not finished")
-        frozen = freeze_checkpoint(run_dir)
-        evaluated = (evaluate_fn or evaluate_run)(run_dir, frames, seed, reference_arrays, weights)
-        if evaluated["best"]["checkpoint"]["weights_sha256"] != frozen["sha256"]:
-            raise RuntimeError(f"{run_dir}: the evaluated BEST is not the frozen checkpoint")
-        results[int(seed)] = write_result(run_dir, evaluated, frozen)
-        log(f"=== [{n}/{len(seeds)}] seed {seed} DONE: EyePACS validation QWK {frozen['val_qwk']:.4f} at epoch index "
-            f"{frozen['best_epoch_index']} | frozen {frozen['sha256']}")
-        gc.collect()
-    return results
+    run_dir = run_dir_for(experiments_root, frames.manifest_sha256)
+    log(f"=== EyePACS adaptation (one run, seed {ADAPTATION_SEED}): {state(run_dir)} | {run_dir}")
+    if state(run_dir) == "complete":
+        read_frozen(run_dir)
+        with open(posixpath.join(run_dir, "result.json")) as fh:
+            return json.load(fh)
+    (train_fn or train)(run_dir, frames, reference_arrays, weights, repo_dir=repo_dir,
+                        staging_dir=posixpath.join(staging_root, f"seed_{ADAPTATION_SEED}"), log=log)
+    if msr.read_stop_decision(run_dir) is None:
+        raise RuntimeError(f"{run_dir}: the run returned without a stop decision -- training is not finished")
+    frozen = pin_checkpoint(run_dir, repo_dir)
+    evaluated = (evaluate_fn or evaluate_run)(run_dir, frames, reference_arrays, weights)
+    if evaluated["best"]["checkpoint"]["weights_sha256"] != frozen["sha256"]:
+        raise RuntimeError(f"{run_dir}: the evaluated BEST is not the pinned checkpoint")
+    result = write_result(run_dir, evaluated, frozen)
+    log(f"=== adaptation DONE: EyePACS validation QWK {frozen['val_qwk']:.4f} at epoch index {frozen['best_epoch_index']} "
+        f"| pinned {frozen['sha256']}")
+    return result

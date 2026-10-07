@@ -1,0 +1,18 @@
+{
+ "manifest": "eyepacs_heldout_test_v1.csv",
+ "manifest_sha256": "84a344ab1c780899170def378b0efbc021ae642005ba585512a772b2268b7e6d",
+ "images": 16249,
+ "patients": 12048,
+ "grade_counts": [
+  11362,
+  1398,
+  2644,
+  448,
+  397
+ ],
+ "label_file": "EyeQ repository data/Label_EyeQ_test.csv (columns image, DR_grade only)",
+ "label_file_sha256": "5e3a80415311b9513a957da351bb04b16b9ef661db6ef2161794d5b7da6aaaae",
+ "excluded": [],
+ "quality_filter": "none (the quality column is not read)",
+ "role": "held-out evaluation of the frozen adaptation model; never selection"
+}

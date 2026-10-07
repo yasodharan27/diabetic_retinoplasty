@@ -1,6 +1,6 @@
 """CPU tests for eyepacs_adaptation_train. Random ConvNeXt weights and synthetic 64-pixel frames only: no EyePACS
 image is decoded, no APTOS file is read, and nothing here is an adaptation result. The short run exists to prove
-the checkpoint / selection / freezing mechanics."""
+the checkpoint / selection / pinning / held-out-evaluation mechanics."""
 import inspect
 import json
 import os
@@ -23,7 +23,7 @@ REPO = os.path.dirname(os.path.abspath(et.__file__))
 SMALL = 64
 
 
-def _reference_arrays(size):
+def reference_arrays(size=SMALL):
     keras.utils.set_random_seed(7)
     from keras.applications import ConvNeXtTiny
     ref = ConvNeXtTiny(include_top=False, weights=None, include_preprocessing=True, pooling="avg",
@@ -35,18 +35,24 @@ def _reference_arrays(size):
     return [np.asarray(v.numpy()) for v in ref.weights if "prestem" not in v.path]
 
 
-REF_ARRAYS = _reference_arrays(SMALL)
+REF_ARRAYS = reference_arrays()
 CW = list(et.APPROVED_CLASS_WEIGHTS)
 
 
 class FakeFrames:
     """Stands in for eyepacs_adaptation_data.FrameCache with small frames."""
-    manifest_sha256 = "f" * 64
     fingerprint = "e" * 64
 
-    def __init__(self, n_train=20, n_val=10, size=SMALL):
-        self._entries = {"train": [(f"{p}_{eye}.jpeg", (p + k) % 5) for p in range(1, n_train // 2 + 1) for k, eye in enumerate(("left", "right"))],
-                         "val": [(f"{p}_{eye}.jpeg", (p + k) % 5) for p in range(900, 900 + n_val // 2) for k, eye in enumerate(("left", "right"))]}
+    def __init__(self, splits=("train", "val"), n=(20, 10), size=SMALL, manifest_sha256="f" * 64, first_patient=1):
+        self.manifest_sha256 = manifest_sha256
+        self._entries, patient = {}, first_patient
+        for split, count in zip(splits, n):
+            self._entries[split] = []
+            for _ in range(count // 2):
+                for k, eye in enumerate(("left", "right")):
+                    self._entries[split].append((f"{patient}_{eye}.jpeg", (patient + k) % 5))
+                patient += 1
+        self.report = {"frames": {s: len(v) for s, v in self._entries.items()}}
         self.size = size
         self.read = []
 
@@ -60,14 +66,34 @@ class FakeFrames:
         return np.random.default_rng(patient + image.endswith("left.jpeg")).random((self.size, self.size, 3)).astype(np.float32)
 
 
+def small_adaptation(root, frames, tmp):
+    """A two-epoch synthetic adaptation run through the real loop (used here and by the APTOS-arm tests)."""
+    def train(run_dir, frames, reference_arrays, weights, **kw):
+        return et.train(run_dir, frames, reference_arrays, weights, max_epochs=2, mixed_precision=False,
+                        image_size=SMALL, workers=1, **kw)
+
+    def evaluate(run_dir, frames, reference_arrays, weights):
+        return et.evaluate_run(run_dir, frames, reference_arrays, weights, mixed_precision=False, image_size=SMALL)
+    result = et.run_adaptation(root, frames, REF_ARRAYS, CW, repo_dir=REPO, staging_root=os.path.join(tmp, "staging"),
+                               log=lambda *a: None, train_fn=train, evaluate_fn=evaluate)
+    return result, train, evaluate
+
+
 class ProtocolTests(unittest.TestCase):
     def test_protocol_is_p_with_batch_16_only(self):
         self.assertEqual({k: v for k, v in et.PROTOCOL.items() if k != "batch_size"},
                          {k: v for k, v in at.P_PROTOCOL.items() if k != "batch_size"})
         self.assertEqual((et.PROTOCOL["batch_size"], at.P_PROTOCOL["batch_size"]), (16, 2))
         self.assertEqual((et.PROTOCOL["learning_rate"], et.PROTOCOL["weight_decay"], et.PROTOCOL["max_epochs"],
-                          et.PROTOCOL["early_stopping_patience"], et.PROTOCOL["monitor"]), (1e-4, 0.05, 50, 12, "val_QWK"))
-        self.assertEqual(et.SEEDS, (42, 123, 2026))
+                          et.PROTOCOL["early_stopping_patience"], et.PROTOCOL["monitor"], et.PROTOCOL["mode"]),
+                         (1e-4, 0.05, 50, 12, "val_QWK", "max"))
+
+    def test_exactly_one_adaptation_run(self):
+        self.assertEqual((et.ADAPTATION_RUNS, et.ADAPTATION_SEED), (1, 42))
+        self.assertFalse(hasattr(et, "run_sequence") or hasattr(et, "SEEDS"))
+        for function in (et.run_adaptation, et.train, et.run_dir_for, et.run_mapping):
+            self.assertFalse({"seed", "seeds"} & set(inspect.signature(function).parameters))   # no seed can be passed
+        self.assertTrue(et.run_dir_for("x", "a" * 64).endswith("p_eyepacs_aaaaaaaaaaaa_seed42"))
 
     def test_class_weights_come_from_the_pinned_manifest_training_part(self):
         rows = ea.read_split(os.path.join(REPO, "dataset_splits"), ea.MANIFEST_SHA256)
@@ -78,13 +104,19 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             et.class_weights(changed)
 
-    def test_no_aptos_idrid_or_quality_dependency(self):
+    def test_no_aptos_idrid_ddr_or_quality_dependency_and_no_test_set_in_training(self):
         source = inspect.getsource(et)
         for forbidden in ("verify_split", "Arch1Bundle", "arch1_data", "stage34_cache_v2", "DOWNSTREAM_SPLIT", "Label_EyeQ",
-                          "image_quality", "idrid", "ddr_probe", "train_images"):
+                          "image_quality", "idrid", "ddr_probe", "train_images", "e1_model", "e2_control", "lesion_loss"):
             self.assertNotIn(forbidden, source)
-        self.assertNotIn("test", {p for f in (et.train_seed, et.run_sequence, et.freeze_checkpoint)
-                                  for p in inspect.signature(f).parameters})
+        for function in (et.train, et.run_adaptation, et.training_loop, et.pin_checkpoint, et.selected_epoch):
+            self.assertFalse([p for p in inspect.signature(function).parameters if "test" in p])
+            self.assertNotIn("heldout", inspect.getsource(function).replace("evaluate_heldout_test", ""))
+        self.assertNotIn('entries("test")', inspect.getsource(et.train) + inspect.getsource(et.run_adaptation))
+        with tempfile.TemporaryDirectory() as tmp:                         # a cache that holds test frames is refused
+            with self.assertRaises(RuntimeError):
+                et.train(os.path.join(tmp, "r"), FakeFrames(splits=("train", "val", "test"), n=(4, 4, 4)), REF_ARRAYS, CW,
+                         repo_dir=REPO, staging_dir=os.path.join(tmp, "s"))
 
 
 class ModelAndInputTests(unittest.TestCase):
@@ -128,8 +160,6 @@ class ModelAndInputTests(unittest.TestCase):
         np.testing.assert_array_equal(x0["stage5_input"], x0b["stage5_input"])   # independent of workers
         seen = [g for i in range(len(seq)) for g in seq[i][1]]
         self.assertEqual(sorted(seen), sorted(g for _, g in entries))             # every image once per epoch
-        other = et.make_epoch_sequence(frames, entries, 4, 42, 16, augment=True)[0][1]
-        self.assertFalse(np.array_equal(other, y0) and itd.epoch_training_order(entries, 42, 4) == order)
         val = et.make_epoch_sequence(frames, frames.entries("val"), 0, 42, 16, augment=False)
         xv, yv = val[0]
         np.testing.assert_array_equal(yv, [g for _, g in frames.entries("val")])   # given order, unaugmented
@@ -148,63 +178,56 @@ class RunTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         cls.frames = FakeFrames()
         cls.root = os.path.join(cls.tmp.name, "exp")
-        cls.kw = dict(repo_dir=REPO, staging_root=os.path.join(cls.tmp.name, "staging"), log=lambda *a: None)
-
-        def train(run_dir, frames, seed, reference_arrays, weights, **kw):
-            return et.train_seed(run_dir, frames, seed, reference_arrays, weights, max_epochs=2, mixed_precision=False,
-                                 image_size=SMALL, workers=1, **kw)
-
-        def evaluate(run_dir, frames, seed, reference_arrays, weights):
-            return et.evaluate_run(run_dir, frames, seed, reference_arrays, weights, mixed_precision=False, image_size=SMALL)
+        cls.result, train, evaluate = small_adaptation(cls.root, cls.frames, cls.tmp.name)
         cls.train, cls.evaluate = staticmethod(train), staticmethod(evaluate)
-        cls.results = et.run_sequence(cls.root, cls.frames, REF_ARRAYS, CW, (42,), train_fn=train, evaluate_fn=evaluate, **cls.kw)
-        cls.run_dir = et.run_dir_for(cls.root, cls.frames.manifest_sha256, 42)
+        cls.run_dir = et.run_dir_for(cls.root, cls.frames.manifest_sha256)
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_run_writes_config_history_best_and_a_frozen_checkpoint(self):
+    def test_run_writes_config_history_metadata_and_a_pinned_checkpoint(self):
         import multiseed_runs as msr
         with open(os.path.join(self.run_dir, "config.json")) as fh:
             cfg = json.load(fh)
-        self.assertEqual((cfg["experiment"], cfg["batch_size"], cfg["learning_rate"], cfg["weight_decay"], cfg["quality_filter"]),
-                         ("EyePACSAdaptation", 16, 1e-4, 0.05, "none"))
-        self.assertEqual(cfg["split_manifest_sha256"], self.frames.manifest_sha256)
-        self.assertEqual(cfg["checkpoint_selection"], et.SELECTION)
+        self.assertEqual((cfg["experiment"], cfg["seed"], cfg["adaptation_runs"], cfg["batch_size"], cfg["learning_rate"],
+                          cfg["weight_decay"], cfg["quality_filter"]), ("EyePACSAdaptation", 42, 1, 16, 1e-4, 0.05, "none"))
+        self.assertEqual((cfg["split_manifest_sha256"], cfg["checkpoint_selection"]), (self.frames.manifest_sha256, et.SELECTION))
         history = msr.read_history(self.run_dir)
         self.assertEqual([h["epoch"] for h in history], [1, 2])
-        self.assertTrue(all(h["val_QWK"] is not None for h in history))
         self.assertEqual(msr.read_stop_decision(self.run_dir)["stop_reason"], "epoch_cap")
-        result = self.results[42]
-        frozen = result["frozen"]
+        frozen = self.result["frozen"]
         completed, top = et.selected_epoch(history)                         # selection = validation QWK, first maximum
         self.assertEqual((frozen["best_epoch_index"], frozen["val_qwk"]), (completed - 1, top))
-        self.assertEqual(result["best"]["checkpoint"]["weights_sha256"], frozen["sha256"])
-        self.assertEqual(result["best"]["set"], "EyePACS adaptation validation (selection set)")
-        self.assertIn("qwk", result["best"]["metrics"])
-        self.assertTrue(os.path.exists(os.path.join(self.run_dir, "metrics", "per_sample_best.csv")))
-        self.assertEqual(et.seed_state(self.run_dir), "complete")
+        self.assertEqual(self.result["best"]["checkpoint"]["weights_sha256"], frozen["sha256"])
+        self.assertEqual(self.result["best"]["set"], "EyePACS adaptation validation (selection set)")
+        for key in ("git_commit", "python", "tensorflow", "keras", "numpy", "gpus", "platform", "utc"):
+            self.assertIn(key, frozen["pinned"])                            # commit, library versions, hardware
+        self.assertEqual(frozen["identity"]["split_manifest_sha256"], self.frames.manifest_sha256)
+        self.assertEqual((frozen["training_configuration"]["batch_size"], frozen["training_configuration"]["max_epochs"],
+                          frozen["training_configuration"]["early_stopping_patience"]), (16, 50, 12))
+        with open(os.path.join(self.run_dir, "run_metadata.json")) as fh:
+            self.assertEqual(len(json.load(fh)["invocations"]), 1)
+        self.assertEqual(et.state(self.run_dir), "complete")
         self.assertTrue(set(self.frames.read) <= {i for s in ("train", "val") for i, _ in self.frames.entries(s)})
 
-    def test_frozen_checkpoint_is_pinned_and_never_replaced(self):
+    def test_pinned_checkpoint_is_immutable_and_hands_over_the_encoder_only(self):
         path, record = et.read_frozen(self.run_dir)
         self.assertEqual(at._sha256(path), record["sha256"])
-        self.assertEqual(et.freeze_checkpoint(self.run_dir), record)        # same file: accepted, unchanged
+        self.assertEqual(et.pin_checkpoint(self.run_dir), record)           # same file: accepted, unchanged
         model, again = et.load_frozen(self.run_dir, REF_ARRAYS, mixed_precision=False, image_size=SMALL)
         self.assertFalse(model.trainable_variables)
         self.assertEqual(again, record)
-        logits = et.predict_logits(model, self.frames, [i for i, _ in self.frames.entries("val")])
-        self.assertEqual(logits.shape, (10, 4))
-        arrays = et.adapted_backbone_arrays(model)                          # the hand-over to the APTOS code
+        arrays = et.adapted_backbone_arrays(model)
+        self.assertFalse(all(np.array_equal(a, b) for a, b in zip(arrays, REF_ARRAYS)))   # trained, not ImageNet's
         for seed in (42, 123):
             p_ep = pl.build_pl_model("P", seed, arrays, image_size=SMALL)
             for a, v in zip(arrays, p_ep.get_layer(pl.BACKBONE_NAME).weights):
                 np.testing.assert_array_equal(a, v.numpy())                 # the adapted encoder, exactly
-            kernel, bias = pl.corn_head_initial_weights(seed)
-            np.testing.assert_array_equal(p_ep.get_layer("corn").get_layer("corn_logits").get_weights()[0], kernel)
+            np.testing.assert_array_equal(p_ep.get_layer("corn").get_layer("corn_logits").get_weights()[0],
+                                          pl.corn_head_initial_weights(seed)[0])
         self.assertFalse(np.array_equal(model.get_layer("corn").get_layer("corn_logits").get_weights()[0],
-                                        pl.corn_head_initial_weights(42)[0]))   # the trained head is not carried over
+                                        pl.corn_head_initial_weights(42)[0]))   # the EyePACS-trained head is not carried over
         with open(path, "rb") as fh:
             original = fh.read()
         try:
@@ -217,19 +240,45 @@ class RunTests(unittest.TestCase):
                 fh.write(original)
         et.read_frozen(self.run_dir)
 
-    def test_a_run_directory_holds_one_configuration_and_a_finished_seed_is_kept(self):
+    def test_heldout_test_is_scored_once_from_the_pinned_checkpoint_and_selects_nothing(self):
+        frozen_before = dict(et.read_frozen(self.run_dir)[1])
+        with self.assertRaises(RuntimeError):                               # not the pinned held-out manifest
+            et.evaluate_heldout_test(self.run_dir, FakeFrames(splits=("test",), n=(6,), first_patient=5000), REF_ARRAYS,
+                                     mixed_precision=False, image_size=SMALL, log=lambda *a: None)
+        with self.assertRaises(RuntimeError):                               # the adaptation cache is not a test cache
+            et.evaluate_heldout_test(self.run_dir, self.frames, REF_ARRAYS, mixed_precision=False, image_size=SMALL)
+        test = FakeFrames(splits=("test",), n=(6,), manifest_sha256=ea.TEST_MANIFEST_SHA256, first_patient=5000)
+        expected = ea.EXPECTED_TEST_IMAGES
+        try:
+            ea.EXPECTED_TEST_IMAGES = 6                                     # synthetic stand-in for the 16,249
+            result = et.evaluate_heldout_test(self.run_dir, test, REF_ARRAYS, mixed_precision=False, image_size=SMALL,
+                                              log=lambda *a: None)
+        finally:
+            ea.EXPECTED_TEST_IMAGES = expected
+        self.assertEqual((result["images"], result["checkpoint_sha256"], result["role"]), (6, frozen_before["sha256"], et.HELDOUT_ROLE))
+        self.assertIn("qwk", result["metrics"])
+        self.assertTrue(os.path.exists(os.path.join(self.run_dir, et.HELDOUT_DIR, "per_sample.csv")))
+        reads = len(test.read)
+        again = et.evaluate_heldout_test(self.run_dir, test, REF_ARRAYS, mixed_precision=False, image_size=SMALL, log=lambda *a: None)
+        self.assertEqual((again, len(test.read)), (json.loads(json.dumps(result, default=float)), reads))   # never recomputed
+        self.assertEqual(et.read_frozen(self.run_dir)[1], frozen_before)    # the pinned checkpoint is untouched
+        with open(os.path.join(self.run_dir, "result.json")) as fh:
+            self.assertNotIn("heldout", fh.read())                          # and the run's own record does not read it
+        with tempfile.TemporaryDirectory() as tmp:                          # an unpinned run cannot be scored
+            with self.assertRaises(RuntimeError):
+                et.evaluate_heldout_test(tmp, test, REF_ARRAYS)
+
+    def test_one_configuration_per_directory_and_a_finished_run_is_kept(self):
         with self.assertRaises(RuntimeError):                               # other class weights = another configuration
-            self.train(self.run_dir, self.frames, 42, REF_ARRAYS, [1.0] * 5, repo_dir=REPO,
+            self.train(self.run_dir, self.frames, REF_ARRAYS, [1.0] * 5, repo_dir=REPO,
                        staging_dir=os.path.join(self.tmp.name, "s2"), log=lambda *a: None)
         calls = []
-        kept = et.run_sequence(self.root, self.frames, REF_ARRAYS, CW, (42,), train_fn=lambda *a, **k: calls.append(a),
-                               evaluate_fn=self.evaluate, **self.kw)
+        kept = et.run_adaptation(self.root, self.frames, REF_ARRAYS, CW, repo_dir=REPO, staging_root=os.path.join(self.tmp.name, "st"),
+                                 log=lambda *a: None, train_fn=lambda *a, **k: calls.append(a), evaluate_fn=self.evaluate)
         self.assertEqual(calls, [])
-        self.assertEqual(kept[42]["frozen"], self.results[42]["frozen"])
-        with self.assertRaises(ValueError):
-            et.run_dir_for(self.root, self.frames.manifest_sha256, 7)
-        with self.assertRaises(RuntimeError):                               # an unfinished run cannot be frozen
-            et.freeze_checkpoint(os.path.join(self.tmp.name, "nothing"))
+        self.assertEqual(kept["frozen"], self.result["frozen"])
+        with self.assertRaises(RuntimeError):                               # an unfinished run cannot be pinned
+            et.pin_checkpoint(os.path.join(self.tmp.name, "nothing"))
 
 
 if __name__ == "__main__":
