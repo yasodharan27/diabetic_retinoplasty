@@ -4174,3 +4174,68 @@ The probe of §62 is implemented in `e1_probe.py` (tests: `tests/test_e1_probe.p
 - **Reported, not used for any choice:** per-epoch training loss, validation loss and validation mean cell AUROC of every probe, and the final training-set scores, to show whether a probe is under-trained. The final epoch is the one scored, as pre-registered.
 
 - **Added 2026-10-07, still before any probe result.** The first two Colab attempts crashed the session by exhausting RAM during feature extraction (seed 42, P encoder; no probe had been trained and nothing was saved). `e1_probe.py` now writes the frozen features to a float16 memory-mapped file on local disk and reads them in batches, runs one forward pass source per batch from the RGB cache only, logs RAM use, and resumes from the (model, seed) pairs already finished. The probe form, loss, optimiser, batch size, epochs, initialisation, batch order, targets, scoring and criterion are unchanged; a test confirms the probe trained from memory-mapped features equals the one trained from in-memory features.
+
+
+### 63.2 Mechanism probe — result (Colab T4 2026-10-07, commit `a8fefb3`; bootstrap on the laptop; no grader trained, E1 unchanged)
+
+**Run.** `e1_probe.run` (notebook cell 9), protocol of §62 / §63.1: frozen P BEST and frozen E1 BEST of each seed, the same fresh 1×1 probe on the 16×16×768 map, lesion loss only, Adam 1e-3, batch 16, 5 epochs, no augmentation, final epoch; 2,921 training and 730 validation images; E1's trained lesion head and both grading heads not used. Output `experiments/E1MultiTask/mechanism_probe/`. Checked locally: the probe's validation targets equal the E1 targets recomputed from the Stage-4 cache; each frozen encoder's grading logits reproduce its stored BEST table to one or two float16 steps (max 0.0078, one case 0.0156), so the encoders are the evaluated models; the E1 weights hashes equal those in the result files.
+
+| validation cell AUROC (target ≥ 0.5) | | MA | HE | EX | SE | mean |
+|---|---|---|---|---|---|---|
+| seed 42 | probe on P | 0.7954 | 0.9476 | 0.8685 | 0.9758 | 0.8968 |
+| | probe on E1 | 0.9559 | 0.9865 | 0.9647 | 0.9956 | 0.9757 |
+| | E1 − P | +0.1605 | +0.0389 | +0.0962 | +0.0198 | **+0.0789** (0.0757 to 0.0822) |
+| seed 123 | probe on P | 0.8206 | 0.9466 | 0.8824 | 0.9752 | 0.9062 |
+| | probe on E1 | 0.9457 | 0.9830 | 0.9553 | 0.9939 | 0.9695 |
+| | E1 − P | +0.1252 | +0.0365 | +0.0729 | +0.0188 | **+0.0633** (0.0604 to 0.0666) |
+| seed 2026 | probe on P | 0.8206 | 0.9580 | 0.8883 | 0.9805 | 0.9119 |
+| | probe on E1 | 0.9541 | 0.9865 | 0.9647 | 0.9955 | 0.9752 |
+| | E1 − P | +0.1335 | +0.0284 | +0.0764 | +0.0150 | **+0.0633** (0.0606 to 0.0663) |
+| three-seed mean | E1 − P | +0.1397 | +0.0346 | +0.0818 | +0.0179 | **+0.0685 (95 % interval 0.0659 to 0.0715)** |
+
+Intervals: paired bootstrap, 2,000 grade-stratified image resamples, seed 20260927, the same resamples for both probes and all seeds.
+
+**Criterion (§62): satisfied.** probe(E1) − probe(P) is positive in 3 / 3 seeds and the interval of the three-seed mean excludes zero. → **A. MECHANISM SUPPORTED; E2 is eligible** under the §62 decision tree. E2 is not run automatically.
+
+**Probe behaviour (reported; nothing was selected with it).**
+
+| | P-42 | E1-42 | P-123 | E1-123 | P-2026 | E1-2026 |
+|---|---|---|---|---|---|---|
+| validation mean AUROC, epochs 1 → 5 | 0.835 → 0.897 | 0.972 → 0.976 | 0.834 → 0.906 | 0.965 → 0.970 | 0.863 → 0.912 | 0.971 → 0.975 |
+| change in the last epoch | +0.0030 | +0.0006 | +0.0076 | +0.0003 | +0.0043 | +0.0012 |
+| validation loss, epoch 5 (last change) | 0.1838 (−0.0022) | 0.1171 (−0.0001) | 0.1813 (−0.0026) | 0.1247 (−0.0002) | 0.1707 (−0.0033) | 0.1183 (−0.0008) |
+| training − validation mean AUROC | +0.005 | +0.004 | +0.002 | +0.002 | +0.004 | +0.003 |
+| validation loss before training | 4.58 | 1.82 | 4.27 | 1.29 | 4.85 | 2.29 |
+| mean absolute feature value | 1.40 | 1.00 | 1.78 | 0.93 | 1.69 | 1.08 |
+
+- The E1 probes have converged by epoch 2–3. **The P probes are still improving at epoch 5** (+0.003 to +0.008 per epoch, loss still falling): under the pre-registered five epochs the P probe is not fully trained, so the measured difference **overstates** how much better E1's map supports lesion prediction. P's features are larger in magnitude and its probe starts from a much higher loss, which slows it at the fixed learning rate.
+- The direction is not in doubt on this evidence: the gap (0.063–0.079) is 8 to 25 times the P probe's last-epoch gain, and that gain is shrinking; neither probe over-fits (training ≈ validation). The size of the converged gap is not established.
+- The intervals are narrow because each resample holds about 187,000 cells; they reflect resampling of validation images only, not probe-training variation, and there are three seeds.
+
+**What this establishes.** The lesion supervision changed the shared representation: E1's final feature map makes the Stage-4 lesion maps much more linearly readable than P's, most for MA (+0.14) and EX (+0.08), least for SE and HE, which P's features already encode well (0.95–0.98). So the supervision was not merely absorbed by features P already had; C2's prediction (§50) that P's features would largely support the same head is not borne out at this resolution and with a linear read-out.
+
+**What it does not establish.** Any grading benefit — E1 remains COMPARABLE to P (§63, unchanged). A representation that encodes the teacher's lesion maps better did not grade better. Agreement is with Stage 4, not with lesion ground truth. Whether a longer-trained or non-linear probe on P would close the gap is not tested, and is not to be tested as a new criterion.
+
+**Position.** §62 tree: comparable + mechanism changed → E2 (shuffled lesion targets) is eligible. E2 would test whether the effect needs image-aligned targets rather than an extra loss term. Nothing is launched; E2 and E3 remain the user's decision.
+
+
+### 63.3 E2 — shuffled-target control: pre-run record (2026-10-07; written before any E2 training)
+
+**Why.** §63.2 met the §62 criterion, so E2 is eligible. E2 asks whether E1's representation change needs **image-aligned** lesion supervision or whether an auxiliary spatial loss of the same form produces it by itself. E1's grading conclusion (COMPARABLE to P, §63) is locked and is not revisited by E2. E2 is a control: it is not selected against E1, replaces nothing and tunes nothing. No IDRiD.
+
+**Design (locked).** E1 in every respect — model, loss, λ = 1.0, optimiser, P protocol, augmentation, bias prior, seeds 42 / 123 / 2026, BEST by validation QWK — except the **training** lesion targets: each training image receives the cached Stage-4 map of its partner in one fixed derangement of the training set. Validation uses the true, image-aligned targets. Implementation: `e2_control.py` (new; no E1 or P file changed), tests `tests/test_e2_control.py` (6 pass), notebook cells 10 (training) and 11 (probe).
+
+- **Derangement.** Seed 20261001 (the seed pre-registered in §62), drawn as the project's other derangements (seeded permutations until none has a fixed point), over the 2,921 training images in bundle order; one mapping for all three model seeds. Verified on the real training set: a permutation, 0 fixed points, every image a partner exactly once, no validation image involved; mapping SHA-256 `9ecaa1a7bfcba0d6…`. It is written into every run's `config.json` and checked again before each seed.
+- **How the partner's map is used.** It replaces the image's own map before the augmentation, so E1's augmentation code runs unchanged on [image RGB | partner map] (the image's geometry, RGB-only intensity). The image's own Stage-4 file is never opened by the training sequence (tested: exactly the partner's file is read for every sample; the RGB equals what E1 fed that image).
+- **Same target distribution.** Every training map is used exactly once, so the per-class mean target — and therefore the bias prior — is E1's. No pair has identical targets. Label-free note: an image's own cells and its partner's agree at ≥ 0.5 in 78–92 % of cells per class simply because most cells are negative, so shuffled targets still carry the dataset-level prior; what they lack is the image-specific part.
+- **Bookkeeping.** E1's gates cover E2 (same model, targets definition and log aliases) and must be recorded as passed. Run directories `experiments/E2ShuffledTargets/e2_cb5fc7a8d370_seed{N}/`.
+
+**Analysis fixed in advance.**
+
+- *Probe.* The §63.2 probe, unchanged (`e1_probe`: same fresh 1×1 probe, Adam 1e-3, batch 16, 5 epochs, seed, batch order, aligned targets), on each frozen E2 BEST encoder; E2's trained lesion head and grading head are not used. The stored P and E1 probe outputs are reused; the E2 probe refuses to run unless its validation targets are identical to theirs.
+- *Comparison.* Per class and mean: P, E1, E2; E2 − P and E2 − E1 per seed and for the three-seed mean, with the §63.2 paired bootstrap (the same 2,000 grade-stratified image resamples, seed 20260927, shared by all models and seeds). The bootstrap is computed from exact per-image-pair counts instead of re-sorting the cells of every resample; checked against §63.2, it reproduces the recorded E1 − P intervals to 1e-8.
+- *Reading (the user's framework, 2026-10-07; no other is introduced).* **A — image-aligned supervision required:** E1 shows the large probe improvement and E2 does not reproduce it. **B — auxiliary-loss effect:** E2 reproduces a similar improvement despite shuffled targets; then the change is not called lesion-specific. **C — inconclusive:** the E2 probe is unstable or under-trained, or the comparison cannot be interpreted. The framework sets no numerical boundary between "does not reproduce" and "similar"; the share of the E1 gain that E2 reproduces, (E2 − P) / (E1 − P), will be reported with both intervals, and an intermediate result will be reported as intermediate rather than forced into A or B.
+- *Known caveat carried over.* The P probes were not converged at five epochs (§63.2); the same protocol is applied to E2 and its per-epoch behaviour is reported.
+- *Grading.* E2's QWK / AUROC against same-seed P is reported descriptively; it is not used to choose anything.
+
+**Status.** Nothing trained. E3 is not run.
