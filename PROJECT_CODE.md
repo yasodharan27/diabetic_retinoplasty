@@ -86,6 +86,8 @@ section numbers below refer to it.
    Runner implemented, not run (§71: `ddr_probe_ep.py`, `colab/notebooks/ddr_lesion_probe_ep.ipynb`).
 9. **E2-EP** only if that criterion is met (enforced in code).
 10. **IDRiD batch 2** for the EP arms.
+    Steps 5 - 9 are done and recorded (§72 - §77). Batch 2: protocol locked and evaluator implemented (§78:
+    `idrid_batch2_eval.py`, `idrid_batch2_protocol.json`, `colab/notebooks/idrid_batch2_ep.ipynb`); not run.
 
 Not planned: any further fusion, gating, routing or graph module; E3; backbone or foundation-model swaps; λ
 sweeps before the steps above; a new architecture.

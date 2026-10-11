@@ -151,25 +151,31 @@ def table_from_logits(ids, grades, logits):
 # --------------------------------------------------------------------------- gates (no IDRiD image is read)
 
 def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=None, protocol_path=PROTOCOL_PATH,
-          settings=None, official=True, models=None, log=print):
+          settings=None, official=True, models=None, log=print, batch=None):
     """The pre-inference gates. `bundle`: the verified v2 bundle with the cached APTOS RGB frames. Writes
     gates.json and returns it; `official=False` marks a pre-check that can never unlock IDRiD. `models` is for
-    tests only."""
+    tests only. `batch` (default: batch 1) supplies another batch's protocol loader, file verifier, model
+    loader, predictor and name -- the gates themselves are the same."""
+    batch = dict({"load_protocol": load_protocol, "verify_files": verify_files, "load_models": load_models,
+                  "predict_logits": predict_logits, "name": "idrid batch 1 pre-inference gates", "label": "IDRiD BATCH 1"},
+                 **(batch or {}))
+    load_protocol_, verify_files_, load_models_, predict_logits_ = (batch[k] for k in ("load_protocol", "verify_files",
+                                                                                        "load_models", "predict_logits"))
     import pandas as pd
 
     import pathology_grader_severity_fusion as sf
-    protocol, protocol_sha, parent = load_protocol(protocol_path)
+    protocol, protocol_sha, parent = load_protocol_(protocol_path)
     settings = dict(settings or parent["inference"])
     if official and settings != parent["inference"]:
         raise ProtocolError("the official gates run with the locked inference settings only")
     tol = parent["parity"]["tolerances"]
     failures, checks = [], {}
     ig.prepare_gpu()
-    files = verify_files(protocol, drive_root)                       # gates 1, 2, 9 (raises on any mismatch)
+    files = verify_files_(protocol, drive_root)                      # gates 1, 2, 9 (raises on any mismatch)
     checks["checkpoint_sha256"] = {k: protocol["checkpoints"][k]["sha256"] for k in files["checkpoints"]}
     checks["p_table_sha256"] = {str(s): protocol["stored_p_tables"][f"p_seed{s}"]["sha256"] for s in SEEDS}
     checks["parent_protocol_sha256"] = protocol["parent_protocol"]["sha256"]
-    models = models if models is not None else load_models(files, settings)      # gates 6, 7
+    models = models if models is not None else load_models_(files, settings)     # gates 6, 7
     checks["grading_output_dtype"] = {f"{m}_seed{s}": str(net.outputs[0].dtype) for (m, s), net in models.items()}
     val_ids, val_grades = sf.authoritative_validation_ids()
     if list(bundle.val_ids) != list(val_ids):
@@ -220,7 +226,7 @@ def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=Non
             failures.append(f"{image_id}: RGB frame differs from the cache by {row['rgb_max_abs']:.3g}")
         raw_checks.append(row)
         raw_frames.append(rgb)
-    raw_logits = predict_logits(models, raw_frames, settings["batch_size"])
+    raw_logits = predict_logits_(models, raw_frames, settings["batch_size"])
     checks["raw_subset"] = {"images": subset, "grades": [int(grade_of[i]) for i in subset], "image_checks": raw_checks,
                             "predictions": {}}
     for key, logits in raw_logits.items():
@@ -231,7 +237,7 @@ def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=Non
         f"{[r.get('stage2_exact') for r in raw_checks].count(True)}/{len(raw_checks)}")
     # (b) all 730 validation images from the cached RGB frames
     cached = [bundle.load_sample(i)["rgb"] for i in val_ids]
-    full_logits = predict_logits(models, cached, settings["batch_size"])
+    full_logits = predict_logits_(models, cached, settings["batch_size"])
     checks["full_validation"] = {}
     for key, logits in full_logits.items():
         result = compare(logits, list(range(len(val_ids))), key)
@@ -244,7 +250,7 @@ def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=Non
     env = ig.environment(settings)
     if official and (env["gpu"] is None or env["keras_policy"] != parent["inference"]["keras_policy"]):
         failures.append("the official gates run on the GPU runtime under the locked precision policy")
-    result = {"gate": "idrid batch 1 pre-inference gates", "kind": "official gate" if official else "pre-check (cannot unlock IDRiD)",
+    result = {"gate": batch["name"], "kind": "official gate" if official else "pre-check (cannot unlock IDRiD)",
               "official": bool(official), "PASS": not failures, "failures": failures, "checks": checks, "tolerances": tol,
               "settings": settings, "environment": env, "protocol_sha256": protocol_sha, "git_commit": ig.git_commit(),
               "idrid_images_read": 0, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}
@@ -252,7 +258,7 @@ def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=Non
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "gates.json"), "w") as fh:
             json.dump(ph._jsonable(result), fh, indent=1)
-    log(f"IDRiD BATCH 1 GATES {'PASS' if result['PASS'] else 'FAIL'} ({result['kind']})"
+    log(f"{batch['label']} GATES {'PASS' if result['PASS'] else 'FAIL'} ({result['kind']})"
         + ("" if result["PASS"] else " | " + "; ".join(failures)))
     return result
 
@@ -263,28 +269,30 @@ def subset_table(table, mask):
     return {k: v[mask] for k, v in table.items()}
 
 
-def summarise(tables, mask, n_boot=ph.N_BOOT):
+def summarise(tables, mask, n_boot=ph.N_BOOT, *, models=MODELS, contrasts=None, primary=PRIMARY_CONTRASTS):
     """Per-seed metrics for P, E1 and E2 on the masked images, mean +/- SD over the three seeds (no ensemble,
     no seed selection), grade-stratified bootstrap intervals for the seed mean, and the paired differences
     (same images, same seed) E1 - P, E2 - P and -- descriptive -- E2 - E1 with intervals for their seed means.
-    The quantities and the bootstrap are those of idrid_grading_eval.summarise."""
+    The quantities and the bootstrap are those of idrid_grading_eval.summarise. `models`, `contrasts` and
+    `primary` default to batch 1; another batch names its own arms and paired differences."""
+    contrasts = CONTRASTS if contrasts is None else contrasts
     per_seed = {}
     for seed in SEEDS:
         per_seed[seed] = {}
-        for model in MODELS:
+        for model in models:
             m = ph.metrics(subset_table(tables[seed][model], mask))
             per_seed[seed][model] = {**pf.headline(m), "recall_per_grade": m["recall_per_grade"],
                                      "confusion_matrix": m["confusion_matrix"]}
     stat = lambda values: {"mean": float(np.mean(values)), "sd": float(np.std(values, ddof=1)), "per_seed": [float(v) for v in values]}
     aggregate = {}
-    for model in MODELS:
+    for model in models:
         aggregate[model] = {k: stat([per_seed[s][model][k] for s in SEEDS]) for k in pf.HEADLINE_KEYS}
         for g in range(5):
             aggregate[model][f"recall_grade{g}"] = stat([per_seed[s][model]["recall_per_grade"][g] for s in SEEDS])
-    grades = subset_table(tables[SEEDS[0]]["p"], mask)["grade"]
+    grades = subset_table(tables[SEEDS[0]][models[0]], mask)["grade"]
     indices = ph.bootstrap_indices(grades, n_boot)
     intervals = {}
-    for model in MODELS:
+    for model in models:
         draws = {k: [] for k in ph.BOOT_KEYS}
         for idx in indices:
             vals = [ph.bootstrap_metrics(subset_table(tables[s][model], mask), idx) for s in SEEDS]
@@ -292,7 +300,7 @@ def summarise(tables, mask, n_boot=ph.N_BOOT):
                 draws[k].append(np.mean([v[k] for v in vals]))
         intervals[model] = {k: [float(np.nanpercentile(d, 2.5)), float(np.nanpercentile(d, 97.5))] for k, d in draws.items()}
     differences = {}
-    for name, (a, b) in CONTRASTS.items():
+    for name, (a, b) in contrasts.items():
         point, draws = {k: [] for k in ph.METRICS}, {k: [] for k in ph.BOOT_KEYS}
         recall = {g: [] for g in range(5)}
         for s in SEEDS:
@@ -311,7 +319,7 @@ def summarise(tables, mask, n_boot=ph.N_BOOT):
             differences[name][f"recall_grade{g}"] = stat(recall[g])
         for cut in ("auroc_ge1", "auroc_ge2", "auroc_ge3", "auroc_ge4", "grade4_recall"):
             differences[name][cut] = stat([per_seed[s][a][cut] - per_seed[s][b][cut] for s in SEEDS])
-        differences[name]["role"] = "primary" if name in PRIMARY_CONTRASTS else "secondary, descriptive"
+        differences[name]["role"] = "primary" if name in primary else "secondary, descriptive"
         differences[name]["decoded_grades_differ"] = [int((subset_table(tables[s][a], mask)["pred"]
                                                            != subset_table(tables[s][b], mask)["pred"]).sum()) for s in SEEDS]
     return {"n": int(mask.sum()), "grade_counts": np.bincount(grades, minlength=5).tolist(), "per_seed": per_seed,
@@ -323,9 +331,9 @@ def _f(v, signed=False):
     return "n/a" if v is None or (isinstance(v, float) and np.isnan(v)) else (f"{v:+.4f}" if signed else f"{v:.4f}")
 
 
-def report_markdown(title, note, summary, protocol):
-    labels = {"p": "P (stored predictions of the earlier run; not run again)", "e1": "E1 (aligned lesion supervision)",
-              "e2": "E2 (shuffled lesion targets; control)"}
+def report_markdown(title, note, summary, protocol, *, labels=None, names=None):
+    labels = labels or {"p": "P (stored predictions of the earlier run; not run again)", "e1": "E1 (aligned lesion supervision)",
+                        "e2": "E2 (shuffled lesion targets; control)"}
     rows = (("qwk", "QWK"), ("auroc_ge1", "AUROC ≥1"), ("auroc_ge2", "AUROC ≥2"), ("auroc_ge3", "AUROC ≥3"),
             ("auroc_ge4", "AUROC ≥4"), ("recall_grade0", "recall, grade 0"), ("recall_grade1", "recall, grade 1"),
             ("recall_grade2", "recall, grade 2"), ("recall_grade3", "recall, grade 3"), ("recall_grade4", "recall, grade 4"),
@@ -334,7 +342,7 @@ def report_markdown(title, note, summary, protocol):
              f"Images: {summary['n']} (grades 0-4: {summary['grade_counts']}). Seeds 42, 123, 2026; mean ± SD over seeds; no "
              "ensemble, no seed selection. Decoding: grade = number of cumulative CORN probabilities above 0.5 (unchanged).", "",
              "## Disclosures", ""] + [f"- {d}" for d in protocol["disclosures"]] + [""]
-    for model in MODELS:
+    for model in labels:
         lines += [f"## {labels[model]}", "", "| | seed 42 | seed 123 | seed 2026 | mean | SD |", "|---|---|---|---|---|---|"]
         for key, name in rows:
             st = summary["aggregate"][model][key]
@@ -345,7 +353,7 @@ def report_markdown(title, note, summary, protocol):
         for seed in SEEDS:
             lines.append(f"Confusion matrix, seed {seed} (rows = true grade): {summary['per_seed'][seed][model]['confusion_matrix']}")
         lines.append("")
-    names = {"e1_minus_p": "E1 − P (primary)", "e2_minus_p": "E2 − P (primary)", "e2_minus_e1": "E2 − E1 (secondary, descriptive)"}
+    names = names or {"e1_minus_p": "E1 − P (primary)", "e2_minus_p": "E2 − P (primary)", "e2_minus_e1": "E2 − E1 (secondary, descriptive)"}
     lines += ["## Paired differences, same images and same seed", "",
               "| | QWK (95 % interval) | per seed | mean AUROC, four cuts (95 % interval) | AUROC ≥3 | AUROC ≥4 | grade-3 recall | "
               "grade-4 recall | false-urgent |", "|---|---|---|---|---|---|---|---|---|"]

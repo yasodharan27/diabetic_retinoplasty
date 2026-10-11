@@ -1,0 +1,195 @@
+{
+ "name": "IDRiD batch 2 -- cross-dataset evaluation of the frozen EyePACS-adapted graders P-EP, E1-EP and E2-EP (P reused from the earlier run)",
+ "prepared": "2026-10-11",
+ "research_record_section": "§78",
+ "parent_protocol": {
+  "file": "idrid_grading_protocol.json",
+  "sha256": "f93c1237eb81ab20397dea8bc6d9079871d6308578304f793dfabee17938587e",
+  "note": "the dataset (image-set and label-file hashes, the three primary exclusions), Stage-2 preprocessing, the 512 RGB frame, the inference settings, the decoding rule, the bootstrap and the parity tolerances are the parent protocol's, unchanged"
+ },
+ "seeds": [
+  42,
+  123,
+  2026
+ ],
+ "models": {
+  "p": "ImageNet ConvNeXt-Tiny + CORN, RGB. NOT run: the per-image tables stored by the earlier one-time run are reused",
+  "p_ep": "P trained on APTOS from the pinned EyePACS-adapted encoder with a fresh CORN head (pl_convnext P graph)",
+  "e1_ep": "E1 trained on APTOS from the same adapted encoder: 1x1 lesion head on aligned Stage-4 targets (e1_model). Only the grading output is read",
+  "e2_ep": "E1-EP with deranged training lesion targets (control). Same model definition. Only the grading output is read"
+ },
+ "adapted_encoder": {
+  "run_dir": "experiments/EyePACSAdaptation/p_eyepacs_c5f7e41501b9_seed42",
+  "path": "experiments/EyePACSAdaptation/p_eyepacs_c5f7e41501b9_seed42/checkpoints/best_b/model.weights.h5",
+  "sha256": "ef1c3beb30d7652553780d1989c703c3de06ef56cfd292f8e03c253b0cad87e0",
+  "note": "the one EyePACS adaptation checkpoint every EP run started from (record 72)"
+ },
+ "experiment": "EyePACSAdaptedAPTOS",
+ "checkpoints": {
+  "p_ep_seed42": {
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "8828eacb8bd12974aceaaa476cc54db18117933d5143d9590e15059da08a0470",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_a",
+   "best_epoch_index": 2,
+   "arm": "p_ep",
+   "seed": 42,
+   "model_type": "P"
+  },
+  "p_ep_seed123": {
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed123/checkpoints/best_a/model.weights.h5",
+   "sha256": "6bdc68a0654755e87a11939d29a3e140c1caf8dc295b6789a63728fef59670ca",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_a",
+   "best_epoch_index": 10,
+   "arm": "p_ep",
+   "seed": 123,
+   "model_type": "P"
+  },
+  "p_ep_seed2026": {
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "2bcd1830cc77d808a2f4566a9821e4c47e37d0dac000a971d90c8a71b2353607",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_b",
+   "best_epoch_index": 29,
+   "arm": "p_ep",
+   "seed": 2026,
+   "model_type": "P"
+  },
+  "e1_ep_seed42": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "4d7384f226d6ea648811a2476382c474a052c529becda473419f0b779056059c",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_a",
+   "best_epoch_index": 16,
+   "arm": "e1_ep",
+   "seed": 42,
+   "model_type": "E1"
+  },
+  "e1_ep_seed123": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "50a1b935c1ec8f7e7a2beca7eec069b70a3156e36a3f0440f80a86f82c5eb73f",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_b",
+   "best_epoch_index": 11,
+   "arm": "e1_ep",
+   "seed": 123,
+   "model_type": "E1"
+  },
+  "e1_ep_seed2026": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed2026/checkpoints/best_a/model.weights.h5",
+   "sha256": "996f344c2194d9d1ba2d6688b79036f6e51ad11b3856c0e6b8dd5d2f9c450c4c",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_a",
+   "best_epoch_index": 15,
+   "arm": "e1_ep",
+   "seed": 2026,
+   "model_type": "E1"
+  },
+  "e2_ep_seed42": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed42/checkpoints/best_b/model.weights.h5",
+   "sha256": "1fd8c22b30031d2a34c3c1c049b921b9e56ba6a81272795226d38ee6a3d85f96",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_b",
+   "best_epoch_index": 30,
+   "arm": "e2_ep",
+   "seed": 42,
+   "model_type": "E1"
+  },
+  "e2_ep_seed123": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "ab620636b01502858b52b57023311232d020729811227d6a721315cb3ba4eaf5",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_b",
+   "best_epoch_index": 2,
+   "arm": "e2_ep",
+   "seed": 123,
+   "model_type": "E1"
+  },
+  "e2_ep_seed2026": {
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "aa17b2441f5ae6170700d90b7ba42a3ec54e27d4bfa6d283db9e8bdf6e977a4a",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_b",
+   "best_epoch_index": 17,
+   "arm": "e2_ep",
+   "seed": 2026,
+   "model_type": "E1"
+  }
+ },
+ "stored_p_tables": {
+  "source_run": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16",
+  "p_seed42": {
+   "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed42.csv",
+   "sha256": "579d4079d1df8912c800d0c0ea25a4021d2230bf71c8da54511a956ce5b47822"
+  },
+  "p_seed123": {
+   "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed123.csv",
+   "sha256": "070f15898b6694f03d1b4dd0574ae3001fbd5d7d0276b460e6f4a79855ac4aa9"
+  },
+  "p_seed2026": {
+   "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed2026.csv",
+   "sha256": "cedd6563278e164c425091f0f08e5d449faef065c34c1d850b29d2cea6cc99b0"
+  },
+  "note": "made at commit 6a88636 under TensorFlow 2.20.0 / Keras 3.13.2; float16 differences of about one logit step are possible between runtimes"
+ },
+ "stored_validation_tables": {
+  "p_ep": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv",
+  "e1_ep": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv",
+  "e2_ep": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv"
+ },
+ "pipeline": {
+  "stage2": "stage4_v2_data.stage2_rgb: DR profile, once, native size",
+  "rgb_frame": "stage4_v2_aptos_cache.recompute_rgb_512: full-frame direct resize to 512x512 (no crop), float32 [0,1]",
+  "stage3": "not run (all three arms take RGB only)",
+  "stage4": "not run (all three arms take RGB only); no Stage-3 or Stage-4 cache is read",
+  "model": "p_ep: pl_convnext.build_pl_model('P') through P's three inputs (RGB in the first three channels, the rest zero); e1_ep, e2_ep: e1_model.build_e1_model, output 0 (CORN logits). mixed_float16; BEST weights",
+  "decode": "cumulative p_k = cumprod(sigmoid(logits)); grade = number of k with p_k > 0.5"
+ },
+ "parity": {
+  "raw_subset": "the first two images of every grade in the authoritative 730-image validation order (10 images), from the RAW files: Stage 2 exact against the stored Stage-2 file, RGB frame within rgb_max_abs of the cache",
+  "full_validation": "all 730 validation images from the cached RGB frames against each model's stored BEST validation table, authoritative order",
+  "tolerances": "parent protocol: rgb_max_abs 1e-06, logit_max_abs 0.05, probability_max_abs 0.01, grades identical"
+ },
+ "comparisons": {
+  "primary": [
+   "p_ep_minus_p",
+   "e1_ep_minus_p_ep"
+  ],
+  "secondary_descriptive": [
+   "e2_ep_minus_p_ep",
+   "e1_ep_minus_e2_ep"
+  ],
+  "note": "paired on the same images and the same seed. P-EP - P is the external form of Q1 (does DR-specific adaptation change cross-dataset grading); E1-EP - P-EP is the grading effect of aligned lesion supervision after adaptation. The two contrasts with E2-EP are descriptive. No superiority, equivalence or non-inferiority criterion is defined."
+ },
+ "analysis_sets": {
+  "primary": "100 images (103 minus IDRiD_088, IDRiD_089, IDRiD_091)",
+  "sensitivity": "all 103 images, computed after the primary result and labelled as sensitivity"
+ },
+ "disclosures": [
+  "IDRiD's grading test set has been used twice before in this project: once (record 61) for an earlier frozen pipeline and its P reference, and once (record 67, batch 1) for E1 and E2. This is its third and last declared use.",
+  "The nine EP checkpoints were never evaluated on IDRiD before this run and were not tuned, selected or modified using IDRiD.",
+  "This is therefore a cross-dataset evaluation of models fixed beforehand, on a dataset the project has already used -- not an untouched project-level test, and the batch-1 result (E1 lower than P in decoded grades) was known when this batch was planned.",
+  "Stage 4, which supplied the lesion targets of E1-EP (and, deranged, of E2-EP), was trained on IDRiD segmentation images and so on IDRiD's camera domain. No EP model saw an IDRiD image, but this indirect exposure is not shared by P or P-EP and is a limitation.",
+  "The three test images that are copies of Stage-4 training images are excluded from the primary analysis.",
+  "P's predictions are those stored by the earlier run (TensorFlow 2.20.0); P was not run again.",
+  "All nine EP models start from ONE EyePACS-adapted encoder: their seed-to-seed spread does not include the variance of the adaptation.",
+  "APTOS validation was the checkpoint-selection set of every model here; EyePACS validation selected the adapted encoder.",
+  "The primary set has 100 images (19 of grade 3, 13 of grade 4): small differences cannot be resolved, and intervals are descriptive of this sample.",
+  "No non-inferiority or equivalence margin was pre-specified; none is tested or claimed. The evaluation says nothing about clinical utility."
+ ],
+ "rules": [
+  "evaluation only",
+  "no tuning",
+  "no threshold changes",
+  "no preprocessing changes",
+  "no retraining",
+  "no checkpoint or seed selection",
+  "no change to decoding",
+  "no repeated runs for better numbers",
+  "a rerun only for a technical failure, with the reason recorded",
+  "nothing about P, P-EP, E1-EP, E2-EP or any recorded conclusion (records 70, 74-77) is changed on the basis of this result"
+ ],
+ "confirmation_token": "RUN_IDRID_BATCH_2_EP_ONCE",
+ "outputs": "experiments/IDRiDGrading/idrid_batch2_ep_<protocol sha12>_<UTC time>/"
+}

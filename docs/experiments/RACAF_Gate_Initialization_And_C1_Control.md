@@ -4792,3 +4792,339 @@ The held-out test cache (`--set heldout-test`, about 25 GB, Drive `datasets/EyeP
 **Tests** `tests/test_ddr_probe_ep.py` 13 (new; fabricated run directories and synthetic features — the probe training in them is the real `ddr_probe` code): the protocol constants and reuse, cell targets, the test split never entering training, the DDR manifest unchanged and only read; manifest parsing, the three seeds, missing / duplicate / foreign seeds, wrong checkpoint hash, tampered file, wrong DDR manifest hash, wrong protocol version, missing commit, incompatible architecture, non-EP runs and P / E1 / E2 hashes; the E2-EP gate (refused with no record and with a failed criterion, eligible when met, still refused without the phrase); run outputs and schema, resume, one configuration per directory; the criterion computed from the five-epoch variant, reproducibility, the gate record, the descriptive baseline comparison. `tests/test_ep_aptos_train.py` adds the same confirmation requirement for E2-EP training.
 
 **Status.** Implemented and tested. Not run. No P-EP or E1-EP probe result exists, and none is claimed.
+
+
+## 69.5 EyePACS adaptation frame cache — built, verified and uploaded (2026-10-08; data preparation only, no model)
+
+Protocol and cache definition: §69 – §69.4, unchanged. Builder: commit `c86c01d` (`python eyepacs_adaptation_data.py build --set adaptation`, three worker threads, laptop CPU).
+
+| item | value |
+|---|---|
+| local path | `datasets/EyePACS/processed/adaptation_frames_v1` |
+| Drive path | `datasets/EyePACS/adaptation_frames_v1` |
+| size | 55,242,134,016 bytes of shards (51.4 GiB); 37 files with the index, 55,245,310,680 bytes |
+| shards | 36 (32 training, 4 validation), 1,000 frames each except the last of each part |
+| images | 35,122 — training 31,610, validation 3,512; exactly the images of the manifest, no other file in the folder |
+| dtype / frame | float16, 512 × 512 × 3 |
+| split manifest SHA-256 | `c5f7e41501b9b803be3cc4fdbaf655942366a961531e1b0570ae5fec9a13fd86` |
+| preprocessing version | `stage2-DR-profile/full-frame-direct-resize/v1` |
+| cache fingerprint | `4b5bf08a4b7bf901c248011c7a15337ae05276d0825f6f032b710e05042c99c9` |
+
+**Verification: PASS, twice** (before the upload and again after it): identity (manifest hash, preprocessing version, cache version, dtype, frame size, shard layout), the complete planned shard set and no other, image order and grades equal to the manifest, the SHA-256 of every shard file, and the SHA-256 of all 35,122 source JPEGs against the hashes recorded at build time. **Upload: verified** — `rclone check` of the 37 files against Drive, 0 differences; no duplicate names on Drive.
+
+**What happened during the run.** No image failed and none was missing; no shard was corrupted. The build ran from 00:14 to about 08:20 (about 8 hours; 12 – 29 minutes per shard, the slower ones while the test suite was running on the same machine). The sequence was stopped once on purpose after the last shard (to leave out the held-out cache, see below) and restarted; the restart found all 36 shards and rebuilt none. The upload failed three times within one second at 09:20 because the network was down (DNS lookup), was restarted at 09:25 and completed at 12:33 (3 h 10 min, 0.4 – 7.8 MiB/s); one shard failed in transit and was re-sent automatically.
+
+**Held-out test cache.** Not part of this section. By the user's instruction it is built and verified locally after this cache and is **not uploaded** until the user says so.
+
+**Status.** The adaptation cache is ready for the T4 (staging, then the speed check). No adaptation run, no speed check, no APTOS run has been made.
+
+
+## 69.6 Held-out EyePACS test frame cache — built and verified locally; NOT uploaded (2026-10-08; data preparation only)
+
+Definition: §69.2 – §69.4. Builder: commit `c86c01d` (`python eyepacs_adaptation_data.py build --set heldout-test`, three worker threads).
+
+| item | value |
+|---|---|
+| local path | `datasets/EyePACS/processed/heldout_test_frames_v1` (separate folder from the adaptation cache) |
+| size | 25,557,469,312 bytes of shards (23.8 GiB) |
+| shards | 17 test shards |
+| images | 16,249 — exactly the images of the held-out manifest; no other file in the folder |
+| dtype / frame | float16, 512 × 512 × 3 |
+| manifest SHA-256 | `84a344ab1c780899170def378b0efbc021ae642005ba585512a772b2268b7e6d` |
+| preprocessing version | `stage2-DR-profile/full-frame-direct-resize/v1` |
+| cache fingerprint | `b4d4e8b81c2952274c819fd7bad93cacda9b379502b8e58e456593e301f77ac0` |
+
+**Verification: PASS, twice:** identity, the complete planned shard set and no other, image order and grades equal to the manifest, the SHA-256 of every shard, and the SHA-256 of all 16,249 source JPEGs. One build attempt, 3 h 37 min (13:26 – 17:03); no image failed or was missing, no retry, no corrupted shard. A frame was produced for every image of the set, so no exclusion arises.
+
+**Not uploaded.** By the user's instruction the cache stays on the laptop until the user asks for the upload (intended Drive path `datasets/EyePACS/heldout_test_frames_v1`). No model has read it; it is evaluation-only (§69.2 D).
+
+
+## 69.7 EyePACS adaptation — cache staged on the T4 and speed check (2026-10-08; nothing trained, nothing saved)
+
+Reported by the user from `colab/notebooks/eyepacs_adaptation.ipynb` on a T4 runtime. Not part of the experiment: the speed check builds a throwaway model, runs ten optimiser steps and keeps nothing; no protocol value was chosen from it.
+
+- **Cache on the T4.** 36 / 36 shards present on local disk and matching their recorded SHA-256 (the staging step found all 36 already copied and re-hashed them: `copied 0, skipped 36`, about 15 – 20 minutes for the re-hash); verified against the split: 31,610 training and 3,512 validation frames, 55,242,134,016 bytes, manifest `c5f7e415…`, preprocessing `stage2-DR-profile/full-frame-direct-resize/v1`, float16, fingerprint `4b5bf08a…99c9` — the fingerprint of §69.5.
+- **Speed, batch 16, mixed_float16.** 0.60 s per optimiser step (26.6 images / s); 0.23 s to load and augment a batch in one thread; 1,976 steps per epoch, so about 20 minutes for the training part of an epoch, before the validation pass (3,512 images) and the checkpoint write.
+- **Memory.** Peak 6.6 GiB as reported by TensorFlow; the runtime's GPU display showed 9.1 of 15 GB in use (the allocator's reserved pool and the CUDA context are counted there). Batch 16 fits.
+
+**Reading.** The protocol of §69 is feasible on a T4 as written. With early-stopping patience 12 the run lasts at least 13 epochs and at most 50, that is roughly 5 to 19 hours of training time at about 22 minutes per epoch all told, spread over several sessions. The adaptation run has not been started.
+
+
+## 69.8 Held-out EyePACS test frame cache — uploaded on the user's instruction (2026-10-08)
+
+The cache of §69.6, unchanged, was uploaded to Drive `datasets/EyePACS/heldout_test_frames_v1` after the user asked for it: 18 files (17 shards and the index), 25,558,939,701 bytes. `rclone check` against the local copy: 18 matching files, 0 differences; no duplicate names. One upload attempt. No model has read the cache; it remains evaluation-only (§69.2 D).
+
+
+## 72. EyePACS adaptation — the one run: result (seed 42; finished 2026-10-09 03:45 UTC; commit `c86c01d`; Colab T4; protocol §69, §69.2)
+
+**Run.** `experiments/EyePACSAdaptation/p_eyepacs_c5f7e41501b9_seed42`, two invocations (one resume), Tesla T4, TensorFlow 2.21.0, Keras 3.13.2. P from the ImageNet weights on the 31,610 EyePACS training frames (cache fingerprint `4b5bf08a…99c9`), batch 16, validated each epoch on the 3,512 validation frames. No APTOS file, no test image and no quality label was read. Stopped by early stopping after 18 epochs (best epoch + 12).
+
+| epoch | 1 | 2 | 3 | 4 | 5 | **6** | 7 | 8 | 9 | 10 | 12 | 14 | 16 | 18 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| validation QWK | 0.716 | 0.778 | 0.808 | 0.808 | 0.805 | **0.827** | 0.805 | 0.807 | 0.777 | 0.805 | 0.787 | 0.787 | 0.798 | 0.794 |
+| training QWK | 0.715 | 0.804 | 0.819 | 0.837 | 0.844 | 0.858 | 0.870 | 0.876 | 0.890 | 0.897 | 0.938 | 0.954 | 0.974 | 0.981 |
+| validation CORN loss (unweighted) | 0.461 | 0.369 | 0.325 | 0.315 | 0.375 | **0.297** | 0.338 | 0.322 | 0.396 | 0.357 | 0.403 | 0.433 | 0.502 | 0.543 |
+
+Learning rate 1e-4 through epoch 9, then halved at epochs 10, 14 and 18.
+
+**Selected and pinned checkpoint.** Epoch index 5 (the sixth epoch) — the first epoch with the highest validation QWK, which is also the epoch of the lowest validation loss. **EyePACS validation QWK 0.8274.** Weights `checkpoints/best_b/model.weights.h5`, **SHA-256 `ef1c3beb30d7652553780d1989c703c3de06ef56cfd292f8e03c253b0cad87e0`**, pinned 2026-10-09 03:45 UTC. The re-evaluation of the pinned weights from per-image predictions gives the same 0.8274.
+
+**The pinned model on the EyePACS validation part (the selection set — not a test result).** AUROC at the cuts ≥1 / ≥2 / ≥3 / ≥4: 0.913 / 0.953 / 0.980 / 0.977. Recall per grade 0 – 4: 0.965 / 0.323 / 0.624 / 0.516 / 0.591. Mean absolute error 0.193. Confusion matrix (rows true grade 0 – 4, columns predicted): [2507, 64, 27, 1, 0], [137, 75, 20, 0, 0], [105, 69, 327, 23, 0], [1, 1, 41, 47, 1], [4, 0, 13, 10, 39].
+
+**Reading.** The run behaved as a supervised grader on a large, noisily labelled set is expected to: validation QWK peaked early and then drifted down while training QWK rose to 0.98 and the validation loss nearly doubled — overfitting after epoch 6, which the selection rule kept out of the pinned checkpoint. 0.827 is the value on the set that selected the checkpoint and is therefore optimistic; the held-out EyePACS test evaluation (§69.2 D) is the unbiased number and has not been run. Nothing here says anything yet about Q1 or Q2: those are answered on APTOS and on the DDR probe. One run, one seed: the variance of the adaptation itself is not measured (stated in §69.2 A).
+
+**Status.** Adaptation complete; checkpoint pinned. Next, in the declared order: the held-out EyePACS test evaluation of this pinned model, then P-EP and E1-EP on APTOS.
+
+
+## 73. Held-out EyePACS test — the pinned adaptation model, scored once (2026-10-09 05:34 UTC; commit `c86c01d`; Colab T4; rule §69.2 D)
+
+**What was scored.** The pinned adaptation checkpoint of §72 (`ef1c3beb…87e0`), unchanged, on the 16,249 held-out labelled EyePACS test images (manifest `84a344ab…7e6d`, cache fingerprint `b4d4e8b8…7ac0`; 17 / 17 shards copied to the T4 and verified). One evaluation; the result file is written once and is not recomputed. In-domain held-out evaluation of the adaptation model — not an external test, not a result for P-EP or E1-EP, and read by no other step.
+
+| | EyePACS validation (selection set, §72) | **EyePACS held-out test** |
+|---|---|---|
+| images | 3,512 | 16,249 |
+| **QWK** | 0.8274 | **0.8083** |
+| accuracy | — | 0.825 |
+| mean absolute error | 0.193 | 0.232 |
+| AUROC, grade ≥ 1 | 0.913 | 0.915 |
+| AUROC, grade ≥ 2 | 0.953 | 0.949 |
+| AUROC, grade ≥ 3 | 0.980 | 0.973 |
+| AUROC, grade ≥ 4 | 0.977 | 0.979 |
+| recall grade 0 / 1 / 2 / 3 / 4 | 0.965 / 0.323 / 0.624 / 0.516 / 0.591 | 0.963 / 0.382 / 0.563 / 0.525 / 0.526 |
+| false-urgent rate | 0.007 | 0.014 |
+
+Held-out confusion matrix (rows true grade 0 – 4, columns predicted): [10937, 309, 104, 2, 10], [750, 534, 112, 2, 0], [544, 404, 1489, 191, 16], [17, 8, 167, 235, 21], [33, 10, 63, 82, 209]. Bootstrap over images for the held-out QWK (1,000 resamples; descriptive — images, not patients, are resampled, so it is somewhat too narrow): 0.798 – 0.819.
+
+**Reading.** The held-out QWK is 0.019 below the value on the set that selected the checkpoint — the expected direction and a small amount; the ranking measures (AUROC at every cut) are essentially the same on both sets, so the adaptation model generalises within EyePACS and the validation value was only mildly optimistic. Decoded-grade errors are concentrated where EyePACS is known to be hard: grade 1 against grade 0 (recall 0.38) and grade 2 against 0 / 1; grades 3 and 4 are recalled about half the time while their AUROCs are 0.97 – 0.98, i.e. the ordering is good and the fixed 0.5 decoding is conservative for the rare grades. No threshold is changed and nothing is selected from this.
+
+**What this number is not.** It is not evidence for or against Q1 or Q2 and it does not enter any decision: the checkpoint was pinned before the evaluation, and P-EP and E1-EP proceed whatever this value is.
+
+**Status.** Step 3 of the declared order is complete. Next: P-EP on APTOS (three seeds), then E1-EP.
+
+
+## 74. P-EP on APTOS — three seeds: result and comparison with P (finished 2026-10-09; commit `c86c01d`; Colab T4; protocol §69.2 B)
+
+**Runs.** `experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed{42,123,2026}`. Each started from the pinned adapted encoder `ef1c3beb…87e0` (start-up record of every seed: encoder is the adapted one, not ImageNet's; 180 arrays; fresh CORN head) and followed the P protocol on the verified bundle and the authoritative 2,921 / 730 split (batch 2, AdamW 1e-4, weight decay 0.05, patience 12, the pre-registered APTOS class weights). All three stopped by early stopping. About 4.3 minutes per epoch.
+
+| seed | epochs run | BEST epoch index | APTOS validation QWK | pinned SHA-256 |
+|---|---|---|---|---|
+| 42 | 15 | 2 | 0.9198 | `8828eacb8bd12974aceaaa476cc54db18117933d5143d9590e15059da08a0470` |
+| 123 | 23 | 10 | 0.9223 | `6bdc68a0654755e87a11939d29a3e140c1caf8dc295b6789a63728fef59670ca` |
+| 2026 | 42 | 29 | 0.9229 | `2bcd1830cc77d808a2f4566a9821e4c47e37d0dac000a971d90c8a71b2353607` |
+
+**Behaviour.** The adapted encoder gives a much better start than ImageNet (validation QWK after the first epoch 0.888 / 0.856 / 0.880; E1 from ImageNet, seed 42: 0.765) and all three seeds are near their final level by the third epoch. After that the validation QWK moves within about 0.89 – 0.92 from epoch to epoch while the training QWK rises to 0.99 and the validation loss grows (seed 42: 0.205 at BEST, 0.338 at the end) — the same overfitting pattern as P; the selection rule takes the best validation epoch.
+
+**Comparison with P (matched seeds, same 730 validation images; paired bootstrap over images, 2,000 resamples, seed 20260927; P's stored predictions).**
+
+| metric | P (mean ± SD) | P-EP (mean ± SD) | P-EP − P per seed (42 / 123 / 2026) | mean difference | 95 % interval |
+|---|---|---|---|---|---|
+| **QWK** | 0.9170 ± 0.0019 | 0.9216 ± 0.0017 | +0.0013 / +0.0075 / +0.0052 | **+0.0047** | −0.0062 … +0.0147 |
+| AUROC (score ≥ 3; grade 4 against 0 – 2) | 0.9496 ± 0.0089 | 0.9565 ± 0.0017 | −0.0042 / +0.0089 / +0.0162 | +0.0070 | −0.0019 … +0.0164 |
+| mean AUROC of the four cuts | 0.9698 ± 0.0047 | 0.9730 ± 0.0007 | −0.0024 / +0.0059 / +0.0058 | +0.0031 | −0.0012 … +0.0075 |
+| grade-3 recall (39 images) | 0.547 | 0.453 | −0.103 / −0.154 / −0.026 | −0.094 | — |
+| grade-4 recall (58 images) | 0.575 | 0.667 | −0.069 / +0.293 / +0.052 | +0.092 | — |
+| false-urgent rate | 0.0353 | 0.0427 | +0.016 / +0.008 / −0.002 | +0.0074 | — |
+| mean absolute error | 0.190 | 0.185 | +0.021 / −0.025 / −0.012 | −0.006 | — |
+
+§54 tolerances against P of the same seed: QWK (−0.02) passed 3 / 3; AUROC (−0.01) passed 3 / 3; false-urgent rate (+0.02) passed 3 / 3; **grade-3 recall (−0.10) failed in seeds 42 (0.513 against a limit of 0.515 — four images fewer than P) and 123 (0.359 against 0.413 — six fewer), passed in seed 2026.** Decoded predictions differ from P's on 94 / 99 / 66 of the 730 images.
+
+**Reading (Q1: does supervised DR-specific adaptation improve the RGB grader on APTOS).**
+1. **No improvement in QWK is shown.** P-EP is higher in all three seeds, by 0.001 – 0.008, mean +0.005; the interval of the mean includes zero (−0.006 … +0.015). The result is "comparable to P", as expected for a validation set on which every arm of this project has ended at 0.91 – 0.92. No statement of equivalence is made (no margin was pre-specified).
+2. **The ranking measures point the same way and are also unresolved:** AUROC +0.007 (−0.002 … +0.016), and its spread between seeds is smaller for P-EP (SD 0.0017 against 0.0089) — one shared starting encoder is the likely reason, so this is not read as greater robustness.
+3. **The decoded grades shift between the two severe classes.** P-EP assigns grade 3 less often correctly and grade 4 more often (mean recall 0.55 → 0.45 and 0.58 → 0.67); grade-3 recall breaches the pre-set tolerance in two of three seeds. With 39 grade-3 validation images one image is 0.026, so the counts are small, but the direction is the same in all three seeds and it is reported as a guardrail failure, not explained away. No threshold is changed.
+4. Not a test of generalisation: APTOS validation is the selection set of every arm. Whether the adapted models transfer better is the question of IDRiD batch 2, which has not been run.
+
+**Status.** P-EP complete and pinned (three checkpoints above). Next in the declared order: E1-EP on APTOS, then the DDR probe of both arms.
+
+
+## 75. E1-EP on APTOS — three seeds: result and grading comparisons (finished 2026-10-10; commit `c86c01d`; Colab T4; protocol §69.2 C)
+
+**Runs.** `experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed{42,123,2026}`. Start-up record of every seed: the adapted encoder `ef1c3beb…87e0` (the same content digest as the P-EP runs, 180 arrays; not ImageNet's), fresh CORN head, fresh lesion head with E1's initialisation, λ = 1, aligned Stage-4 targets, E1's recorded lesion prior. Otherwise the P / E1 protocol on the same bundle and split. All three stopped by early stopping.
+
+| seed | epochs run | BEST epoch index | APTOS validation QWK | lesion head: mean cell AUROC vs the Stage-4 teacher (E1 from ImageNet) | pinned SHA-256 |
+|---|---|---|---|---|---|
+| 42 | 29 | 16 | 0.9244 | 0.9740 (0.9756) | `4d7384f226d6ea648811a2476382c474a052c529becda473419f0b779056059c` |
+| 123 | 24 | 11 | 0.9235 | 0.9715 (0.9685) | `50a1b935c1ec8f7e7a2beca7eec069b70a3156e36a3f0440f80a86f82c5eb73f` |
+| 2026 | 28 | 15 | 0.9274 | 0.9743 (0.9754) | `996f344c2194d9d1ba2d6688b79036f6e51ad11b3856c0e6b8dd5d2f9c450c4c` |
+
+**Behaviour.** Like P-EP, a fast start (validation QWK 0.87 – 0.89 after the first epoch) and then epoch-to-epoch movement of about 0.89 – 0.925 while training QWK reaches 0.99; BEST comes later than for P-EP in two of three seeds (epoch index 16 / 11 / 15 against 2 / 10 / 29). The auxiliary head learns the teacher as well as it did in E1 (0.972 – 0.974 against 0.969 – 0.976), so the lesion task was learned to the same degree from the adapted encoder.
+
+**Grading comparisons (matched seeds, the same 730 validation images, paired bootstrap, 2,000 resamples, seed 20260927). Mean ± SD over seeds: P 0.9170 ± 0.0019, E1 0.9180 ± 0.0039, P-EP 0.9216 ± 0.0017, E1-EP 0.9251 ± 0.0020.**
+
+| E1-EP against | QWK difference per seed (42 / 123 / 2026) | mean | 95 % interval | AUROC (severe) difference | 95 % interval | grade-3 recall difference |
+|---|---|---|---|---|---|---|
+| **P-EP** (the effect of the lesion head after adaptation) | +0.0047 / +0.0011 / +0.0045 | **+0.0034** | −0.0049 … +0.0125 | +0.0017 | −0.0058 … +0.0092 | +0.103 / +0.205 / +0.179 |
+| P (adaptation and lesion head together) | +0.0060 / +0.0087 / +0.0098 | +0.0081 | −0.0025 … +0.0191 | +0.0086 | +0.0002 … +0.0182 | 0.000 / +0.051 / +0.154 |
+| E1 (the effect of adaptation with the lesion head) | +0.0041 / +0.0101 / +0.0072 | +0.0071 | −0.0015 … +0.0174 | +0.0027 | −0.0063 … +0.0111 | +0.077 / −0.051 / +0.231 |
+
+E1-EP absolute, three-seed means: AUROC (score ≥ 3; grade 4 against 0 – 2) 0.9582, mean AUROC of the four cuts 0.9743, grade-3 recall 0.615, false-urgent rate 0.0369, mean absolute error 0.173. §54 tolerances: against P-EP — QWK, AUROC and grade-3 recall passed 3 / 3; false-urgent rate failed in seed 2026 (0.0585 against a limit of 0.0548), passed in the other two. Against P — QWK, AUROC and grade-3 recall passed 3 / 3; false-urgent rate failed in seed 2026 (+0.022 against +0.02).
+
+**Reading.**
+1. **E1-EP has the highest APTOS validation QWK of any arm so far (0.9251), and no QWK difference is established.** It is above P-EP, above P and above E1 in every seed, but every interval of the mean difference includes zero (against P: −0.003 … +0.019). The ordering P ≈ E1 < P-EP < E1-EP is consistent across seeds and small; on this validation set differences of this size cannot be resolved with three seeds. It is not reported as an improvement.
+2. **Against P-EP the lesion head costs nothing in grading and restores grade-3 recall.** QWK +0.003 (−0.005 … +0.013), AUROC unchanged; grade-3 recall is higher in all three seeds (0.453 → 0.615), which undoes the drop of §74 — the grade-3 guardrail that P-EP failed against P is met by E1-EP. This is on 39 images and was not a pre-declared outcome; it is recorded as an observation.
+3. **One AUROC interval excludes zero** (severe-grade AUROC against P, +0.0086, +0.0002 … +0.0182). It is one of several metrics and three comparisons examined, its lower end is at zero, and per seed it is −0.004 / +0.006 / +0.023; it is not treated as a finding.
+4. **One guardrail breach:** the false-urgent rate in seed 2026 exceeds the tolerance against both P-EP and P (0.058); the other two seeds are below their baselines.
+5. As for E1 in §63: this says nothing about whether the lesion supervision changed the representation — that is Q2, answered by the DDR probe of P-EP and E1-EP, which has not been run. And nothing here is a generalisation result (APTOS validation selects every arm; IDRiD batch 2 is pending).
+
+**Status.** P-EP and E1-EP are complete and pinned (six checkpoints, §74 and above). Next: the DDR ground-truth probe of both arms (`ddr_lesion_probe_ep.ipynb`), then the criterion of §69.2 C; E2-EP stays locked until then.
+
+
+## 76. DDR ground-truth probe of the EP arms — result (run once 2026-10-10 12:21 UTC, commit `c86c01d`, Colab T4; method §68, criterion §69.2 C)
+
+**Run.** `ddr_probe_ep.run`, one invocation, probe protocol `ddr-ground-truth-probe/record-68/v1`, DDR manifest `2f3e4a40…dcc2d0`, the six pinned checkpoints of §74 and §75 (each verified as a pinned EP run started from the adapted encoder `ef1c3beb…`; hashes recorded and matching). Same 756 images, targets, probe, variants and stopping rule as §70; every probe stopped by the validation rule. Comparison: `ddr_probe_ep.analyse` on the saved test logits, 2,000 paired resamples of the 225 test images, seed 20260927 (the resamples of §70). Outputs: `experiments/DDRProbe/ddr_ground_truth_probe_ep_v1/`.
+
+### Five-epoch probe — the pre-declared primary result
+
+| encoder | seed 42 | seed 123 | seed 2026 | mean | MA | HE | EX | SE |
+|---|---|---|---|---|---|---|---|---|
+| P-EP | 0.6312 | 0.6607 | 0.6672 | **0.6530** | 0.642 | 0.688 | 0.776 | 0.507 |
+| E1-EP | 0.8501 | 0.8517 | 0.8520 | **0.8513** | 0.867 | 0.857 | 0.944 | 0.738 |
+| **E1-EP − P-EP** | +0.2189 | +0.1910 | +0.1849 | **+0.1983** | +0.225 | +0.168 | +0.168 | +0.231 |
+
+95 % interval of the three-seed mean difference: **+0.1802 … +0.2163**; positive in 3 / 3 seeds; every class interval above zero.
+
+**Criterion of §69.2 C: MET.**
+
+### Converged probe — the pre-declared robustness analysis
+
+| encoder | seed 42 | seed 123 | seed 2026 | mean | MA | HE | EX | SE |
+|---|---|---|---|---|---|---|---|---|
+| P-EP | 0.8636 | 0.8987 | 0.8725 | **0.8783** | 0.864 | 0.886 | 0.931 | 0.833 |
+| E1-EP | 0.9320 | 0.9307 | 0.9236 | **0.9288** | 0.920 | 0.924 | 0.971 | 0.900 |
+| E1-EP − P-EP | +0.0684 | +0.0320 | +0.0511 | **+0.0505** | +0.055 | +0.038 | +0.040 | +0.068 |
+
+95 % interval: +0.0398 … +0.0617; positive in 3 / 3 seeds; every class interval above zero (SE +0.029 … +0.109). Stopping epochs (best of run): P-EP 24 / 29, 53 / 58, 49 / 54; E1-EP 35 / 40, 47 / 52, 24 / 29.
+
+### Descriptive comparison with the encoders of §70 (Q3; same test images and resamples; no criterion)
+
+| contrast | five-epoch | 95 % interval | converged | 95 % interval | per seed, converged |
+|---|---|---|---|---|---|
+| P-EP − P | −0.1089 | −0.1267 … −0.0903 | **−0.0206** | −0.0318 … −0.0110 | −0.025 / +0.001 / −0.037 |
+| E1-EP − E1 | −0.0004 | −0.0093 … +0.0091 | −0.0001 | −0.0067 … +0.0058 | +0.011 / −0.000 / −0.011 |
+
+Converged means of the four RGB encoders on expert lesions: P 0.899, P-EP 0.878, E1 0.929, E1-EP 0.929. Per class, P-EP − P at convergence: MA −0.001, HE −0.009, EX −0.011, SE −0.062 (−0.106 … −0.025).
+
+### Reading (rules of §68 and §69.2)
+
+1. **Q2 is answered in the affirmative, in both variants.** After DR-specific adaptation, the encoder trained with image-aligned lesion supervision contains more information predictive of expert-annotated lesion masks than the encoder trained without it: E1-EP − P-EP is positive in every seed, for every lesion class, on the five-epoch probe (+0.198) and on the converged probe (+0.051). The permitted wording is that of §68; it is a statement about what a linear probe reads from frozen features on DDR, not about lesion segmentation, not about what the grading head uses.
+2. **The size to quote is the converged one.** As in §70 point 4, P-type probes are far from converged at five epochs (P-EP validation loss 0.20 – 0.23 at epoch 5 against 0.079 – 0.087 at their best epoch; 3.3 – 5.3 at initialisation against 1.1 – 1.7 for E1-EP), so the five-epoch difference of 0.20 mixes information with how quickly a 1×1 probe fits. Unlike §70, the two variants agree here in sign and in excluding zero; the criterion is met on the primary variant and confirmed on the robustness variant, at +0.05.
+3. **Q3: EyePACS adaptation by grades alone did not make lesion information more readable — at convergence it is slightly less readable** (P-EP − P −0.021, interval −0.032 … −0.011; two of three seeds; mostly soft exudates). A second supervised grading stage on EyePACS moved the representation, if anything, away from linearly readable lesion content, while grading on APTOS stayed the same or marginally higher (§74). This comparison is descriptive and was declared so.
+4. **With lesion supervision the adapted and the non-adapted encoders reach the same level** (E1-EP 0.929, E1 0.929; difference −0.0001, −0.007 … +0.006): the lesion head brings the representation to the same readability whichever encoder it starts from, and removes the deficit of point 3. Put together, the gap that aligned supervision opens is larger after adaptation (+0.051) than before it (+0.030, §70) because P-EP starts lower, not because E1-EP ends higher.
+5. **What this result does not settle — specificity.** §70 found that on the five-epoch probe a model trained with deranged lesion targets (E2) was as readable as E1, and that E1 separated from E2 only at convergence (+0.024). Whether the E1-EP gain here is specific to image-aligned targets is exactly what E2-EP tests; nothing in this section answers it.
+6. Limits as in §68 / §70: one source, grades 1 – 4 only, image-level split, 16×16 cells, three seeds sharing one adapted encoder (§69.2 A), intervals over test-image resampling. The DDR test split has now been used a second time, for other encoders, under the unchanged method; no choice was made from it.
+
+**E2-EP gate.** The criterion record (`e1_ep_probe_criterion.json`: per seed +0.2189 / +0.1910 / +0.1849, mean +0.1983, interval +0.1802 … +0.2163, 3 / 3 positive, met) is written to `experiments/EyePACSAdaptedAPTOS/`. **E2-EP is now eligible. It has not been started;** by §69.2 it also needs the user's explicit confirmation.
+
+**Status.** Probe of P-EP and E1-EP complete. No protocol changed.
+
+
+## 77. E2-EP — the shuffled-target control after adaptation: APTOS result and DDR probe (trained and probed 2026-10-10 / 11; commit `c86c01d`; Colab T4)
+
+**Eligibility and start.** E2-EP was run after the criterion of §69.2 C was recorded as met (§76) and on the user's confirmation. Runs `experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed{42,123,2026}`: the adapted encoder `ef1c3beb…` (same digest as P-EP and E1-EP), fresh CORN and lesion heads, λ = 1, E1-EP in every respect except the **training** lesion targets, which come from the fixed derangement of §62 (seed 20261001, 2,921 images, no fixed point, SHA-256 `9ecaa1a7…`); validation targets aligned. Pinned BEST: seed 42 `1fd8c22b30031d2a34c3c1c049b921b9e56ba6a81272795226d38ee6a3d85f96` (epoch index 30 of 43), seed 123 `ab620636b01502858b52b57023311232d020729811227d6a721315cb3ba4eaf5` (2 of 15), seed 2026 `aa17b2441f5ae6170700d90b7ba42a3ec54e27d4bfa6d283db9e8bdf6e977a4a` (17 of 30). The auxiliary head's agreement with the aligned teacher on validation is 0.59 – 0.62 mean cell AUROC (E1-EP: 0.97): the derangement did what it should — the head could not learn the image's lesions.
+
+### Grading on APTOS validation (matched seeds, paired bootstrap as before)
+
+| arm | seed 42 | seed 123 | seed 2026 | mean ± SD |
+|---|---|---|---|---|
+| P-EP | 0.9198 | 0.9223 | 0.9229 | 0.9216 ± 0.0017 |
+| E1-EP | 0.9244 | 0.9235 | 0.9274 | 0.9251 ± 0.0020 |
+| **E2-EP** | 0.9309 | 0.9218 | 0.9228 | **0.9252 ± 0.0050** |
+
+E2-EP − E1-EP: QWK +0.0001 (−0.0077 … +0.0077; +0.006 / −0.002 / −0.005); severe-grade AUROC −0.0060 (−0.0155 … +0.0023); grade-3 recall 0.513 against 0.615 (lower in 3 / 3 seeds); false-urgent rate 0.028 against 0.037. E2-EP − P-EP: QWK +0.0035 (−0.0045 … +0.0119). Tolerances of E2-EP against E1-EP: QWK passed 3 / 3; AUROC failed in seeds 123 and 2026; grade-3 recall failed in seed 2026. **In grading, deranged targets do as well as aligned ones** — the same finding as E2 against E1 (§63.3) — and the small QWK edge of E1-EP over P-EP (§75) is matched by the control, so it is not attributable to the lesion targets.
+
+### DDR ground-truth probe with E2-EP (method §68; its own output directory)
+
+One invocation (2026-10-11 05:00 UTC). P-EP and E1-EP were probed again alongside E2-EP: their test logits are **identical** to those of the §76 run (maximum difference 0.0 in both variants, all six encoders), so the numbers of §76 are reproduced exactly and the criterion result is unchanged.
+
+| mean cell AUROC, test | P-EP | E2-EP | E1-EP |
+|---|---|---|---|
+| five-epoch, per seed | 0.631 / 0.661 / 0.667 | 0.800 / 0.887 / 0.815 | 0.850 / 0.852 / 0.852 |
+| five-epoch, mean | 0.6530 | 0.8337 | 0.8513 |
+| **converged, per seed** | 0.864 / 0.899 / 0.873 | 0.909 / 0.924 / 0.904 | 0.932 / 0.931 / 0.924 |
+| **converged, mean** | **0.8783** | **0.9122** | **0.9288** |
+
+| contrast | five-epoch | 95 % interval | positive seeds | converged | 95 % interval | positive seeds |
+|---|---|---|---|---|---|---|
+| E1-EP − P-EP | +0.1983 | +0.180 … +0.216 | 3 / 3 | +0.0505 | +0.040 … +0.062 | 3 / 3 |
+| E2-EP − P-EP | +0.1807 | +0.159 … +0.202 | 3 / 3 | **+0.0339** | +0.023 … +0.046 | 3 / 3 |
+| **E1-EP − E2-EP** | +0.0175 | +0.003 … +0.032 | 2 / 3 (+0.051 / −0.035 / +0.037) | **+0.0166** | +0.0085 … +0.0235 | 3 / 3 (+0.023 / +0.007 / +0.020) |
+
+Per class, E1-EP − E2-EP at convergence: MA +0.040 (+0.033 … +0.048), HE +0.014 (+0.009 … +0.020), EX +0.027 (+0.023 … +0.033), SE −0.015 (−0.047 … +0.009). E2-EP probes stopped at epochs 41 / 46, 23 / 28, 22 / 27.
+
+### Reading (rule of §68: "E2 also exceeds P: reported as such; the specificity of the aligned-supervision reading is weakened")
+
+1. **Most of the gain of §76 is not specific to image-aligned lesion targets.** With targets taken from other images, the adapted encoder is still clearly more readable for expert lesions than P-EP: +0.034 at convergence (3 / 3 seeds, interval above zero), about two thirds of E1-EP's +0.051. On the five-epoch probe it reaches 0.83 against E1-EP's 0.85.
+2. **A smaller part is specific.** E1-EP is above E2-EP at convergence in all three seeds, +0.017 (+0.009 … +0.024), and for MA, HE and EX separately; not for SE. On the five-epoch probe the mean difference is the same size but one seed is reversed (−0.035, its own interval below zero), so the two variants agree on the mean and disagree on consistency. No criterion was pre-declared for this contrast; it is descriptive.
+3. **So the statement of §76 stands but must be worded narrowly:** after adaptation, E1-EP's representation contains more information predictive of expert-annotated lesions than P-EP's — and roughly two thirds of that difference is reproduced by an auxiliary head trained on lesion maps that do not belong to the image. What a deranged-target head can add is not information about the image's lesions; the candidates are the statistics of lesion maps in general and, more likely, a conditioning of the final feature map by any 1×1 dense head that makes a linear read-out easier even when the probe is run to its stopping rule. That is an interpretation; it was not tested.
+4. **Compared with the non-adapted encoders (§70)** the non-specific share is larger here: there E2 − P was +0.006 and E1 − E2 +0.024 at convergence; here E2-EP − P-EP is +0.034 and E1-EP − E2-EP +0.017. P-EP started from a lower level than P (§76, −0.021), and the control recovers that and more. The specific part is of similar size in both settings (+0.024 and +0.017).
+5. **Grading is unaffected by whether the targets are aligned** (QWK difference 0.0001). Lesion supervision — aligned or not — is not shown to improve APTOS grading; E1-EP's higher grade-3 recall than E2-EP (0.62 against 0.51, 39 images, 3 / 3 seeds) is an observation, not a pre-declared outcome.
+6. Limits as before; additionally, all nine EP models share one adapted encoder (§69.2 A).
+
+**Where the EP phase stands.** Q1: P-EP comparable to P on APTOS validation, no improvement shown (§74). Q2: criterion met (§76); specificity to aligned targets is partial (this section). Q3: adaptation alone lowered lesion readability slightly (§76). Outstanding: IDRiD batch 2 for the EP arms — the only evaluation in this phase that is external to every arm.
+
+
+## 78. IDRiD batch 2 — cross-dataset evaluation of P-EP, E1-EP and E2-EP: pre-run record and implementation (2026-10-11; written before any EP prediction on IDRiD exists; nothing run)
+
+**Position.** §65 declared this batch as the last planned use of IDRiD's grading test set, "under the same protocol and with its own lock". It tests **external grading transfer** of the EP arms. It does not reopen §70 or §74 – §77, and whatever it shows, those sections stand as written. Nothing below may be changed after an IDRiD result for an EP model has been seen.
+
+### What is evaluated
+
+Nine checkpoints, all BEST by APTOS validation QWK, all started from the one pinned EyePACS-adapted encoder `ef1c3beb30d7652553780d1989c703c3de06ef56cfd292f8e03c253b0cad87e0` (§72) with a fresh CORN head, pinned in §74, §75 and §77:
+
+| arm | seed | BEST | SHA-256 |
+|---|---|---|---|
+| P-EP | 42 | `best_a`, epoch index 2 | `8828eacb8bd12974aceaaa476cc54db18117933d5143d9590e15059da08a0470` |
+| P-EP | 123 | `best_a`, epoch index 10 | `6bdc68a0654755e87a11939d29a3e140c1caf8dc295b6789a63728fef59670ca` |
+| P-EP | 2026 | `best_b`, epoch index 29 | `2bcd1830cc77d808a2f4566a9821e4c47e37d0dac000a971d90c8a71b2353607` |
+| E1-EP | 42 | `best_a`, epoch index 16 | `4d7384f226d6ea648811a2476382c474a052c529becda473419f0b779056059c` |
+| E1-EP | 123 | `best_b`, epoch index 11 | `50a1b935c1ec8f7e7a2beca7eec069b70a3156e36a3f0440f80a86f82c5eb73f` |
+| E1-EP | 2026 | `best_a`, epoch index 15 | `996f344c2194d9d1ba2d6688b79036f6e51ad11b3856c0e6b8dd5d2f9c450c4c` |
+| E2-EP | 42 | `best_b`, epoch index 30 | `1fd8c22b30031d2a34c3c1c049b921b9e56ba6a81272795226d38ee6a3d85f96` |
+| E2-EP | 123 | `best_b`, epoch index 2 | `ab620636b01502858b52b57023311232d020729811227d6a721315cb3ba4eaf5` |
+| E2-EP | 2026 | `best_b`, epoch index 17 | `aa17b2441f5ae6170700d90b7ba42a3ec54e27d4bfa6d283db9e8bdf6e977a4a` |
+
+Paths `experiments/EyePACSAdaptedAPTOS/<arm>_ef1c3beb30d7_seed<seed>/checkpoints/<slot>/model.weights.h5`. **P is not run again:** the per-image tables stored by the run of §61 are reused (the three files and hashes of §65). No retraining, no other checkpoint, no LAST. For E1-EP and E2-EP only the grading output is read.
+
+### Dataset, inference, decoding — the locked protocol, unchanged
+
+Parent protocol `idrid_grading_protocol.json`, SHA-256 `f93c1237eb81ab20397dea8bc6d9079871d6308578304f793dfabee17938587e` — the file batch 1 used. IDRiD B. Disease Grading, Testing Set, raw JPG, image-set hash `879e0680…8d32c733`, label-file hash `ced1cb8f…bff8ff602`, verified at run time (and on the local copy by the tests). **Primary set: 100 images** (grades 34 / 5 / 29 / 19 / 13; `IDRiD_088`, `IDRiD_089`, `IDRiD_091` excluded as copies of Stage-4 training images). **Sensitivity set: all 103**, computed after the primary result, reported separately, never a replacement. Raw image → `stage4_v2_data.stage2_rgb` (once, native size) → `stage4_v2_aptos_cache.recompute_rgb_512` → model under `mixed_float16` on a Tesla T4, batch 8 → CORN decode (grade = number of cumulative probabilities above 0.5). P-EP runs in P's graph (the frame in the first three channels of P's input, the rest zero — as it was trained and validated); E1-EP and E2-EP in E1's graph. Stage 3 and Stage 4 are not run. No threshold, decoding rule, preprocessing step, checkpoint or seed is chosen on IDRiD.
+
+### Reported, and the paired differences
+
+Per seed and as mean ± SD over the three seeds (no ensemble, no seed selection), for P, P-EP, E1-EP and E2-EP: QWK; AUROC ≥1, ≥2, ≥3, ≥4; recall for grades 0 – 4; false-urgent rate; confusion matrices. Paired differences on the same images and the same seed, with the project's 95 % grade-stratified bootstrap over the test images (2,000 resamples, seed 20260927) for the seed mean:
+
+- **P-EP − P** (primary): does DR-specific adaptation change cross-dataset grading — the external form of Q1.
+- **E1-EP − P-EP** (primary): the grading effect of image-aligned lesion supervision after adaptation.
+- E2-EP − P-EP and E1-EP − E2-EP (secondary, descriptive): the control.
+
+The two primary contrasts are named here, before the run, because §65 did not name them for this batch; they are the ones that correspond to Q1 and to batch 1's E1 − P. **No superiority, equivalence or non-inferiority criterion is defined** — none was pre-specified and none is introduced.
+
+### Reading rules (fixed now; those of §65 for this batch's contrasts)
+
+- **Higher** (interval above zero): report magnitude and interval; no claim of general improvement; state the limitations below.
+- **Comparable** (interval includes zero): no grading difference shown. Not "equivalent", not "non-inferior".
+- **Lower** (interval below zero): reported as it is.
+- E2-EP behaving like E1-EP weakens any reading that alignment matters for external grading; E2-EP differing from E1-EP is reported with its interval. Neither changes §76 – §77, which are about representation, not grading.
+- No seed, grade or metric is singled out. A positive mean difference whose interval includes zero is not an improvement.
+- Nothing about any model or any recorded conclusion is changed on the basis of this result.
+
+### Limitations that travel with the result
+
+1. **Small sample.** 100 primary images, 19 of grade 3 and 13 of grade 4 (one image = 0.053 / 0.077 of recall); P's seed-to-seed SD of QWK on this set was 0.09 (§61). Small differences will not be distinguishable; the intervals describe this sample.
+2. **Prior use.** IDRiD's test set has been used twice in this project (§61, §67). The EP checkpoints have never been evaluated on it and were not tuned, selected or modified with it, but the batch-1 result was known when this batch was planned. Not an untouched project-level test.
+3. **Teacher-domain exposure.** Stage 4 — the source of the lesion targets of E1-EP and, deranged, of E2-EP — was trained on IDRiD segmentation images, so on IDRiD's camera domain. No EP model saw an IDRiD image; the indirect exposure is not shared by P or P-EP. This is not a fully independent evaluation of every component.
+4. **One adapted encoder.** All nine models start from the same EyePACS checkpoint; their seed spread excludes the variance of the adaptation.
+5. P's predictions come from the earlier run (TensorFlow 2.20.0); the EP models run on the current runtime. APTOS validation selected every APTOS checkpoint; EyePACS validation selected the adapted encoder.
+6. Decoding uses the fixed 0.5 rule, which §73 – §75 showed to be conservative for grades 3 and 4; it is not changed. The evaluation says nothing about clinical utility.
+
+### Gates and one-time rule
+
+1. **Preflight** (no model, no image decoded): both protocols; for each of the nine checkpoints the file's SHA-256, that it is the frozen BEST of a finished run of the EP experiment for that arm, seed and architecture, started from the pinned adapted encoder (not ImageNet's) with a fresh head, selected by APTOS validation QWK, with the BEST pointer still naming it, and that it is not one of the pinned P / E1 / E2 checkpoints; the adapted encoder's own pin; the ImageNet file the P graph is built from; the stored P tables; the IDRiD image-set and label hashes; the 100 / 103 subsets; the lock.
+2. **APTOS parity on the runtime that will run IDRiD** — batch 1's gates for the nine models: ten raw images through Stage 2 and the resize (Stage 2 exact, frame within 1e-6 of the cache), and all 730 validation images against each model's stored BEST validation table (logits within 0.05, cumulative probabilities within 0.01, decoded grades identical). Models verified to be in mixed precision. A failed gate stops the run; no tolerance is loosened.
+3. **Confirmation token** `RUN_IDRID_BATCH_2_EP_ONCE` and a lock written before any prediction; a second run is refused except for a technical failure with the reason recorded, and then writes to its own directory. Output: `experiments/IDRiDGrading/idrid_batch2_ep_<protocol sha12>_<UTC time>/` with the lock record, per-image tables (logits, probabilities, grades) for the nine models, byte copies of the P tables, the image manifest, the run configuration and environment, primary and sensitivity results and reports, and `output_hashes.json` (SHA-256 of every file written).
+
+### Implementation (written and tested; not run)
+
+`idrid_batch2_protocol.json` (SHA-256 `5ea937c4edb8baef9458ef996beef92f80c7eb969a0a45a8f0a0aaa636cc073a`) and `idrid_batch2_eval.py`, an extension of the batch-1 evaluator: the image path, table and decode, gates, metrics, bootstrap, paired differences, report, gate requirement and stored-P reader are batch 1's own functions. For that, `idrid_batch1_eval.gates`, `summarise` and `report_markdown` received keyword arguments whose defaults are batch 1; **the generalised `summarise`, run on the stored per-image tables of §67, reproduces the recorded batch-1 primary and sensitivity results exactly**, and the ten batch-1 tests pass. New in the module: the nine-checkpoint identity checks, the P graph next to E1's graph, the four paired differences, its own token, lock and directory, the preflight and the output hashes. Notebook `colab/notebooks/idrid_batch2_ep.ipynb` (`CONFIRM = None`). Tests `tests/test_idrid_batch2_eval.py`, 16: the protocol and its refusals (missing seed, wrong arm, wrong seed, wrong architecture, duplicated file, changed parent); file verification (wrong hash, missing or replaced checkpoint, wrong run, wrong lineage, ImageNet start, selection not on APTOS validation, a P / E1 / E2 hash); the IDRiD manifest and the 100 / 103 subsets on the real local files; preprocessing parity with the frame every EP model was trained on; metrics, paired differences and reproducibility; token and gate enforcement (batch 1's token does not open batch 2); output schema, run metadata and output hashes; a second run refused before any image is read and nothing overwritten; the preflight.
+
+**Status.** Protocol locked; implementation complete. No EP model has been run on IDRiD. The run needs the user's confirmation token.
