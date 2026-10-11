@@ -5418,3 +5418,76 @@ A signature was computed for every image. No image is excluded and none is flagg
 **Notebook.** `colab/notebooks/ddr_grading_v1.ipynb`: setup; staging and preflight (protocol, twelve checkpoints, lists, every image hash, both check files, existing outputs); the twelve-model APTOS parity gate; the run, which refuses without the confirmation token; the report.
 
 **Not done.** The parity gate has not been run. No DDR image has been decoded by a model. The one-time evaluation awaits the gate and the user's explicit authorisation.
+
+## 85. DDR grading evaluation, version 1 — APTOS parity gate: PASS (2026-10-11; Colab T4, commit `d951be2`; no DDR image decoded, no grade predicted on DDR)
+
+**What this section is.** The record of the last technical gate before the one-time evaluation. It is not a DDR result: the gate reads APTOS images only (`ddr_images_read` 0).
+
+**Result: official gate PASS, no failure.** Environment: Tesla T4, mixed_float16, TensorFlow 2.21.0, Keras 3.13.2, PyTorch 2.11.0, NumPy 2.1.3, Python 3.13.15. All twelve grading outputs are float16.
+
+- **Image path.** Ten raw APTOS images (two per grade): Stage 2 recomputed exactly (10 / 10) and the 512 frame identical to the cache (largest difference 0).
+- **Ten raw images, twelve models.** Largest logit difference 0.0156 (tolerance 0.05); largest cumulative-probability difference 0.00022 (tolerance 0.01); decoded grades identical for every model.
+- **All 730 validation images, twelve models.** Largest logit difference 0.0156; largest cumulative-probability difference 0.00046; decoded grades identical for every model; every QWK equal to its stored value:
+
+| arm | seed 42 | seed 123 | seed 2026 |
+|---|---|---|---|
+| P | 0.9184 | 0.9148 | 0.9176 |
+| P-EP | 0.9198 | 0.9223 | 0.9229 |
+| E1-EP | 0.9244 | 0.9235 | 0.9274 |
+| E2-EP | 0.9309 | 0.9218 | 0.9228 |
+
+P, which is run afresh in this evaluation, reproduces its stored validation table under the current runtime (TensorFlow 2.21.0; the stored tables were made under 2.20.0).
+
+**State.** Protocol, download, official size / CRC-32 comparison, near-duplicate screen and parity gate have all passed. The one-time evaluation has not been run and awaits the user's explicit authorisation. The gate is valid only in the runtime, commit and protocol in which it passed.
+
+## 86. DDR grading evaluation, version 1 — result (run once 2026-10-11 12:50 UTC; commit `d951be2`; protocol `38eb810f…c192`; Colab T4; read under the rules of §82 – §83)
+
+**Run integrity.** One run; no rerun; `technical_rerun_reason` empty; no earlier output of this evaluation existed. Output `experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/`, 19 files, each equal to its entry in `output_hashes.json` when read back from Drive (`primary_result.json` `fe689ae5…4cdd`, `secondary_results.json` `759ba792…d9f4`, `sensitivity_results.json` `c24603f2…26cc`). The run records zero IDRiD files opened. Nothing was trained, tuned or selected.
+
+### 86.1 Primary result
+
+Population: 3,540 images (1,846 / 159 / 1,224 / 57 / 254).
+
+| seed | QWK P | QWK P-EP | difference |
+|---|---|---|---|
+| 42 | 0.5113 | 0.6324 | +0.1211 |
+| 123 | 0.5290 | 0.5453 | +0.0163 |
+| 2026 | 0.4877 | 0.6012 | +0.1135 |
+| mean | 0.5093 | 0.5929 | **+0.0836** (95 % interval +0.0687 … +0.0989) |
+
+**Reading under the pre-declared rule: supported** — the interval lies wholly above zero. All three differences are positive, so no seed-level inconsistency is flagged; they are unequal (seed 123 contributes +0.016, the other two about +0.12).
+
+The interval is conditional on these six checkpoints and treats images as independent. The three P-EP checkpoints share one adapted encoder.
+
+### 86.2 What the difference consists of (secondary, descriptive)
+
+- **Both arms grade DDR poorly in absolute terms.** QWK 0.51 and 0.59 against 0.92 on APTOS validation. Most diseased images are called grade 0: of the grade-2 images, P decodes 74 % as grade 0 and P-EP 56 %. Referable-DR sensitivity of the decoded grade is 0.306 (P) and 0.369 (P-EP) at specificity 0.996 and 0.998.
+- **The gain is at the decoded grade, hardly in ranking.** Pooled per-cut AUROC changes little: mean of the four cuts +0.0049 (interval +0.0004 … +0.0093; per seed +0.013 / +0.011 / −0.010). Per-grade recall, P → P-EP: grade 1 0.036 → 0.067, grade 2 0.096 → 0.208, grade 3 0.468 → 0.339, grade 4 0.358 → 0.535. MAE 0.744 → 0.623. P-EP moves more diseased images off grade 0 and more grade-4 images to grade 4, and loses grade-3 recall.
+- **Calibration is poor for every arm.** Mean confidence 0.93 against top-label accuracy 0.59 (P) and 0.64 (P-EP); top-label ECE 0.35 and 0.29. The fixed 0.5 decode is far from a good operating point on this dataset; no threshold was fitted and none may be.
+- **Seed ensemble.** QWK 0.508 (P) and 0.590 (P-EP); difference +0.082 (+0.063 … +0.102).
+- **Lesion-supervised arms.** E1-EP − P-EP −0.030 (−0.045 … −0.016), with unequal seeds (−0.150 / +0.053 / +0.006): carried by seed 42. E2-EP − P-EP −0.046 (−0.058 … −0.034), negative in all three seeds. As on APTOS and IDRiD, no grading gain from lesion supervision is shown; these contrasts carry no criterion.
+
+### 86.3 Source family and same-visit proxy
+
+| family | images (grades 0 – 4) | P-EP − P | per seed |
+|---|---|---|---|
+| timestamp-named | 2,765 (1,846 / 21 / 867 / 31 / 0) | +0.170 (+0.151 … +0.191) | +0.229 / +0.088 / +0.195 |
+| `007`-named | 775 (0 / 138 / 357 / 26 / 254) | +0.059 (+0.030 … +0.089) | +0.088 / −0.014 / +0.103 |
+
+- The difference has the same sign inside both families; inside the `007` family one seed is slightly negative.
+- **Pooled AUROC overstates what is seen inside a family.** For "any DR" the pooled AUROC is 0.891 (P) and 0.908 (P-EP), but among timestamp-named images — the only family holding grade 0 — it is 0.832 and 0.872. For grade 4 the pooled value is 0.960 and 0.956, but among `007`-named images — the only family holding grade 4 — it is 0.825 and 0.848. Part of the pooled discrimination is therefore between sources. This is the confound stated before the run; the family analysis shows it is material and cannot remove it.
+- Same-visit proxy (cluster bootstrap over 2,046 file-time units): +0.0836 (+0.0672 … +0.0985), essentially the image-level interval. A proxy, not patient-level inference.
+
+### 86.4 Sensitivity
+
+Broader 3,725 images (not untouched): +0.0895 (+0.0751 … +0.1033). The 185 lesion-subset images alone: +0.124 (+0.093 … +0.157). The screen flagged no image, so there is no "without flagged" analysis. None of these replaces §86.1.
+
+### 86.5 What is and is not supported
+
+- **Supported.** On the restricted DDR test population, under a protocol fixed before any DDR image was seen by a model, the EyePACS-adapted grader P-EP agrees better with the reference grades than P (QWK +0.084, interval excluding zero, all three seed pairs positive). With IDRiD (§79: +0.097, +0.040 … +0.162) this is a second dataset on which the same direction is observed, this time pre-declared.
+- **Qualifications that belong to the claim.** The interval does not cover training or adaptation variability (one adapted encoder); it may be too narrow without patient identifiers; the seed contributions are unequal; the pooled metric mixes grading with source; the gain is mostly a shift of decoded grades, with almost no change in ranking.
+- **Not supported.** That either model grades DDR well: both miss most referable disease at the fixed decode. Any claim about severe grades specifically (grade-3 recall falls). Any benefit of lesion supervision for grading. Any statement about clinical utility, equivalence or non-inferiority. Any generalisation beyond these two external datasets.
+
+### 86.6 Standing
+
+The DDR grading test list is now consumed for this project: no threshold, decoding rule, checkpoint or model may be chosen or re-evaluated on it. IDRiD stays closed. Messidor-2 remains a possible separate replication with its open questions (§81.3). No recorded conclusion of §60 – §85 is changed. No further experiment is approved by this section.
