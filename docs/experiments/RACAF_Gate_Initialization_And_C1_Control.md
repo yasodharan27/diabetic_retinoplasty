@@ -5393,3 +5393,28 @@ The archive's folder counts are those of the mirror: grading 6,835 / 2,733 / 4,1
 ### 83.4 Order from here
 
 Download with per-file SHA-256; comparison with the official directory; the near-duplicate screen; then, only if both are clean, the private upload, the Colab notebook, the twelve-checkpoint APTOS parity gate on a T4, and — after the one-run authorisation — the locked evaluator. No model is trained, tuned or selected on DDR. IDRiD stays closed.
+
+## 84. DDR grading evaluation, version 1 — download, official-directory comparison and near-duplicate screen (2026-10-11; no model run, no grade predicted, IDRiD not opened)
+
+**What this section is.** The record of the three steps that had to pass before any model sees a DDR grading image. They did. Nothing below is a grading result.
+
+**Download.** The 3,725 images of the pinned broader list were fetched from the mirror at revision `50541319…` with `ddr_grading_data.download` (preconditions of §83.3 verified first). Each file was kept only with its listed SHA-256, and a final pass re-hashed all 3,725. The folder holds exactly those files. To shorten the transfer the same function, with the same token and the same per-file rule, was also run on six disjoint slices of the list in parallel; one rename collision between two streams was retried and the file re-verified. No ungradable image and no file outside the list was requested.
+
+**Comparison with the official archive's directory** (`ddr_grading_data.official_check`). 3,725 of 3,725 images equal their official entry in size and CRC-32; none differs and none is absent from the official directory. Output `ddr_grading_official_crc_check_v1.json`, SHA-256 `adc7a70f…2491`. This is agreement of size and a 32-bit checksum for every evaluated file, not a proof of byte identity.
+
+**Near-duplicate screen** (`ddr_grading_data.screen`; frozen thresholds 0.01 and 0.06; label-free). Output `ddr_grading_near_duplicate_screen_v1.json`, SHA-256 `f766c2cd…05d4`.
+
+| against | images | nearest distance (minimum / 1st percentile / median) | exclusion band (< 0.01) | flagged band (0.01 – 0.06) |
+|---|---|---|---|---|
+| APTOS training set (train + validation) | 3,662 | 0.107 / 0.137 / 0.313 | 0 | 0 |
+| EyePACS adaptation images | 35,122 | 0.076 / 0.091 / 0.243 | 0 | 0 |
+
+A signature was computed for every image. No image is excluded and none is flagged, so the primary population stays the frozen 3,540, no second version is issued, and the "without flagged images" sensitivity analysis has nothing to remove. For information only: among the listed images themselves, none lies within 0.01 of another and 27 lie within 0.06 of another (similar photographs inside DDR; the rule attaches no action to them).
+
+**What a clean screen means.** No listed image is a near-exact copy, under this 32 × 32 signature, of an APTOS or EyePACS adaptation image. Given the positive control (§82.5: re-encoded copies fall below 0.06 in about 99 % of cases), a re-encoded copy of a development image among the test images is unlikely. It does not show that the eyes or patients are distinct from those of the development data, and IDRiD was not screened.
+
+**Staging.** The images were packed into one archive (`ddr_grading_test_3725.tar`, SHA-256 `a290734b…6d33`) and placed, with the two lists and the two check files, in the private Drive folder `datasets/DDR/grading_test_v1/`. Nothing image-derived is in Git.
+
+**Notebook.** `colab/notebooks/ddr_grading_v1.ipynb`: setup; staging and preflight (protocol, twelve checkpoints, lists, every image hash, both check files, existing outputs); the twelve-model APTOS parity gate; the run, which refuses without the confirmation token; the report.
+
+**Not done.** The parity gate has not been run. No DDR image has been decoded by a model. The one-time evaluation awaits the gate and the user's explicit authorisation.
