@@ -5128,3 +5128,50 @@ The two primary contrasts are named here, before the run, because §65 did not n
 `idrid_batch2_protocol.json` (SHA-256 `5ea937c4edb8baef9458ef996beef92f80c7eb969a0a45a8f0a0aaa636cc073a`) and `idrid_batch2_eval.py`, an extension of the batch-1 evaluator: the image path, table and decode, gates, metrics, bootstrap, paired differences, report, gate requirement and stored-P reader are batch 1's own functions. For that, `idrid_batch1_eval.gates`, `summarise` and `report_markdown` received keyword arguments whose defaults are batch 1; **the generalised `summarise`, run on the stored per-image tables of §67, reproduces the recorded batch-1 primary and sensitivity results exactly**, and the ten batch-1 tests pass. New in the module: the nine-checkpoint identity checks, the P graph next to E1's graph, the four paired differences, its own token, lock and directory, the preflight and the output hashes. Notebook `colab/notebooks/idrid_batch2_ep.ipynb` (`CONFIRM = None`). Tests `tests/test_idrid_batch2_eval.py`, 16: the protocol and its refusals (missing seed, wrong arm, wrong seed, wrong architecture, duplicated file, changed parent); file verification (wrong hash, missing or replaced checkpoint, wrong run, wrong lineage, ImageNet start, selection not on APTOS validation, a P / E1 / E2 hash); the IDRiD manifest and the 100 / 103 subsets on the real local files; preprocessing parity with the frame every EP model was trained on; metrics, paired differences and reproducibility; token and gate enforcement (batch 1's token does not open batch 2); output schema, run metadata and output hashes; a second run refused before any image is read and nothing overwritten; the preflight.
 
 **Status.** Protocol locked; implementation complete. No EP model has been run on IDRiD. The run needs the user's confirmation token.
+
+
+## 79. IDRiD batch 2 — cross-dataset evaluation of P-EP, E1-EP and E2-EP: result (run once 2026-10-11 07:24 UTC; commit `1ef0929`; Colab T4; read under the rules of §78)
+
+**Run.** `experiments/IDRiDGrading/idrid_batch2_ep_5ea937c4edb8_2026-10-11_07-24-10`, protocol `5ea937c4…073a`, Tesla T4, TensorFlow 2.21.0, Keras 3.13.2, mixed_float16. One run: no previous run, no technical rerun. Verified from the files on Drive: all 19 output files match `output_hashes.json`; the nine checkpoints verified at run time are the nine of §78; the primary result recomputed on the laptop from the saved per-image tables is identical to the stored one. **Gates: official PASS, no failure** — ten raw APTOS images: Stage 2 exact in 10 / 10, frame difference 0.0; all 730 validation images, nine models: largest logit difference 0.0156, largest cumulative-probability difference 0.0013, decoded grades identical, every model's stored validation QWK reproduced to four decimals; no IDRiD image read before the gates passed.
+
+### Primary result — 100 images (grades 34 / 5 / 29 / 19 / 13)
+
+| | P (stored) | P-EP | E1-EP | E2-EP |
+|---|---|---|---|---|
+| **QWK**, seeds 42 / 123 / 2026 | 0.538 / 0.702 / 0.685 | 0.783 / 0.699 / 0.733 | 0.663 / 0.756 / 0.692 | 0.712 / 0.663 / 0.625 |
+| **QWK**, mean ± SD | **0.642 ± 0.090** | **0.738 ± 0.042** | **0.704 ± 0.048** | **0.667 ± 0.044** |
+| 95 % interval of the seed mean | 0.532 – 0.732 | 0.654 – 0.805 | 0.612 – 0.781 | 0.566 – 0.750 |
+| AUROC ≥1 | 0.888 | 0.922 | 0.910 | 0.913 |
+| AUROC ≥2 | 0.895 | 0.901 | 0.890 | 0.905 |
+| AUROC ≥3 | 0.893 | 0.926 | 0.926 | 0.906 |
+| AUROC ≥4 | 0.861 | 0.946 | 0.956 | 0.929 |
+| recall, grades 0 / 1 / 2 / 3 / 4 | 0.51 / 0.33 / 0.72 / 0.30 / 0.21 | 0.75 / 0.53 / 0.53 / 0.25 / 0.26 | 0.52 / 0.53 / 0.60 / 0.23 / 0.44 | 0.50 / 0.53 / 0.64 / 0.19 / 0.33 |
+| false-urgent rate | 0.005 | 0.005 | 0.005 | 0.000 |
+
+Paired differences, same images and same seed (grade-stratified bootstrap, 2,000 resamples, seed 20260927):
+
+| contrast | QWK | 95 % interval | per seed | mean AUROC of the four cuts | 95 % interval | per seed |
+|---|---|---|---|---|---|---|
+| **P-EP − P** (primary) | **+0.0965** | **+0.040 … +0.162** | +0.245 / −0.004 / +0.048 | +0.0393 | +0.019 … +0.064 | +0.092 / +0.019 / +0.007 |
+| **E1-EP − P-EP** (primary) | −0.0345 | −0.090 … +0.015 | −0.120 / +0.058 / −0.041 | −0.0028 | −0.019 … +0.014 | −0.023 / +0.015 / −0.001 |
+| E2-EP − P-EP (descriptive) | −0.0716 | −0.124 … −0.027 | −0.071 / −0.036 / −0.108 | −0.0104 | −0.026 … +0.005 | −0.026 / +0.000 / −0.006 |
+| E1-EP − E2-EP (descriptive) | +0.0370 | −0.026 … +0.095 | −0.049 / +0.093 / +0.067 | +0.0076 | −0.007 … +0.022 | +0.003 / +0.015 / +0.005 |
+
+P-EP − P by cut: AUROC ≥1 +0.035, ≥2 +0.006, ≥3 +0.033, ≥4 +0.084 (≥4 per seed +0.115 / +0.075 / +0.063); recall by grade +0.245 / +0.200 / −0.195 / −0.053 / +0.051. E1-EP − P-EP recall by grade: −0.235 / 0.000 / +0.069 / −0.018 / +0.179. Decoded grades differ between P-EP and P on 39 / 31 / 29 of the 100 images.
+
+### Sensitivity analysis — all 103 images (not the primary result)
+
+QWK P 0.636, P-EP 0.736, E1-EP 0.701, E2-EP 0.663. P-EP − P +0.0998 (+0.044 … +0.164); E1-EP − P-EP −0.0345 (−0.093 … +0.015); E2-EP − P-EP −0.0731 (−0.126 … −0.029); E1-EP − E2-EP +0.0386 (−0.023 … +0.100). The same reading as the primary set for every contrast.
+
+### Reading (rules of §78, applied as written)
+
+1. **P-EP − P: higher.** The EyePACS-adapted grader has a higher cross-dataset QWK on IDRiD than P, +0.097, and the interval of the seed-mean difference lies above zero (+0.040 … +0.162), on the primary and on the sensitivity set; the threshold-free measure agrees (mean AUROC +0.039, +0.019 … +0.064). By the rule: the magnitude and interval are reported and **no claim of general improvement is made**. What qualifies it: (a) the QWK difference is carried mostly by seed 42 (+0.245), where P was at its lowest (0.538); in seed 123 it is zero and in seed 2026 +0.048 — the mean AUROC difference is positive in all three seeds but also largest in seed 42; (b) the gain in decoded grades comes from grades 0 and 1 (recall 0.51 → 0.75 and 0.33 → 0.53) with a loss on grade 2 (0.72 → 0.53) — P-EP calls fewer healthy IDRiD eyes diseased, which is where P failed on this set (§61); (c) the ordering of the severe grades improved (AUROC ≥4 +0.084, positive in every seed) while their decoded recall stayed low (grade 3: 0.25, grade 4: 0.26); (d) P's predictions come from the earlier runtime and the nine EP models share one adapted encoder, so the reduced seed spread of P-EP (0.042 against 0.090) is not evidence of robustness; (e) 100 images.
+2. **This is the first place in the project where the EyePACS adaptation shows a difference.** On APTOS validation P-EP was comparable to P (§74, +0.005, interval through zero); on the one external set it is higher. That is consistent with the purpose of the adaptation — data from other cameras and clinics — and with APTOS validation being unable to show it. It is one external set of 100 images that the project had used before; it is not established as a general effect.
+3. **E1-EP − P-EP: comparable.** −0.035 (−0.090 … +0.015); the signs differ between seeds; mean AUROC unchanged (−0.003). Aligned lesion supervision after adaptation shows no grading difference on IDRiD — neither a gain nor, as E1 had in batch 1 against P (§67, −0.066), a loss whose interval excludes zero. E1-EP has higher grade-4 recall than P-EP (0.44 against 0.26; six more of 39 grade-4 decisions over the three seeds) and lower grade-0 recall (0.52 against 0.75); descriptive.
+4. **E2-EP − P-EP: lower** (−0.072, −0.124 … −0.027; all three seeds), in decoded grades; its mean AUROC difference includes zero (−0.010, −0.026 … +0.005). **E1-EP − E2-EP: comparable** (+0.037, −0.026 … +0.095). So on IDRiD the deranged-target control is the lowest EP arm, and it cannot be separated from the aligned one. Both are descriptive contrasts. The teacher-domain limitation applies to both lesion-supervised arms.
+5. **No statement about lesion supervision improving grading is supported**: E1-EP is not above P-EP here or on APTOS (§75, §77). §76 – §77 (representation) are unaffected: this batch is about grading.
+6. Context, not a declared contrast: against their non-adapted counterparts in batch 1 on the same images, the EP arms have higher mean QWK (E1-EP 0.704 against E1 0.576; E2-EP 0.667 against E2 0.646; P-EP 0.738 against P 0.642).
+
+**Limitations (those of §78).** 100 primary images, 19 of grade 3 and 13 of grade 4; the third use of this test set in the project; Stage 4 was trained on IDRiD's camera domain (affects E1-EP and E2-EP, not P or P-EP); one adapted encoder under all nine models; P from an earlier runtime; APTOS validation selected every checkpoint; the fixed 0.5 decoding is conservative for the severe grades (their recall is 0.19 – 0.44 for every arm while AUROC ≥3 and ≥4 are 0.91 – 0.96); absolute performance on IDRiD remains far below APTOS validation (0.74 against 0.92). Nothing here establishes clinical utility.
+
+**Closed.** IDRiD batch 2 has been used; with it every declared use of IDRiD's grading test set is consumed. It is not rerun. No model, threshold, decoding rule or recorded conclusion is changed on the basis of this result.
