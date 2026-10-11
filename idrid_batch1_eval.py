@@ -173,7 +173,8 @@ def gates(drive_root, aptos_raw_dir, bundle, out_dir, *, aptos_processed_dir=Non
     ig.prepare_gpu()
     files = verify_files_(protocol, drive_root)                      # gates 1, 2, 9 (raises on any mismatch)
     checks["checkpoint_sha256"] = {k: protocol["checkpoints"][k]["sha256"] for k in files["checkpoints"]}
-    checks["p_table_sha256"] = {str(s): protocol["stored_p_tables"][f"p_seed{s}"]["sha256"] for s in SEEDS}
+    if "stored_p_tables" in protocol:                                # an evaluation that runs P itself pins none
+        checks["p_table_sha256"] = {str(s): protocol["stored_p_tables"][f"p_seed{s}"]["sha256"] for s in SEEDS}
     checks["parent_protocol_sha256"] = protocol["parent_protocol"]["sha256"]
     models = models if models is not None else load_models_(files, settings)     # gates 6, 7
     checks["grading_output_dtype"] = {f"{m}_seed{s}": str(net.outputs[0].dtype) for (m, s), net in models.items()}

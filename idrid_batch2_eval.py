@@ -88,14 +88,29 @@ def baseline_hashes(parent):
 
 
 def verify_files(protocol, drive_root, parent=None):
-    """Every pinned file exists with the pinned SHA-256, and every checkpoint is what the protocol says it is.
+    """Every pinned file exists with the pinned SHA-256, and every checkpoint is what the protocol says it is:
+    `verify_checkpoints`, then the three stored P tables. Raises on the first mismatch; nothing is substituted."""
+    files = verify_checkpoints(protocol, drive_root, parent)
+    root = lambda rel: os.path.join(drive_root, *rel.split("/"))
+    p_tables = {}
+    for seed in SEEDS:
+        entry = protocol["stored_p_tables"][f"p_seed{seed}"]
+        path = root(entry["path"])
+        if not os.path.exists(path) or ig.sha256_file(path) != entry["sha256"]:
+            raise ProtocolError(f"stored P table for seed {seed} is missing or is not the pinned file")
+        p_tables[seed] = path
+    return {**files, "p_tables": p_tables}
+
+
+def verify_checkpoints(protocol, drive_root, parent=None):
+    """The checkpoint part of `verify_files` (no stored prediction table is opened).
 
     For each of the nine: the weights file's SHA-256; the run's pinned-checkpoint record names this file and this
     hash (it is frozen and was not replaced); the run is the EP experiment's run for this arm, seed and model
     type; it started from the pinned adapted encoder -- not ImageNet's -- with a fresh head; its BEST pointer
     still names the pinned slot and epoch; the run evaluated this file as BEST, selected by APTOS validation QWK;
-    and the hash is not one of the P / E1 / E2 checkpoints. Also: the adapted encoder's own pin, the ImageNet file
-    the P graph is built from, and the three stored P tables. Raises on the first mismatch; nothing is substituted."""
+    and the hash is not one of the P / E1 / E2 checkpoints. Also: the adapted encoder's own pin and the ImageNet
+    file the P graph is built from. Raises on the first mismatch; nothing is substituted."""
     root = lambda rel: os.path.join(drive_root, *rel.split("/"))
     parent = parent or ig.load_protocol(os.path.join(HERE, protocol["parent_protocol"]["file"]))[0]
     forbidden = baseline_hashes(parent)
@@ -142,23 +157,17 @@ def verify_files(protocol, drive_root, parent=None):
     pretrained = parent["checkpoints"]["convnext_pretrained"]
     if not os.path.exists(root(pretrained["path"])) or ig.sha256_file(root(pretrained["path"])) != pretrained["sha256"]:
         raise ProtocolError("the ImageNet ConvNeXt file the P graph is built from is missing or is not the pinned file")
-    p_tables = {}
-    for seed in SEEDS:
-        entry = protocol["stored_p_tables"][f"p_seed{seed}"]
-        path = root(entry["path"])
-        if not os.path.exists(path) or ig.sha256_file(path) != entry["sha256"]:
-            raise ProtocolError(f"stored P table for seed {seed} is missing or is not the pinned file")
-        p_tables[seed] = path
-    return {"checkpoints": checkpoints, "p_tables": p_tables, "lesion_prior": priors, "kinds": kinds,
+    return {"checkpoints": checkpoints, "lesion_prior": priors, "kinds": kinds,
             "pretrained": root(pretrained["path"]), "adapted_encoder_sha256": adapted["sha256"]}
 
 
 # --------------------------------------------------------------------------- models
 
-def load_models(files, settings):
+def load_models(files, settings, arms=RUN_MODELS):
     """{(arm, seed): keras model}: P-EP in P's graph, E1-EP and E2-EP in E1's graph, built under the protocol's
     dtype policy (set AFTER clear_session) and loaded from the pinned BEST weights; every model is checked to
-    really be in that precision."""
+    really be in that precision. `arms` (default: this batch's three) lets another evaluation name its own; the
+    graph of each checkpoint is `files['kinds']`."""
     import keras
 
     import e1_model as em
@@ -171,7 +180,7 @@ def load_models(files, settings):
     keras.mixed_precision.set_global_policy(settings["keras_policy"])
     expected = "float16" if settings["keras_policy"] == "mixed_float16" else "float32"
     models = {}
-    for arm in RUN_MODELS:
+    for arm in arms:
         for seed in SEEDS:
             name = f"{arm}_seed{seed}"
             if files["kinds"][name] == "P":

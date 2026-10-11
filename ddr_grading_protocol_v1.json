@@ -1,0 +1,532 @@
+{
+ "name": "DDR grading test set -- restricted cross-dataset evaluation of the frozen graders P and P-EP (secondary: E1-EP, E2-EP)",
+ "version": 1,
+ "prepared": "2026-10-11",
+ "research_record_section": "§82 (audits: §81)",
+ "status": "prepared before any DDR grading image was downloaded and before any grade prediction on DDR exists; evaluation only",
+ "parent_protocol": {
+  "file": "idrid_grading_protocol.json",
+  "sha256": "f93c1237eb81ab20397dea8bc6d9079871d6308578304f793dfabee17938587e",
+  "note": "used for what it locks independently of any dataset: the three P checkpoints, the ImageNet file the P graph is built from, Stage-2 preprocessing, the 512 RGB frame, the inference settings, the decoding rule and the parity tolerances. Its dataset section (IDRiD) is not used and no IDRiD file is opened"
+ },
+ "ep_protocol": {
+  "file": "idrid_batch2_protocol.json",
+  "sha256": "5ea937c4edb8baef9458ef996beef92f80c7eb969a0a45a8f0a0aaa636cc073a",
+  "note": "used for the nine EP checkpoint pins, their identity checks and the adapted-encoder pin only"
+ },
+ "seeds": [
+  42,
+  123,
+  2026
+ ],
+ "question": "Does supervised pre-adaptation on EyePACS (P-EP) change five-grade agreement with the reference grades, relative to P, on DDR grading-test images that no model or decision of this project has used?",
+ "primary_hypothesis": "the mean over the three seed-labelled pairs of QWK(P-EP) - QWK(P) on the primary population is positive",
+ "data": {
+  "mirror": "huggingface.co/datasets/ctmedtech/DDR-dataset",
+  "revision": "50541319cfcdc963e3edc8b15508bc822d6b3ab5",
+  "provenance": "a third-party mirror, used provisionally. The official release (github.com/nkicsl/DDR-dataset) is one stored zip archive in ten chunks with no published checksums. Its central directory was read from the last 6 MiB of the last chunk (2026-10-11; no image downloaded): all 4,105 grading-test file names are present with the same sizes as the mirror records, the three label lists equal the local ones in size and CRC-32, and the 757 lesion images already on disk equal their official entries in size and CRC-32 (including the 185 that are also grading-test files). Every downloaded image is compared with its official entry (size and CRC-32) before the screen. Agreement of size and CRC-32 is evidence, not proof, of byte identity: full byte identity with the official release is NOT verified",
+  "official_directory": {
+   "path": "datasets/DDR/audit/ddr_official_archive_directory.csv",
+   "sha256": "968de07ffeaacac09339a93fc7bf6d4e72c56652a70f0e22dddfaa1d1ccf41ab",
+   "files": 18218,
+   "source": "Google Drive folder 1z6tSFmxW_aNayUqVxx6h6bY4kwGzUTEC, DDR-dataset.zip.010 (986,864,333 bytes, sha256 21189ac330852efbc1354807ae22764d3fafaedeba5d18aa40ea9c1adc2cdd03 as reported by Drive), last 6,291,456 bytes; archive total 15,142,640,333 bytes",
+   "check_output": "datasets/DDR/audit/ddr_grading_official_crc_check_v1.json"
+  },
+  "label_file": {
+   "path": "datasets/DDR/raw/DR_grading/test.txt",
+   "sha256": "195b400fe17bb2323f074904536eb9c9b3bdf77f867e1456c8f0caefabfdd328",
+   "rows": 4105
+  },
+  "lesion_manifest": {
+   "path": "datasets/DDR/audit/ddr_lesion_manifest.csv",
+   "sha256": "6aa891830136dd74465e4903fdd5b582c540bd1807d36b7faf751e51e512198e",
+   "rows": 757
+  },
+  "file_metadata": {
+   "path": "datasets/DDR/audit/ddr_grading_test_files_50541319.csv",
+   "sha256": "7972166140ee02d4b327f0182bf3cabdffe7202ed4cca208be18682e375c4ab4",
+   "rows": 4105,
+   "what": "name, size and SHA-256 of every file of DR_grading/test at the pinned revision (Hugging Face tree API)"
+  },
+  "identity_check": "every image must have the SHA-256 its list records (checked at download, at the screen and again before inference)",
+  "licence_basis": "the official release's CC BY-NC-SA 4.0 is taken as binding (the mirror's card states CC BY 4.0 with incorrect attribution; the conflict is unresolved): non-commercial research use, attribution to Li et al., Information Sciences 2019",
+  "handling": "images, image lists, signatures and per-image outputs stay in the git-ignored datasets/ and results/ folders and in the user's private Drive; nothing image-derived is committed, shared or redistributed. Ungradable images are not downloaded",
+  "storage_estimate": "download of the 3,725 listed images: 4.79 GiB (from the recorded sizes); no frame cache is built (frames are computed in memory, in chunks)"
+ },
+ "populations": {
+  "exclusion_order": [
+   "1. the grading test list: 4,105 images",
+   "2. label 5 (ungradable) removed: 346 -> 3,759 gradable",
+   "3. the lesion-segmentation subset removed, by file name and by content hash: 185 (0 more by content) -> 3,574",
+   "4. byte-identical groups inside the remainder: the lexicographically smallest file name is kept: 32 groups, 34 images removed -> 3,540"
+  ],
+  "exclusion_counts": {
+   "test_list": 4105,
+   "ungradable": 346,
+   "gradable": 3759,
+   "lesion_subset_by_name": 185,
+   "lesion_subset_by_content": 0,
+   "after_lesion_exclusion": 3574,
+   "duplicate_groups": 32,
+   "duplicate_extras_removed": 34
+  },
+  "lesion_subset_roles": {
+   "test": 59,
+   "train": 8,
+   "val": 118
+  },
+  "duplicate_group_sizes": {
+   "2": 31,
+   "4": 1
+  },
+  "primary": {
+   "n": 3540,
+   "grades_0_to_4": [
+    1846,
+    159,
+    1224,
+    57,
+    254
+   ],
+   "list": "ddr_grading_primary_v1.csv",
+   "list_sha256": "f5091c4a6e16c95d80f44af5498bc0a12f9118a446038787a90d8cea1f08fd8b",
+   "by_family": {
+    "timestamp": {
+     "n": 2765,
+     "grades_0_to_4": [
+      1846,
+      21,
+      867,
+      31,
+      0
+     ]
+    },
+    "007": {
+     "n": 775,
+     "grades_0_to_4": [
+      0,
+      138,
+      357,
+      26,
+      254
+     ]
+    }
+   }
+  },
+  "broader": {
+   "n": 3725,
+   "grades_0_to_4": [
+    1846,
+    189,
+    1344,
+    71,
+    275
+   ],
+   "list": "ddr_grading_broader_v1.csv",
+   "list_sha256": "52d57fcce3a2d791d6063c9aa436d12354904909e0502b3c878114a5b19645fa",
+   "definition": "the primary population plus the 185 lesion-subset images = every gradable test image under the same duplicate rule",
+   "status": "SECONDARY, sensitivity only, and NOT an untouched set: the 185 added images were processed in the lesion-representation experiments (records 70, 76) as inputs of linear probes on the frozen encoders of all six arms. Their grades were never an endpoint and no grader was trained, selected or tuned on them, but probe results on them informed project decisions"
+  },
+  "list_location": "datasets/DDR/audit/",
+  "duplicates_not_removed": "3 groups have their second member in the DDR train or valid list; no model here was trained on DDR grading images, so these stay",
+  "same_visit_proxy": {
+   "timestamp_images": 2765,
+   "chains": 1271,
+   "chains_of_two_or_more": 451,
+   "longest_chain": 94
+  }
+ },
+ "near_duplicate_screen": {
+  "when": "after the download and BEFORE any model sees a DDR image; label-free (file names and pixels only)",
+  "implementation": "ddr_grading_data.screen",
+  "signature": "grey image cropped to the fundus bounding box, 32x32, standardised; distance = L2 / 32 (the screen of records 64, 64.1)",
+  "copy_band_below": 0.01,
+  "ambiguous_band_below": 0.06,
+  "calibration": "on APTOS (record 64): copies and re-encodings fall below 0.01, different photographs begin at about 0.06",
+  "screened": "every image of the broader list (3,725)",
+  "against": {
+   "aptos_train_and_validation": {
+    "images": 3662,
+    "signature_file": "results/EyePACS_APTOS_overlap/sig_aptos_train.npz",
+    "signature_file_sha256": "314aea3d19d6411c301cc5cf0f8b754adcb32aaee09dba27edc86c8c141dfe7f"
+   },
+   "eyepacs_adaptation": {
+    "images": 35122,
+    "signature_file": "results/EyePACS_APTOS_overlap/sig_eyepacs_train.npz",
+    "signature_file_sha256": "881745e66cfeaf2d3b82d0bdc2e0fa6113a417ca391cbd3874e66ffdf3669a2e"
+   }
+  },
+  "positive_control": {
+   "what": "run before any DDR image existed, on development images only (ddr_grading_data.positive_control; 150 APTOS and 150 EyePACS images, each re-encoded as JPEG at five size / quality settings; distance of the copy to its original's stored signature)",
+   "result": {
+    "sig_aptos_train.npz": {
+     "images": 150,
+     "JPEG q95, same size": {
+      "median": 0.0083,
+      "p95": 0.0205,
+      "max": 0.0449,
+      "copy_band": 103,
+      "ambiguous_band": 47,
+      "outside_both": 0
+     },
+     "JPEG q75, same size": {
+      "median": 0.009,
+      "p95": 0.0227,
+      "max": 0.053,
+      "copy_band": 88,
+      "ambiguous_band": 62,
+      "outside_both": 0
+     },
+     "75% size, JPEG q90": {
+      "median": 0.0163,
+      "p95": 0.0388,
+      "max": 0.0738,
+      "copy_band": 19,
+      "ambiguous_band": 128,
+      "outside_both": 3
+     },
+     "50% size, JPEG q75": {
+      "median": 0.0122,
+      "p95": 0.0423,
+      "max": 0.0725,
+      "copy_band": 51,
+      "ambiguous_band": 96,
+      "outside_both": 3
+     },
+     "25% size, JPEG q75": {
+      "median": 0.0132,
+      "p95": 0.0559,
+      "max": 0.0807,
+      "copy_band": 11,
+      "ambiguous_band": 133,
+      "outside_both": 6
+     }
+    },
+    "sig_eyepacs_train.npz": {
+     "images": 150,
+     "JPEG q95, same size": {
+      "median": 0.0018,
+      "p95": 0.0051,
+      "max": 0.0076,
+      "copy_band": 150,
+      "ambiguous_band": 0,
+      "outside_both": 0
+     },
+     "JPEG q75, same size": {
+      "median": 0.0073,
+      "p95": 0.0128,
+      "max": 0.0923,
+      "copy_band": 134,
+      "ambiguous_band": 15,
+      "outside_both": 1
+     },
+     "75% size, JPEG q90": {
+      "median": 0.0082,
+      "p95": 0.0258,
+      "max": 0.0922,
+      "copy_band": 97,
+      "ambiguous_band": 51,
+      "outside_both": 2
+     },
+     "50% size, JPEG q75": {
+      "median": 0.0079,
+      "p95": 0.0308,
+      "max": 0.0749,
+      "copy_band": 108,
+      "ambiguous_band": 41,
+      "outside_both": 1
+     },
+     "25% size, JPEG q75": {
+      "median": 0.0094,
+      "p95": 0.0478,
+      "max": 0.0566,
+      "copy_band": 87,
+      "ambiguous_band": 63,
+      "outside_both": 0
+     }
+    }
+   },
+   "totals": {
+    "copies": 1500,
+    "copy_band": 848,
+    "ambiguous_band": 636,
+    "outside_both": 16
+   },
+   "reading": "the copy band alone finds about 57 % of such copies; the two bands together find about 99 %. A re-encoded or resized copy is therefore usually FLAGGED rather than excluded, and about 1 % are missed. The thresholds are those of record 64 and are not changed by this control"
+  },
+  "not_screened": "IDRiD (closed), the EyePACS held-out test and TJDR (not training data of any grader here)",
+  "rule": {
+   "copy_band": "the image is excluded from every population. Version 1 is then NOT run: a new population (v2 lists) and a new protocol file are issued and recorded; this file and its lists are left as they are",
+   "ambiguous_band": "the image stays in its population and is flagged; the primary quantity is also reported without the flagged images, as a sensitivity analysis",
+   "discretion": "no visual review, label or prediction changes either decision",
+   "within_ddr": "distances between the listed images themselves are reported for information and change nothing"
+  },
+  "limit": "a clean screen does not prove that the test images are independent of the development data: it compares one low-resolution signature, flags rather than excludes most re-encoded copies, misses some, and says nothing about other photographs of the same eyes or patients",
+  "output": "datasets/DDR/audit/ddr_grading_near_duplicate_screen_v1.json"
+ },
+ "checkpoints": {
+  "p_seed42": {
+   "arm": "p",
+   "seed": 42,
+   "model_type": "P",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_42/checkpoints/best_a/model.weights.h5",
+   "sha256": "7d6f5498ec45f737e20126ddca1d731ba04203ace0bac7814b6915475ebc041d",
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_42/checkpoints/best.json",
+   "best_slot": "best_a",
+   "best_epoch_index": 18,
+   "pinned_in": "idrid_grading_protocol.json"
+  },
+  "p_seed123": {
+   "arm": "p",
+   "seed": 123,
+   "model_type": "P",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_123/checkpoints/best_a/model.weights.h5",
+   "sha256": "e5f4d3868bc83d71a3495c8e45dc87ba030a68328672ffb1d82bcc74f22d06a2",
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_123/checkpoints/best.json",
+   "best_slot": "best_a",
+   "best_epoch_index": 3,
+   "pinned_in": "idrid_grading_protocol.json"
+  },
+  "p_seed2026": {
+   "arm": "p",
+   "seed": 2026,
+   "model_type": "P",
+   "path": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "d7d7d95f6ddf97c34e74d6b5711f00de9ea9dc83db42b9005b24897818c09d65",
+   "best_pointer": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_2026/checkpoints/best.json",
+   "best_slot": "best_b",
+   "best_epoch_index": 6,
+   "pinned_in": "idrid_grading_protocol.json"
+  },
+  "p_ep_seed42": {
+   "arm": "p_ep",
+   "seed": 42,
+   "model_type": "P",
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "8828eacb8bd12974aceaaa476cc54db18117933d5143d9590e15059da08a0470",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_a",
+   "best_epoch_index": 2,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "p_ep_seed123": {
+   "arm": "p_ep",
+   "seed": 123,
+   "model_type": "P",
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed123/checkpoints/best_a/model.weights.h5",
+   "sha256": "6bdc68a0654755e87a11939d29a3e140c1caf8dc295b6789a63728fef59670ca",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_a",
+   "best_epoch_index": 10,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "p_ep_seed2026": {
+   "arm": "p_ep",
+   "seed": 2026,
+   "model_type": "P",
+   "path": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "2bcd1830cc77d808a2f4566a9821e4c47e37d0dac000a971d90c8a71b2353607",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_b",
+   "best_epoch_index": 29,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e1_ep_seed42": {
+   "arm": "e1_ep",
+   "seed": 42,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "4d7384f226d6ea648811a2476382c474a052c529becda473419f0b779056059c",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_a",
+   "best_epoch_index": 16,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e1_ep_seed123": {
+   "arm": "e1_ep",
+   "seed": 123,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "50a1b935c1ec8f7e7a2beca7eec069b70a3156e36a3f0440f80a86f82c5eb73f",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_b",
+   "best_epoch_index": 11,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e1_ep_seed2026": {
+   "arm": "e1_ep",
+   "seed": 2026,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed2026/checkpoints/best_a/model.weights.h5",
+   "sha256": "996f344c2194d9d1ba2d6688b79036f6e51ad11b3856c0e6b8dd5d2f9c450c4c",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_a",
+   "best_epoch_index": 15,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e2_ep_seed42": {
+   "arm": "e2_ep",
+   "seed": 42,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed42/checkpoints/best_b/model.weights.h5",
+   "sha256": "1fd8c22b30031d2a34c3c1c049b921b9e56ba6a81272795226d38ee6a3d85f96",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed42",
+   "best_slot": "best_b",
+   "best_epoch_index": 30,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e2_ep_seed123": {
+   "arm": "e2_ep",
+   "seed": 123,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "ab620636b01502858b52b57023311232d020729811227d6a721315cb3ba4eaf5",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed123",
+   "best_slot": "best_b",
+   "best_epoch_index": 2,
+   "pinned_in": "idrid_batch2_protocol.json"
+  },
+  "e2_ep_seed2026": {
+   "arm": "e2_ep",
+   "seed": 2026,
+   "model_type": "E1",
+   "path": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed2026/checkpoints/best_b/model.weights.h5",
+   "sha256": "aa17b2441f5ae6170700d90b7ba42a3ec54e27d4bfa6d283db9e8bdf6e977a4a",
+   "run_dir": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed2026",
+   "best_slot": "best_b",
+   "best_epoch_index": 17,
+   "pinned_in": "idrid_batch2_protocol.json"
+  }
+ },
+ "checkpoint_selection": "none on DDR: each is the BEST checkpoint its run selected by APTOS validation QWK; hashes verified on Drive 2026-10-11",
+ "stored_validation_tables": {
+  "p": "experiments/PL_ConvNeXtPriors/2026-09-28_05-22-44/P_convnext_rgb/seed_{seed}/evaluation/per_sample_best.csv",
+  "p_ep": "experiments/EyePACSAdaptedAPTOS/p_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv",
+  "e1_ep": "experiments/EyePACSAdaptedAPTOS/e1_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv",
+  "e2_ep": "experiments/EyePACSAdaptedAPTOS/e2_ep_ef1c3beb30d7_seed{seed}/metrics/per_sample_best.csv"
+ },
+ "pipeline": {
+  "stage2": "stage4_v2_data.stage2_rgb: DR profile, once, native size",
+  "rgb_frame": "stage4_v2_aptos_cache.recompute_rgb_512: full-frame direct resize to 512x512 (no crop), float32 [0,1]",
+  "stage3": "not run",
+  "stage4": "not run",
+  "model": "p, p_ep: pl_convnext.build_pl_model('P') through P's three inputs (RGB in the first three channels, the rest zero); e1_ep, e2_ep: e1_model.build_e1_model, output 0 (CORN logits). mixed_float16; BEST weights",
+  "decode": "cumulative p_k = cumprod(sigmoid(logits)); grade = number of k with p_k > 0.5",
+  "fixed": "no test-time augmentation, no threshold fitting, no recalibration; no ensembling in the primary analysis"
+ },
+ "inference": {
+  "settings": "the parent protocol's `inference` section, unchanged (T4, mixed_float16, batch 8)",
+  "chunk_images": 64,
+  "passes": "ONE: the twelve models predict every image of the broader list; the primary population is a subset of those rows"
+ },
+ "parity": {
+  "before_any_ddr_image": "each of the twelve models must reproduce its stored BEST APTOS validation table: ten raw APTOS images through the locked image path, and all 730 cached validation frames",
+  "tolerances": "the parent protocol's: rgb_max_abs 1e-06, logit_max_abs 0.05, probability_max_abs 0.01, grades identical",
+  "note": "P is run afresh here (no stored P prediction on DDR exists), so its parity under the current runtime is part of the gate"
+ },
+ "comparisons": {
+  "primary": [
+   "p_ep_minus_p"
+  ],
+  "secondary_descriptive": [
+   "e1_ep_minus_p_ep",
+   "e2_ep_minus_p_ep"
+  ],
+  "not_included": "the original E1 and E2: no question specific to them is posed here"
+ },
+ "analysis": {
+  "primary_metric": "quadratic weighted kappa of the decoded grades against the DDR grades",
+  "primary_estimate": "mean over seeds 42, 123, 2026 of [QWK(P-EP, seed) - QWK(P, seed)] on the primary population; the three differences are always reported",
+  "bootstrap": {
+   "method": "paired, grade-stratified over images (arch1_posthoc.bootstrap_indices): one set of resampled images is applied to all tables, the three-seed mean difference is recomputed on each, and the 2.5th and 97.5th percentiles are reported",
+   "n_boot": 2000,
+   "seed": 20260927
+  },
+  "seed_aggregation": "pairs are formed by seed label. The three P checkpoints are three trainings from ImageNet; the three P-EP checkpoints all start from ONE EyePACS-adapted encoder, so they are not independent replicates of the adaptation and their spread does not include its variance",
+  "interval_scope": "the interval describes the sampling of test images, conditional on these fixed checkpoints. It does not cover training variability. Images are treated as independent although DDR publishes no patient or examination identifier: both eyes and repeat photographs of one patient may be present, so the interval may be too narrow",
+  "reading": {
+   "supported": "the interval lies wholly above zero",
+   "reversed": "the interval lies wholly below zero",
+   "not_shown": "the interval includes zero: no difference shown; no equivalence or non-inferiority statement",
+   "seed_consistency": "if any of the three differences is zero or negative, seed-level inconsistency is flagged beside the result, whatever the interval"
+  },
+  "secondary_descriptive": [
+   "E1-EP - P-EP and E2-EP - P-EP by the same method; no criterion",
+   "per-seed and three-seed-mean QWK, accuracy and MAE of the four arms; per-grade recall; confusion matrices; AUROC of each cumulative cut",
+   "referable DR (grade >= 2): sensitivity and specificity of the decoded grade",
+   "seed-ensemble contrast: cumulative probabilities averaged over the three seeds of an arm, then decoded",
+   "calibration from the stored probabilities (top-label ECE in 15 bins, NLL, multiclass Brier); nothing is recalibrated"
+  ],
+  "source_family": {
+   "confound": "file-name family is tied to grade: in the primary population every grade-0 image is timestamp-named and every grade-4 image is 007-named, and the families differ in JPEG encoding. Grade 0 and grade 4 are therefore never represented in both families",
+   "analyses": [
+    "the paired P-EP - P difference inside each family, on the grades that family holds (timestamp: 0-3; 007: 1-4), with a grade-stratified interval inside the family",
+    "AUROC of each cumulative cut inside a family where both sides exist, beside the pooled value",
+    "the distribution of decoded grades of every arm inside each family"
+   ],
+   "limit": "descriptive. The family-stratified analysis cannot establish that performance is independent of source, and the pooled QWK cannot separate grading from recognising the source"
+  },
+  "same_visit_proxy": {
+   "units": "timestamp-named images whose file times follow one another within 60 seconds form a unit; every 007-named image is its own unit",
+   "analysis": "a cluster bootstrap that resamples units within family (same number of resamples and seed), reported beside the primary interval",
+   "limit": "a proxy sensitivity analysis, not patient-level inference: file times are not acquisition or patient identifiers (byte-identical copies carry different times) and chains can join unrelated patients"
+  },
+  "sensitivity": [
+   "the primary quantity on the broader list (3,725), labelled as not untouched",
+   "the primary quantity on the 185 lesion-subset images alone",
+   "the primary quantity without the images the screen flagged in the ambiguous band (when there are any)"
+  ],
+  "order": "the primary result is computed and written first; secondary and sensitivity results never replace it"
+ },
+ "stop_conditions": [
+  "a protocol, parent-protocol, label-file, manifest, metadata or list hash differs from this file",
+  "a checkpoint is missing, has another SHA-256 or fails its identity checks",
+  "an image is missing or does not have its listed SHA-256, or the lists do not hold 3,540 / 3,725 images with the pinned grade counts",
+  "the comparison of the downloaded images with the official archive's directory has not been run, or an image differs in size or CRC-32",
+  "the near-duplicate screen has not been run on the pinned broader list with the pinned thresholds, or it names an image in the copy band",
+  "the official APTOS parity gate has not passed in this runtime, commit and protocol",
+  "a lock or an output directory of this evaluation already exists (a rerun needs a written technical reason)",
+  "the confirmation token is not given"
+ ],
+ "one_run_policy": "one inference pass and one analysis. A rerun only for a technical failure, with the reason recorded. After the first prediction exists nothing about the population, decoding, metric or checkpoints is changed. After this run the DDR grading test list is closed for model selection in this project",
+ "outputs": {
+  "root": "experiments/DDRGrading/",
+  "directory": "ddr_grading_v1_<protocol sha12>_<UTC time>/",
+  "files": [
+   "lock_record.json",
+   "run_configuration.json",
+   "image_manifest.json",
+   "per_image_<arm>_seed<seed>.csv (12)",
+   "primary_result.json",
+   "primary_report.md",
+   "secondary_results.json",
+   "sensitivity_results.json",
+   "output_hashes.json"
+  ],
+  "hashes": "output_hashes.json holds the SHA-256 of every file written; they are copied into the research record"
+ },
+ "disclosures": [
+  "The 185 lesion-subset images were processed in the lesion-representation experiments; they are outside the primary population and appear only in the sensitivity analysis.",
+  "The DDR label lists and file names were read during the provenance audit (record 81): grade counts, file-name families and file times are known. No model output on any DDR grading image exists before this run.",
+  "The DDR lesion-probe results (records 70, 76) and the IDRiD results (records 61, 67, 79) were known when this evaluation was planned; P-EP's higher QWK on IDRiD is what this evaluation tries to replicate, in one pre-declared direction.",
+  "APTOS validation selected every checkpoint; EyePACS validation selected the adapted encoder.",
+  "All P-EP, E1-EP and E2-EP checkpoints start from ONE adapted encoder.",
+  "DDR grades are the dataset's own reference labels, with few grade-1 and grade-3 images (159 and 57 in the primary population).",
+  "The mirror's byte identity with the official release is not verified; re-encoded copies shared with development data are screened by signature only, and IDRiD is not screened.",
+  "No patient identifiers exist; image-level intervals may be too narrow.",
+  "No clinical-utility, equivalence or non-inferiority claim is made, and none that lesion supervision improves grading."
+ ],
+ "rules": [
+  "evaluation only",
+  "no tuning",
+  "no threshold changes",
+  "no preprocessing changes",
+  "no retraining",
+  "no checkpoint or seed selection",
+  "no change to decoding",
+  "no repeated runs for better numbers",
+  "a rerun only for a technical failure, with the reason recorded",
+  "no recorded conclusion (records 60-81) is changed retroactively by this result"
+ ],
+ "confirmation_token": "RUN_DDR_GRADING_V1_ONCE"
+}

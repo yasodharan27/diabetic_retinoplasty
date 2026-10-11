@@ -5205,3 +5205,191 @@ QWK P 0.636, P-EP 0.736, E1-EP 0.701, E2-EP 0.663. P-EP − P +0.0998 (+0.044 �
 **Standing constraints after this phase.** IDRiD's grading test set is consumed (§61, §67, §79) and stays closed: no further model, threshold, decoding rule or checkpoint is to be evaluated or chosen on it. The DDR test split has been used for six encoder groups under one fixed method and is likewise not a tuning set. No recorded conclusion is changed by this section.
 
 **Status.** The EyePACS phase and its consolidation are complete. No experiment is pending in this record.
+
+## 81. Audits before a second external grading evaluation — DDR provenance, stored-prediction diagnostics, Messidor-2 feasibility (2026-10-11; audit only; no model run, no grading image downloaded, IDRiD not opened)
+
+**What this section is.** The record of three audits made before any new evaluation is planned. Nothing was trained or predicted. DDR grading images were not downloaded: everything about them comes from the label lists already on disk and from the mirror's file metadata (path, size, SHA-256) at revision `50541319cfcdc963e3edc8b15508bc822d6b3ab5`. Each statement below is marked **verified** (checked against files or metadata in this audit), **estimate**, or **unresolved**.
+
+### 81.1 DDR provenance
+
+**Verified.**
+
+- The three label lists match the mirror's folders name for name: train 6,835, valid 2,733, test 4,105 (13,673).
+- Test list: 346 ungradable (label 5), 3,759 gradable (1,880 / 189 / 1,344 / 71 / 275).
+- **Lesion-subset overlap.** Exactly 185 lesion-segmentation images are in the grading test list, each byte-identical to the grading file of the same name (59 lesion-test, 118 lesion-val, 8 lesion-train; grades 1–4 = 30 / 120 / 14 / 21). No other test image has the content of a lesion image. The 757 lesion-manifest hashes equal the mirror's metadata.
+- **Restricted population.** Gradable test images outside the lesion subset: 3,574 (1,880 / 159 / 1,224 / 57 / 254).
+- **Duplicates inside DDR.** 97 groups of byte-identical files (197 images) across the three lists; none carries conflicting grades. 35 groups touch the test list, all inside the restricted population: 32 have two or more members there (31 pairs and one group of four — 66 images, all grade 0, all timestamp-named) and 3 have their second member in the train or valid list.
+- **Proposed handling.** Keep the lexicographically smallest file name of each group inside the population; 34 images are removed, leaving **3,540** (1,846 / 159 / 1,224 / 57 / 254). Under the same rule all gradable test images number 3,725 (1,846 / 189 / 1,344 / 71 / 275).
+- **Byte-identical overlap with development data: none.** APTOS train (3,662 files) and test (1,928), TJDR (1,687), the EyePACS adaptation set (35,122 recorded source hashes) and the EyePACS held-out test (16,249): 0 matches against all 13,673 DDR grading files.
+- **Two file-name families.** Timestamp-named and `007-`named images are split by grade: in the 3,540, timestamp-named are 1,846 / 21 / 867 / 31 / 0 and `007`-named 0 / 138 / 357 / 26 / 254. On the 757 local lesion images the families differ in encoding (timestamp: one quantisation table, no EXIF; `007`: several tables, EXIF in 29 files naming a Nikon D5200 or Canon EOS 30D) while image sizes and mean colour are similar.
+- No patient, eye or examination identifier is present in file names, EXIF, the detection XML files or the README.
+
+**Estimates.** Download of the 3,725 images: 4.79 GiB (from the recorded file sizes). Processed 512-pixel frames, if they were cached: about 5.5 GiB.
+
+**Unresolved.**
+
+- *Mirror against official release.* Byte identity with `github.com/nkicsl/DDR-dataset` is not demonstrated. The mirror's card is wrong on authorship and size. The official release is one zip archive in ten chunks with no published checksums.
+- *Licence.* The official release states CC BY-NC-SA 4.0; the mirror's card states CC BY 4.0. The stricter official licence is taken as binding.
+- *Near-duplicates.* Only byte identity was screened. Re-encoded or resized copies shared with APTOS or EyePACS would not be found. IDRiD was not screened, by design.
+- *Patient independence.* It cannot be established. 1,945 of the 2,765 timestamp-named images lie in chains of file times within 60 seconds; byte-identical copies carry different file times, so these are not acquisition identifiers.
+- *Source family.* Family and grade cannot be separated in this test list: grade 0 and grade 4 never share a family. The encoding comparison rests on lesion-subset images only (no grade 0 among them).
+- The DDR paper itself could not be read; patient, hospital and camera counts come from secondary sources.
+
+### 81.2 Stored-prediction diagnostics (APTOS validation and EyePACS; descriptive)
+
+**Verified.** The 18 stored APTOS validation tables hold the same 730 images, order and labels; recomputed QWK equals the stored value in each. The twelve P, P-EP, E1-EP and E2-EP checkpoints on Drive have their pinned SHA-256 (2026-10-11).
+
+**Duplicates.** APTOS's training set holds 123 byte-identical groups (251 images), as §15 found. 41 validation images have a copy in the training split (9 of those groups carry two different grades); 6 groups lie wholly inside validation.
+
+| arm | QWK, 730 | QWK, 689 (the 41 removed) | seed ensemble, 730 | recall grade 3 | recall grade 4 | top-label ECE |
+|---|---|---|---|---|---|---|
+| P | 0.9170 | 0.9187 | 0.9201 | 0.547 | 0.575 | 0.061 |
+| E1 | 0.9180 | 0.9219 | 0.9186 | 0.530 | 0.575 | 0.083 |
+| E2 | 0.9140 | 0.9173 | 0.9249 | 0.632 | 0.517 | 0.058 |
+| P-EP | 0.9216 | 0.9251 | 0.9207 | 0.453 | 0.667 | 0.066 |
+| E1-EP | 0.9251 | 0.9307 | 0.9291 | 0.615 | 0.684 | 0.085 |
+| E2-EP | 0.9251 | 0.9295 | 0.9275 | 0.513 | 0.609 | 0.083 |
+
+- Accuracy on the 41 duplicated images (0.68 – 0.76) is lower than on the rest (0.83 – 0.87): the copies did not inflate validation QWK.
+- The five recorded contrasts are unchanged by the exclusion; every interval still includes zero (P-EP − P: +0.0064, −0.0039 … +0.0175).
+- E1-EP − P on the 689 images is +0.0120 (+0.0016 … +0.0230). This contrast was not pre-declared, is one of six computed here, and is on the selection set: descriptive only.
+- Grade 3 is the weakest class in every arm (recall 0.45 – 0.63, precision 0.35 – 0.55).
+- Single checkpoints are over-confident (mean confidence above accuracy in all arms, most in E1 and E1-EP); averaging seeds lowers ECE without a clear QWK change.
+- The EyePACS-adapted model is close to calibrated in domain (ECE 0.013 validation, 0.020 held-out test; held-out recall 0.963 / 0.382 / 0.563 / 0.525 / 0.526).
+
+**Limitations.** APTOS validation selected every checkpoint; nothing here is a test result. The EyePACS held-out set stays closed for selection. No IDRiD prediction was read. The script that produced these diagnostics is not in the repository (the population counts of §81.1 are reproduced by `ddr_grading_data.py`, §82).
+
+### 81.3 Messidor-2 feasibility
+
+**Verified (official ADCIS page).** 874 examinations, 1,748 macula-centred images (Topcon TRC NW6, 45°, no dilation): 1,058 PNG from the original Messidor and 690 JPG from Brest University Hospital (2009 – 2010), with a spreadsheet pairing the two eyes. Free for research and education; copying and redistribution prohibited; access by a form (website, first name, last name, e-mail, organisation, country, intended use), link valid seven days. No diabetic-retinopathy reference standard is distributed with it. Never downloaded in this project; no model here was trained on it.
+
+**From secondary sources, not confirmed at the primary source.** Third-party five-grade labels (`google-brain/messidor2-dr-grades`, adjudicated by three retina specialists, Krause et al.): 1,744 gradable images, 1,017 / 270 / 347 / 75 / 35; label licence reported as public domain.
+
+**Unresolved.** The label licence; whether the label file's identifiers match the distributed file names; whether registration is granted to an individual applicant.
+
+**Position.** Messidor-2 is kept as a separate, later replication. It was not downloaded and no registration was submitted.
+
+### 81.4 Standing
+
+No conclusion of §60 – §80 is changed. No evaluation is approved by this section.
+
+## 82. DDR grading evaluation, version 1 — protocol, population and implementation: pre-run record (2026-10-11; written before any DDR grading image was downloaded and before any grade prediction on DDR exists; nothing run)
+
+**What this section is.** The pre-run record of a second external grading evaluation, on the DDR grading test list, restricted as §81 found necessary. It fixes the question, the population, the checkpoints, the analysis and the stop conditions. No image has been downloaded, no model has been loaded on DDR, and nothing below is a result. IDRiD was not opened.
+
+**Decisions taken by the user (2026-10-11).** (1) Primary population: 3,540 gradable test images, after removing the 185 lesion-subset images and 34 duplicate extras, keeping the lexicographically smallest file name of each duplicate group. (2) Primary hypothesis: the mean over the three seed-labelled pairs of QWK(P-EP) − QWK(P) is positive; supported only if the paired 95 % bootstrap interval is wholly above zero; the three differences always reported; seed-level inconsistency flagged if any is not positive. (3) Secondary arms E1-EP and E2-EP; the original E1 and E2 are not included. (4) A near-duplicate screen against APTOS and the EyePACS adaptation images before inference, method and thresholds frozen in advance; any exclusion creates a new, versioned population and protocol. (5) The pinned mirror is used provisionally under the official non-commercial licence. (6) No download before the protocol, hashes, exclusions, storage plan and licence handling are recorded. (7) The 3,725-image set is secondary only. (8) Nothing is committed yet.
+
+### 82.1 Protocol
+
+`ddr_grading_protocol_v1.json`, SHA-256 `40d0f278cea889f013b68fe188ce57f7501a77e945f753e3d7da3684501dae3f`. A new file. The three existing protocols are unchanged (`idrid_grading_protocol.json` `f93c1237…587e`, `idrid_batch1_protocol.json` `656dde89…3ac0`, `idrid_batch2_protocol.json` `5ea937c4…073a`); the first and third are read for what they lock independently of any dataset — the P and EP checkpoint pins, the image path, the inference settings, the parity tolerances.
+
+**Question.** Does supervised pre-adaptation on EyePACS change five-grade agreement with the reference grades, relative to P, on DDR test images that no model or decision of this project has used?
+
+### 82.2 Population (verified from the sources; no image read)
+
+Rebuilt by `ddr_grading_data.build_population` from three text sources, each pinned by hash: the DDR test label list (`195b400f…d328`, 4,105 rows), the lesion manifest (`6aa89183…198e`, 757 rows) and the mirror's file metadata at revision `50541319…` (`79721661…4ab4`: name, size, SHA-256 of all 4,105 files).
+
+| step | images | grades 0 – 4 |
+|---|---|---|
+| test list | 4,105 | |
+| ungradable (label 5) removed: 346 | 3,759 | 1,880 / 189 / 1,344 / 71 / 275 |
+| lesion subset removed, by name and by content: 185 (0 more by content) | 3,574 | 1,880 / 159 / 1,224 / 57 / 254 |
+| duplicate extras removed: 34 | **3,540** | **1,846 / 159 / 1,224 / 57 / 254** |
+
+- **Duplicates resolved.** Of the 97 byte-identical groups in the mirror, 35 touch the test list and all 35 lie in the 3,574; 32 have two or more members there (31 pairs, one group of four; 66 images, all grade 0, all timestamp-named, no grade conflict) and 3 have their second member in the train or valid list (kept: no model here was trained on DDR grading images). Rule: the lexicographically smallest file name of a group stays. 34 grade-0 images go.
+- **Lists.** Primary: `ddr_grading_primary_v1.csv`, 3,540 rows, SHA-256 `f5091c4a…fd8b`. Broader: `ddr_grading_broader_v1.csv`, 3,725 rows (1,846 / 189 / 1,344 / 71 / 275), `52d57fcc…45fa`. Both live in the git-ignored `datasets/DDR/audit/`; the protocol pins their hashes. Ungradable images are in neither list and are not downloaded.
+- **By file-name family (primary).** Timestamp-named 2,765 (1,846 / 21 / 867 / 31 / 0); `007`-named 775 (0 / 138 / 357 / 26 / 254).
+
+**The broader set is not untouched.** It is the primary population plus the 185 lesion-subset images (roles in the probes: 59 test, 118 validation, 8 training) — every gradable test image under the same duplicate rule, 3,725 rather than 3,759. Those 185 images were processed in the lesion-representation experiments (§70, §76) as inputs of linear probes on the frozen encoders of all six arms. Their grades were never an endpoint and no grader was trained, selected or tuned on them; but probe results on them informed project decisions. An analysis on the broader set is therefore a sensitivity analysis — it shows whether the primary conclusion depends on the exclusion — and cannot stand in for the untouched evaluation.
+
+### 82.3 Checkpoints (hashes read from Drive, 2026-10-11; all twelve equal to their pins)
+
+| arm | seed 42 | seed 123 | seed 2026 |
+|---|---|---|---|
+| P | `7d6f5498…041d` | `e5f4d386…06a2` | `d7d7d95f…9d65` |
+| P-EP | `8828eacb…0470` | `6bdc68a0…70ca` | `2bcd1830…3607` |
+| E1-EP | `4d7384f2…059c` | `50a1b935…b73f` | `996f344c…0c4c` |
+| E2-EP | `1fd8c22b…5f96` | `ab620636…eaf5` | `aa17b244…7a4a` |
+
+Each is the BEST checkpoint its run selected by APTOS validation QWK. P is run afresh (no P prediction on DDR exists). Inference is the locked path: Stage 2 once at native size, direct resize to 512 × 512, mixed_float16 on a T4, batch 8, CORN decode at 0.5; no test-time augmentation, threshold fitting or recalibration. One pass over the 3,725 listed images; the primary population is a subset of those rows. Before any DDR image is decoded, each of the twelve models must reproduce its stored APTOS validation table within the parent tolerances.
+
+### 82.4 Analysis, fixed in advance
+
+- **Primary.** Mean over seeds 42, 123, 2026 of QWK(P-EP) − QWK(P) on the 3,540, with the three differences beside it. Interval: paired, grade-stratified bootstrap over images, 2,000 resamples, seed 20260927; one set of resampled images is applied to all six tables and the three-seed mean recomputed on each.
+- **Reading.** Supported if the interval is wholly above zero; reversed if wholly below; otherwise no difference shown, with no equivalence statement. Seed-level inconsistency is flagged whenever a difference is zero or negative, whatever the interval.
+- **What the interval is.** It describes the sampling of test images, conditional on these fixed checkpoints. It does not cover training variability. Pairs are formed by seed label; the three P-EP checkpoints start from one adapted encoder and are not independent replicates of the adaptation. Images are treated as independent although DDR publishes no patient identifier, so the interval may be too narrow.
+- **Secondary, descriptive.** E1-EP − P-EP and E2-EP − P-EP; per-grade recall, confusion matrices, per-cut AUROC; referable-DR sensitivity and specificity at the fixed decode; the seed-ensemble contrast; calibration without recalibration.
+- **Source family.** Family is tied to grade and the families differ in encoding. Grade 0 and grade 4 are never represented in both families. Reported inside each family: the paired difference on the grades that family holds, the per-cut AUROC where both sides exist, and each arm's decoded-grade distribution. This cannot establish that performance is independent of source, and the pooled QWK cannot separate grading from recognising the source.
+- **Same-visit proxy.** Timestamp-named images whose file times follow within 60 seconds form a unit (1,271 units over 2,765 images; 451 of two or more; the longest holds 94); `007` images are single units. A cluster bootstrap over units, within family, is reported beside the primary interval. It is a proxy sensitivity analysis, not patient-level inference: file times are not identifiers, and byte-identical copies carry different times.
+- **Sensitivity.** The primary quantity on the broader 3,725, on the 185 alone, and without any image the screen flags.
+
+### 82.5 Near-duplicate screen (frozen before any DDR image exists)
+
+The signature of §64 (grey image cropped to the fundus bounding box, 32 × 32, standardised; distance = L2 / 32), re-implemented in `ddr_grading_data.signature` and checked to reproduce the stored APTOS signatures exactly on five images. Screened: all 3,725 listed images, label-free, against the 3,662 APTOS training-set images and the 35,122 EyePACS adaptation images. Rule: distance below 0.01 — excluded, and version 1 is then not run (a new population and protocol are issued); 0.01 to below 0.06 — kept, flagged, with a sensitivity analysis without the flagged images; no visual review changes either decision.
+
+**Positive control (development images only; run 2026-10-11).** 150 APTOS and 150 EyePACS images were re-encoded as JPEG at five size and quality settings, and each copy compared with its original's stored signature. Of 1,500 copies, 848 (57 %) fell in the copy band, 636 (42 %) in the flagged band and 16 (1 %) outside both. Same-size re-encoding of a JPEG original at quality 95 was always in the copy band (150 of 150); resized copies of PNG originals mostly landed in the flagged band (APTOS at 75 % size: 19 of 150 in the copy band, 128 flagged, 3 outside both). **Consequence, stated before the screen is run:** under the frozen rule a re-encoded copy shared with APTOS or EyePACS is more likely to be flagged than excluded, and the flagged band will also hold unrelated photographs. The thresholds are those of §64 and were not changed after this control.
+
+### 82.6 Provenance and licence
+
+The official release (`github.com/nkicsl/DDR-dataset`) is one zip archive split into ten chunks on Baidu Pan and Google Drive, with no published checksums and no per-file download. A small comparison is therefore not available as a download of a few files. One route short of the whole archive exists — the last chunk, whose central directory lists the size and CRC-32 of every file — and has not been taken. **Byte identity of the mirror with the official release remains unverified.** The official CC BY-NC-SA 4.0 licence is taken as binding; images, lists, signatures and per-image outputs stay out of Git and out of shared folders.
+
+### 82.7 Implementation (not committed)
+
+- `ddr_grading_data.py` — sources, population, lists, family and file-time units, the screen and its positive control, the download (refuses without its own token; keeps a file only with its listed SHA-256).
+- `ddr_grading_eval.py` — protocol loader, checkpoint verification, gates, population / image / screen checks, chunked inference, the analyses, the one-run lock, output hashes.
+- `tests/test_ddr_grading.py` — 41 tests: membership, exclusions, the duplicate rule, pinned counts and hashes from the real sources, the screen's thresholds and decisions, the download guard, protocol tampering, checkpoint verification on fabricated run directories, the analysis against direct computation and against the project's metric block, every stop condition, output completeness. Fake models only; no image of DDR or IDRiD is decoded.
+- Two behaviour-preserving changes to earlier evaluators, so that their code is reused rather than copied: `idrid_batch2_eval.verify_files` now calls a separate `verify_checkpoints` (the same checks, without the stored prediction tables), `load_models` takes the arms to load, and `idrid_batch1_eval.gates` records P-table hashes only when a protocol pins any. The locked protocols are untouched.
+
+### 82.8 Stop conditions
+
+A hash differs (protocol, parent protocols, label file, manifest, metadata, lists, checkpoints, images); the lists do not hold 3,540 / 3,725 images with the pinned grade counts; the screen has not been run as pinned or names an image in the copy band; the APTOS parity gate has not passed in the same runtime, commit and protocol; a lock or output directory of this evaluation already exists; the confirmation token is not given. `experiments/DDRGrading/` does not exist on Drive (checked 2026-10-11).
+
+### 82.9 Not done; awaiting approval
+
+Nothing has been downloaded, screened on DDR images, or predicted. Remaining, in order: approval of the download; download of the 3,725 listed images with per-file hash checks; the screen; if it is clean, upload of images, lists and screen file to the private Drive folder; commit; the parity gate and the one run on a T4; the result record. Messidor-2 stays a separate later replication with its label-licence and label-to-image questions open (§81.3).
+
+## 83. DDR grading evaluation, version 1 — official-archive directory check, protocol finalised, pre-download review (2026-10-11; no image downloaded, no model run, IDRiD not opened)
+
+**What this section is.** The last review before the DDR test images are downloaded. It supersedes two statements of §82, which is left as written: the protocol hash in §82.1, and the sentence in §82.6 that the official archive's directory had not been read.
+
+**Decisions taken by the user (2026-10-11).** The download of the 3,725 listed images is approved on condition that the protocol hash, source hashes, destination, disk space and token guard are verified first. The populations stay as frozen (3,540 primary; 3,725 broader, sensitivity only). The screen keeps its frozen thresholds and handling: an image in the exclusion band stops version 1 and requires a versioned population and protocol; flagged images stay in the primary population with the planned sensitivity analysis. The official archive is to be checked through its last chunk's metadata, without downloading the archive.
+
+### 83.1 The official archive's directory
+
+The official release is ten files in a public Google Drive folder (`DDR-dataset.zip.001` – `.010`; 15,142,640,333 bytes in total). The last 6,291,456 bytes of `.010` were fetched and parsed (`ddr_grading_data.parse_zip_directory`); no image was downloaded. The archive is a zip64 archive whose 18,218 files are all stored without compression.
+
+| check | result |
+|---|---|
+| grading-test folder of the archive against the mirror's metadata | 4,105 file names in both, none missing on either side; **all 4,105 sizes equal** |
+| the three label lists on disk against the archive's entries | size and CRC-32 equal for train, valid and test |
+| the 757 lesion images on disk against the archive's lesion entries | size and CRC-32 equal for all 757 |
+| the 185 lesion images that are also grading-test files, against the archive's **grading-test** entries | size and CRC-32 equal for all 185 |
+
+The archive's folder counts are those of the mirror: grading 6,835 / 2,733 / 4,105; lesion images 383 / 149 / 225.
+
+**What this establishes and what it does not.** The mirror and the official archive list the same test files with the same sizes, and every DDR file already on disk — obtained from the mirror — agrees with the official entry in size and CRC-32. CRC-32 is a 32-bit checksum: agreement is strong evidence against accidental difference and no proof of byte identity. For the 3,725 test images nothing beyond name and size is compared until they are downloaded; then each is compared with its official entry in size and CRC-32 (`ddr_grading_data.official_check`), and a single difference stops the evaluation. **Full byte identity of the mirror with the official release remains unverified.** The directory extract (`ddr_official_archive_directory.csv`, SHA-256 `968de07f…41ab`) and the fetched bytes are kept in the git-ignored audit folder.
+
+### 83.2 Protocol finalised
+
+`ddr_grading_protocol_v1.json`, SHA-256 **`38eb810f05d427c2585a0bf24aae493ee0407727935d9594f8e926773ec9c192`**. Against the draft of §82.1 it adds, and changes nothing else: the directory check above and its pinned extract; the comparison of every downloaded image with its official entry as a stop condition; the positive control of the screen with its counts; and the statement that a clean screen does not prove the test images independent of the development data. Populations, lists, checkpoints, thresholds, comparisons, bootstrap and reading rule are those of §82. No DDR image existed when the file was finalised.
+
+**On the screen, stated before it is run.** The positive control (§82.5) shows that the screen flags many re-encoded copies and excludes fewer: of 1,500 re-encoded or resized copies of development images, 57 % fell in the exclusion band, 42 % in the flagged band and 1 % outside both. Passing the screen will therefore mean only that no listed image is a near-exact copy of an APTOS or EyePACS adaptation image under this signature. It will not show that the images, eyes or patients are independent of the development data.
+
+### 83.3 Pre-download review
+
+| item | state |
+|---|---|
+| protocol hash | `38eb810f…c192`; loads through `ddr_grading_eval.load_protocol` |
+| existing locked protocols | unchanged: `f93c1237…587e`, `656dde89…3ac0`, `5ea937c4…073a` |
+| sources | label list `195b400f…d328`, lesion manifest `6aa89183…198e`, mirror metadata `79721661…4ab4`: population rebuilt and equal to the pins (`ddr_grading_data.py verify`) |
+| lists | primary 3,540 (`f5091c4a…fd8b`), broader 3,725 (`52d57fcc…45fa`) |
+| checkpoints | twelve hashes read from Drive equal the pins |
+| destination | `datasets/DDR/raw/DR_grading/test/`, inside the git-ignored `datasets/`; does not exist yet |
+| disk | 411 GB free on the drive; 4.79 GiB needed |
+| token guard | the download refuses without `DOWNLOAD_DDR_GRADING_TEST_V1`, keeps a file only when its SHA-256 is the listed one, and requests nothing but the listed images (tested) |
+| outputs | `experiments/DDRGrading/` does not exist on Drive |
+| tests | recorded with the commit |
+
+### 83.4 Order from here
+
+Download with per-file SHA-256; comparison with the official directory; the near-duplicate screen; then, only if both are clean, the private upload, the Colab notebook, the twelve-checkpoint APTOS parity gate on a T4, and — after the one-run authorisation — the locked evaluator. No model is trained, tuned or selected on DDR. IDRiD stays closed.
