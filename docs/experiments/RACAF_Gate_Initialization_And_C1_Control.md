@@ -5491,3 +5491,223 @@ Broader 3,725 images (not untouched): +0.0895 (+0.0751 … +0.1033). The 185 les
 ### 86.6 Standing
 
 The DDR grading test list is now consumed for this project: no threshold, decoding rule, checkpoint or model may be chosen or re-evaluated on it. IDRiD stays closed. Messidor-2 remains a possible separate replication with its open questions (§81.3). No recorded conclusion of §60 – §85 is changed. No further experiment is approved by this section.
+
+## 87. Cross-dataset synthesis — P and P-EP on IDRiD and DDR (2026-10-11; documentation only; nothing run, no external test file or prediction table opened)
+
+**What this section is.** A side-by-side reading of the two external evaluations of P against P-EP. Every number is taken from §79 (IDRiD) and §86 (DDR) as recorded. Neither test set was opened, and nothing is selected or changed on the basis of this section.
+
+| | IDRiD (§79) | DDR (§86) |
+|---|---|---|
+| images (grades 0 – 4) | 100 (34 / 5 / 29 / 19 / 13) | 3,540 (1,846 / 159 / 1,224 / 57 / 254) |
+| status of the test set when used | used twice before in the project; contrast declared with one other | not used before for grading; one contrast, one direction, declared in advance |
+| QWK, P → P-EP (three-seed mean) | 0.642 → 0.738 | 0.509 → 0.593 |
+| **P-EP − P, QWK** | **+0.097** (+0.040 … +0.162) | **+0.084** (+0.069 … +0.099) |
+| per seed 42 / 123 / 2026 | +0.245 / −0.004 / +0.048 | +0.121 / +0.016 / +0.114 |
+| P-EP − P, mean AUROC of the four cuts | +0.039 (+0.019 … +0.064); positive in 3 / 3 seeds | +0.005 (+0.0004 … +0.009); positive in 2 / 3 seeds |
+| recall grade 0, P → P-EP | 0.51 → 0.75 | 1.00 → 1.00 |
+| recall grade 2 | 0.72 → 0.53 | 0.10 → 0.21 |
+| recall grade 3 | 0.30 → 0.25 | 0.47 → 0.34 |
+| recall grade 4 | 0.21 → 0.26 | 0.36 → 0.54 |
+
+**1. Direction and size.** P-EP has the higher QWK on both sets, by a similar amount, and both intervals exclude zero. DDR is the stronger evidence: thirty-five times the images, a population no model or decision had touched, and a single hypothesis fixed beforehand.
+
+**2. Seed-level consistency.** The pair labelled 123 shows almost no difference on either set (−0.004, +0.016); the pair labelled 42 shows the largest on both. On IDRiD one pair of three carries the result; on DDR two of three do. The same six checkpoints are behind both rows, so this is the behaviour of particular checkpoints, not two independent samples of training variability — and the three P-EP checkpoints share one adapted encoder. Neither evaluation estimates how the difference would vary over new trainings or a new adaptation run.
+
+**3. Absolute performance.** Both graders are far below their APTOS validation level (0.92) on both sets, and worse on DDR than on IDRiD. The failure has opposite signs: on IDRiD, P calls half of the healthy eyes diseased; on DDR, both graders call most diseased eyes healthy (three quarters of grade 2 for P, over half for P-EP; referable-DR sensitivity of the decoded grade 0.31 and 0.37). In both cases P-EP's decoded grades lie closer to the reference, from opposite directions.
+
+**4. Ranking against decoding.** On IDRiD the ranking also improved (mean AUROC +0.039). On DDR it barely moved (+0.005, one seed negative): there the gain is almost entirely in where the fixed 0.5 decode places images. The DDR result therefore supports "better agreement of the decoded grades", not "better discrimination".
+
+**5. Severe grades.** Grade-3 recall is lower for P-EP than for P on IDRiD, on DDR and on APTOS validation (0.55 → 0.45, §74); grade-4 recall is higher on all three. This repeated trade between the two severe grades is descriptive, and no claim about severe-grade grading is supported.
+
+**6. Calibration.** On DDR every arm is strongly over-confident (confidence 0.93 against accuracy 0.59 for P and 0.64 for P-EP; top-label ECE 0.35 and 0.29). No calibration measure was recorded for IDRiD and none is computed now, since that would mean reopening its prediction tables. On both sets the pattern of high per-cut AUROC with poor decoded recall says the same thing: the fixed decode is a poor operating point away from APTOS. No threshold was fitted on either set and none may be.
+
+**7. Source confounding.** DDR: file-name family is tied to grade, and pooled AUROC is higher than the AUROC inside the family that holds both sides of a cut (any DR 0.89 – 0.91 pooled against 0.83 – 0.87; grade 4 0.96 against 0.83 – 0.85), so part of the pooled discrimination is between sources; the P-EP − P difference is positive inside both families (+0.170 and +0.059; one seed slightly negative in the smaller). IDRiD: single site and camera, so no such split exists; Stage 4's exposure to IDRiD's camera domain does not concern P or P-EP.
+
+**8. Limitations common to both.** Two datasets; one adaptation run; three checkpoints per arm; APTOS validation selected every checkpoint; image-level intervals without patient identifiers (DDR) or on 100 images (IDRiD); reference grades of unknown adjudication quality on DDR. Both sets are consumed.
+
+**What the two evaluations support together.** Starting the APTOS grader from an encoder adapted on EyePACS gave decoded grades that agree better with the reference on two external datasets from different countries and cameras. It does not make either grader adequate on those datasets, and it is not shown to hold for other trainings, other adaptations or other data.
+
+## 88. Messidor-2 — what is resolved and what is not (2026-10-11; metadata only; nothing downloaded, no registration submitted)
+
+**Resolved since §81.3.** The licence of the third-party labels, at its primary source. Kaggle's own metadata record of `google-brain/messidor2-dr-grades` states **CC0: Public Domain**; version 1, published 2018-07-02, creator Google Brain; one file, `messidor_data.csv`, with the columns `image_id`, `adjudicated_dr_grade` (0 – 4), `adjudicated_dme`, `adjudicated_gradable`; described as adjudicated by a panel of three retina specialists (Krause et al. 2018). The licence covers the label file only; the images remain under ADCIS's terms.
+
+**Still unresolved.**
+
+1. *Counts at the primary source.* The number of rows and the grade distribution (1,744 gradable; 1,017 / 270 / 347 / 75 / 35) are from secondary sources. Confirming them needs the 7 KB label file, which has not been downloaded.
+2. *Label-to-image matching.* The form of the `image_id` values is not verified, nor whether they equal the file names in the archive ADCIS distributes today, including extension and letter case. The labels were published in 2018 against the distribution then hosted by LaTIM; whether ADCIS's current archive holds the same 1,748 files under the same names is not established.
+3. *Image identity.* Neither ADCIS nor the label set publishes checksums. That the images received are the images that were graded can be checked by name and count only.
+4. *Examination pairing.* The pairing spreadsheet is said to come with the images; its format, and whether it covers all 874 examinations, is unverified. It is needed for examination-level resampling.
+5. *Permitted handling.* ADCIS prohibits copying and redistribution. Whether keeping the images in a private Drive folder and a Colab runtime for inference is within the terms is not stated; the locked inference settings need a T4.
+6. *Access.* Whether the form is granted to an individual applicant; the link is valid for seven days.
+7. *Duplicates and overlap.* Not screened: duplicates inside Messidor-2, and overlap with APTOS and EyePACS. No model here was trained on Messidor.
+
+**Position.** Unchanged: a possible separate replication, not started. Items 1 – 2 can be settled from the label file alone; items 3 – 7 need the user's registration and, for item 5, a decision or a question to ADCIS.
+
+## 89. Geometry diagnostic, version 1 — pre-run protocol (2026-10-11; written before any frame was built and before any prediction exists; inference only)
+
+**Standing correction from the user (2026-10-11).** IDRiD and DDR are not permanently closed: they may be used again for external testing, and a new dataset is not required for each test. The wording "consumed … closed" in §80, §86.6 and §87 is superseded as a standing rule by this instruction. What the user's instructions keep: neither set is used for model selection or tuning. When either set is tested again, the result will state how many times it has been used. For the diagnostic below the user's prompt excludes both sets entirely.
+
+**Question.** How sensitive are the frozen P graders to the framing of the input? §87 found the main external failure at the operating point; a label-free measurement then showed that, after the project's whole-image resize, the fundus fills a different share of the 512 frame in each dataset (median width 0.94 of the frame in APTOS, 0.82 in EyePACS, 0.72 in the DDR lesion subset; dark area 0.20 / 0.31 / 0.46).
+
+**What is run.** The three pinned P checkpoints (`7d6f5498…`, `e5f4d386…`, `d7d7d95f…`), unchanged, on development images only, twice per image:
+
+- **direct** — the project's frame: Stage 2 (gamma, CLAHE) on the native image, then the whole image resized to 512 × 512;
+- **crop** — the same Stage-2 image cut to the bounding box of the fundus, then the same resize.
+
+Both frames come from one Stage-2 pass of the raw file, so they differ only in the cut. Value range ([0, 1]), dtype (float16 on disk, as the project's caches; float32 into the model) and input size (512 × 512 × 3) are the same in both arms; the same resize function is used.
+
+**The crop rule, fixed now.** On the raw image: grey value (OpenCV BGR→grey) above 12 is "lit"; a row or column belongs to the fundus when more than 2 % of its pixels are lit; the box runs from the first to the last such row and column; if no such row or column exists, or the box is narrower than 10 % of a side, the image is left uncut. One rule, no variants. No parameter is changed after any prediction exists. The share of images left uncut and the box sizes are reported before inference; they do not alter the rule.
+
+**Data (development only).** APTOS validation, 730 images (361 / 74 / 198 / 39 / 58), the selection set of every P checkpoint. EyePACS adaptation-split validation, 3,512 images from 1,756 patients (2,599 / 232 / 524 / 91 / 66); P never saw EyePACS, so for P this is a cross-dataset set inside the development data. The EyePACS held-out test stays closed. IDRiD and DDR are not read.
+
+**Checks before the comparison.** Every EyePACS direct frame is compared with the cached validation frame. On the T4, the direct arm on APTOS validation must reproduce P's stored validation table within the locked tolerance (logits within 0.05, decoded grades identical); otherwise no comparison is computed.
+
+**Primary quantity.** Mean over seeds 42, 123, 2026 of QWK(crop) − QWK(direct) on EyePACS validation, with the three differences; paired grade-stratified bootstrap over images, 2,000 resamples, seed 20260927; beside it, a bootstrap that resamples patients.
+
+**Criteria, fixed now.** *Sensitive in the helpful direction*: the interval lies wholly above zero **and** the mean is at least +0.02. *Guardrail*: on APTOS validation the three-seed mean difference is not below −0.01. Anything else is reported as it falls, including a negative result.
+
+**Also reported, descriptive, for both arms and both sets.** Per-grade recall; referable-DR sensitivity and specificity of the decoded grade; top-label ECE, NLL, mean confidence; AUROC of each cumulative cut; decoded-grade counts; how many decoded grades change.
+
+**What the result can and cannot mean.** It measures how models trained on uncropped frames respond to a change of input geometry at test time. It does not measure what training on geometry-normalised input would give: a model trained on cropped frames may behave differently in either direction. A positive result would make geometry-normalised retraining a candidate to be decided separately; a null or negative result would not show that geometry is irrelevant to a retrained model. Nothing is selected by this run and no model weight changes.
+
+**Implementation.** `geometry_diagnostic.py` (SHA-256 `1a4b9d9c8f43a23a53744a13cd22d1914bd8938d1b40e9559fdd5e2352936935`), not committed; it reuses the project's Stage-2, resize, model-loading, table and bootstrap functions. Frames are built on the laptop from the raw files; inference runs once on a T4.
+
+## 90. Geometry diagnostic, version 1 — result (run once 2026-10-11 17:34 UTC; commit `7788661`; Colab T4; inference only; read under the rules of §89)
+
+**Run.** `experiments/GeometryDiagnostic/geometry_diag_v1_2026-10-11_17-34-10/`; script `1a4b9d9c…6935` as pre-registered; one run; `result.json` `c826e0f3…6958`. The primary difference was recomputed on the laptop from the saved per-image tables and is identical. IDRiD, DDR and the EyePACS held-out test were not read. No weight was changed and nothing was selected.
+
+**Before the comparison.** Frames: all 3,512 EyePACS direct frames equal the cached validation frames exactly. The crop rule cut every EyePACS image (median box 0.81 of the width, full height) and 630 of 730 APTOS images (median box 0.93 of the width; 100 left uncut). Parity: the direct arm on APTOS validation reproduces P's stored table (largest logit difference 0.0078; decoded grades identical in all three seeds).
+
+### 90.1 Primary — EyePACS validation (3,512 images, 1,756 patients; P never trained on EyePACS)
+
+| seed | QWK direct | QWK crop | difference |
+|---|---|---|---|
+| 42 | 0.4379 | 0.4839 | +0.0460 |
+| 123 | 0.4606 | 0.5007 | +0.0401 |
+| 2026 | 0.4206 | 0.4904 | +0.0697 |
+| mean | 0.4397 | 0.4917 | **+0.0519** (image bootstrap +0.038 … +0.067; patient bootstrap +0.035 … +0.070) |
+
+**Criterion met**: the interval lies wholly above zero and the mean exceeds +0.02; all three seeds positive.
+
+### 90.2 Guardrail — APTOS validation (730 images)
+
+QWK 0.9170 → 0.9062: **−0.0108** (−0.017 … −0.005); per seed −0.005 / −0.009 / −0.018; negative in all three. **The guardrail (not below −0.01) is not held**, by a small margin. Cropping the images P was trained on, at test time, costs a little in domain.
+
+### 90.3 Descriptive (three-seed means)
+
+| | EyePACS direct | EyePACS crop | APTOS direct | APTOS crop |
+|---|---|---|---|---|
+| AUROC ≥1 / ≥2 / ≥3 / ≥4 | 0.699 / 0.792 / 0.924 / 0.949 | 0.764 / 0.831 / 0.931 / 0.955 | 0.998 / 0.991 / 0.953 / 0.937 | 0.998 / 0.987 / 0.951 / 0.937 |
+| recall grades 0 – 4 | 0.87 / 0.11 / 0.16 / 0.15 / 0.33 | 0.85 / 0.17 / 0.15 / 0.05 / 0.47 | 0.98 / 0.61 / 0.83 / 0.55 / 0.57 | 0.97 / 0.63 / 0.77 / 0.50 / 0.57 |
+| referable DR, sensitivity / specificity | 0.309 / 0.957 | 0.296 / 0.965 | 0.950 / 0.949 | 0.924 / 0.946 |
+| top-label ECE; confidence vs accuracy | 0.227; 0.91 vs 0.68 | 0.230; 0.90 vs 0.67 | 0.061; 0.88 vs 0.85 | 0.063; 0.87 vs 0.83 |
+| decoded grades changed, per seed | — | 409 / 410 / 277 | — | 41 / 33 / 42 |
+
+### 90.4 Reading
+
+1. **P is sensitive to the framing of its input, in both directions.** Removing the dark side margins raises its agreement on images from a dataset it never saw and lowers it slightly on its own. The EyePACS effect is in the ranking too — every per-cut AUROC rises, most at the low cuts (≥1: +0.065, ≥2: +0.040) — so it is not only a shift of decoded grades.
+2. **It is a small part of the gap.** P reaches 0.44 on EyePACS validation against 0.83 for the model trained on EyePACS (§72); the crop recovers about 0.05 of that 0.39.
+3. **The operating-point failure is untouched.** Referable-DR sensitivity stays near 0.30 with or without the crop, calibration does not improve (ECE 0.23, confidence 0.90 against accuracy 0.67), and grade-3 recall falls (0.15 → 0.05) while grade-4 recall rises (0.33 → 0.47). The QWK gain comes from better ordering and from grades 1 and 4, not from finding more referable disease.
+4. **A development-set mirror of the external failure now exists.** On EyePACS validation P shows the pattern recorded on DDR (§86): low QWK, high confidence, most diseased eyes decoded as grade 0. This set is development data and can be used for diagnosis; for P-EP it would be optimistic, since its encoder was selected on it.
+5. **What this does not show.** It is the response of models trained on uncropped frames to a change made at test time. It is not the benefit of training on geometry-normalised input, which could be larger or smaller, and the in-domain cost seen on APTOS is what one expects of a mismatch between training and test framing rather than evidence that cropping is harmful. Nothing is selected and no preprocessing is changed by this result.
+
+**Status.** The diagnostic is complete. It supports input geometry as a real but minor contributor to the cross-dataset gap and leaves the operating point as the larger one. No follow-up is approved by this section.
+
+## 91. Operating-point and calibration diagnostic, version 1 — pre-run plan (2026-10-11; written before any of its numbers was computed; no inference)
+
+**Question.** Why do P's EyePACS predictions combine low QWK, high confidence, low referable-DR sensitivity and poor grade-3 recall (§90), and how much of that lies in the decoding rule as opposed to the scores?
+
+**Inputs (existing files only).** P's stored APTOS validation tables (730 images, three seeds) and the EyePACS validation tables of the direct arm of §90 (3,512 images, three seeds). Direct-resize frames; no new inference; weights, architecture and preprocessing unchanged; the cropped-input result is not combined with this. Not read: the EyePACS held-out test, IDRiD, DDR.
+
+**Rules compared.**
+
+| | rule | parameters | fitted on |
+|---|---|---|---|
+| A | current: grade = number of cumulative probabilities above 0.5 | none | — |
+| B | expected grade: sum of the four cumulative probabilities, rounded | none | — |
+| C | most probable class of the implied class distribution | none | — |
+| D | one temperature on the CORN logits (minimum NLL), then rule A | 1 | APTOS validation |
+| E | one threshold per cut, maximising QWK (coordinate ascent from 0.5 on the grid 0.02 … 0.98, three sweeps) | 4 | APTOS validation |
+| F | prior-shift correction: class priors re-estimated by EM on the set's own unlabelled outputs (source prior: APTOS training-split grade frequencies; temperature-scaled probabilities), then rule A | priors | target inputs, no labels — **exploratory** |
+| G | oracle thresholds as E, fitted on EyePACS validation labels | 4 | EyePACS validation labels — **exploratory, never generalisation evidence** |
+
+**Fitting discipline.** D and E: five-fold cross-fitting on APTOS validation (stratified by grade, seed 20261011), so every APTOS image is decoded with parameters fitted without it; pooled out-of-fold results and fold variability are reported. For EyePACS, D and E use parameters fitted on all of APTOS validation; EyePACS labels never enter A – E, so those five are unbiased on EyePACS validation. G on EyePACS is cross-fitted in five folds that keep patients together; it shows what a decoding rule could reach given P's scores. Nothing is fitted on P's in-sample training predictions.
+
+**Assumptions of F, stated now.** Label shift only (the appearance of each grade is the same in both datasets, only prevalence differs) and calibrated source probabilities. Both are doubtful here — the datasets differ in cameras and grading standards — so F is a probe of whether prevalence alone explains the failure, not a proposed method.
+
+**Reported for every rule on both sets.** QWK (three-seed mean and per seed), per-grade recall, referable-DR sensitivity and specificity of the decoded grade, ECE (confidence = the probability the rule's distribution gives to the grade it decodes), decoded-grade counts; the QWK difference from rule A with a paired grade-stratified bootstrap interval. Per-cut AUROC once: no rule changes the ordering within a cut.
+
+**No selection.** Rule A remains the project's decoding. No rule is adopted, and no rule is chosen by its EyePACS validation result. APTOS validation selected every P checkpoint, so its numbers remain selection-set numbers.
+
+**Implementation.** `operating_point_diagnostic.py` (SHA-256 `57af770c1c8c4d1f817e5c329bc179b4c536d38d31f76e73440f0034536c3577`), not committed.
+
+## 92. Operating-point and calibration diagnostic, version 1 — result (2026-10-11; laptop; existing prediction tables only; read under §91)
+
+**Run.** `operating_point_diagnostic.py` (`57af770c…3577`, as planned), once; output `results/OperatingPointDiagnostic/operating_point_v1.json` (`e0be18d6…ae61`). Rule A reproduces the stored decoded grades of all six tables. No inference; nothing fitted on EyePACS labels except rule G; not read: EyePACS held-out test, IDRiD, DDR.
+
+**Per-cut AUROC (unchanged by any rule).** APTOS validation 0.998 / 0.991 / 0.953 / 0.937. EyePACS validation **0.699 / 0.792 / 0.924 / 0.949** (the EyePACS-trained model reaches 0.913 / 0.953 / 0.980 / 0.977 on the same images, §72).
+
+### EyePACS validation (3,512 images; three-seed means)
+
+| rule | status | QWK | vs A (95 % interval) | recall grades 0 – 4 | referable sens / spec | ECE |
+|---|---|---|---|---|---|---|
+| A current | — | 0.440 | — | 0.87 / 0.11 / 0.16 / 0.15 / 0.33 | 0.309 / 0.957 | 0.229 |
+| B expected grade | unbiased | 0.447 | +0.008 (+0.001 … +0.014) | 0.85 / 0.13 / 0.16 / 0.18 / 0.28 | 0.306 / 0.959 | 0.225 |
+| C most probable class | unbiased | 0.433 | −0.007 (−0.011 … −0.003) | 0.87 / 0.10 / 0.15 / 0.15 / 0.39 | 0.309 / 0.956 | 0.227 |
+| D temperature (APTOS) | unbiased | 0.438 | −0.001 (−0.006 … +0.003) | 0.87 / 0.11 / 0.16 / 0.15 / 0.31 | 0.300 / 0.961 | 0.191 |
+| E thresholds (APTOS) | unbiased | 0.443 | +0.003 (−0.005 … +0.012) | 0.87 / 0.10 / 0.19 / 0.23 / 0.31 | 0.353 / 0.940 | 0.212 |
+| F prior shift (EM) | exploratory | 0.317 | −0.123 (−0.145 … −0.100) | 0.88 / 0.11 / 0.00 / 0.14 / 0.10 | 0.076 / 0.994 | 0.250 |
+| **G oracle thresholds** | **exploratory, fitted on EyePACS labels** | **0.477** | +0.037 (+0.024 … +0.051) | 0.80 / 0.21 / 0.10 / 0.41 / 0.41 | 0.339 / 0.953 | 0.218 |
+
+### APTOS validation (730 images; D and E are pooled out-of-fold)
+
+| rule | QWK | vs A (95 % interval) | referable sens / spec | ECE |
+|---|---|---|---|---|
+| A | 0.917 | — | 0.950 / 0.949 | 0.061 |
+| B | 0.913 | −0.004 (−0.007 … −0.001) | 0.956 / 0.944 | 0.061 |
+| C | 0.913 | −0.004 (−0.008 … −0.000) | 0.950 / 0.948 | 0.061 |
+| D | 0.914 | −0.003 (−0.007 … −0.000) | 0.947 / 0.948 | 0.036 |
+| E | 0.911 | −0.006 (−0.010 … −0.001) | 0.960 / 0.935 | 0.065 |
+| F (exploratory) | 0.894 | −0.023 (−0.029 … −0.018) | 0.870 / 0.966 | 0.125 |
+| G (EyePACS oracle thresholds applied to APTOS) | 0.860 | −0.057 (−0.068 … −0.047) | 0.923 / 0.956 | 0.059 |
+
+**Fitted values and their stability.** Temperature per seed 2.47 / 0.98 / 1.30 (stable across folds within a seed: 2.36 – 2.53, 0.91 – 1.03, 1.26 – 1.33). Thresholds are not stable: across folds and seeds a single cut's threshold ranges from 0.04 to 0.96; fold-to-fold QWK SD 0.014 – 0.033. EM priors on EyePACS put grade 2 at 0.000 in all three seeds against a true 0.149 (and on APTOS itself, in one seed, grade 2 at 0.000 against 0.271).
+
+### Reading
+
+1. **On EyePACS the failure is in the scores, not in the decoding.** No rule that avoids EyePACS labels moves QWK by more than +0.008, and thresholds fitted on EyePACS labels themselves — the most any per-cut decoding rule can do with P's scores — reach only 0.477 with referable sensitivity 0.34. The EyePACS-trained model is at 0.83. The low sensitivity follows from the ranking: an AUROC of 0.79 at the referable cut cannot give high sensitivity at 0.95 specificity, wherever the threshold is put.
+2. **This corrects the emphasis of §87 and of the audit that followed it.** Those read the external failure mainly as an operating-point problem, from high pooled AUROC with poor decoded recall on DDR. On the development mirror the ranking at the two lower cuts is itself poor (0.70 and 0.79), and the decoding rule accounts for at most about 0.04 of a 0.39 gap. Whether DDR behaves the same is not known: its pooled AUROC at the referable cut was higher (0.90; 0.86 inside the family holding both sides), so the decoding share there may be larger. That question is not answered here.
+3. **Calibration fitted on APTOS does not transfer.** Temperature scaling halves ECE in domain (0.061 → 0.036) and leaves EyePACS badly calibrated (0.229 → 0.191). Thresholds fitted on 730 APTOS images are noise-level unstable and cost a little in domain. Operating points do not transfer in the other direction either: the EyePACS oracle thresholds lower APTOS QWK by 0.057.
+4. **Prevalence shift alone does not explain it.** The label-shift correction makes EyePACS much worse and deletes grade 2; its assumption — each grade looks the same in both datasets — is violated. It is also unstable on APTOS itself.
+5. **Grade-3 recall is partly a decoding matter, at a price.** The oracle raises it from 0.15 to 0.41 while grade-2 recall falls to 0.10 — the same kind of trade along a poor curve that the project's earlier CORN threshold diagnostic (2026-09-22) recorded for grade 4.
+6. **The parameter-free alternatives are immaterial.** Expected-grade decoding is +0.008 on EyePACS and −0.004 on APTOS; the most probable class is slightly worse on both.
+
+**Limitations.** One development dataset as the shifted set, and P only. Rule G is an oracle for QWK, not for sensitivity, and although cross-fitted by patient it is fitted on the evaluated distribution: it bounds what decoding could do and is not evidence about generalisation. EyePACS grades are single-grader labels with known noise, though the EyePACS-trained model's AUROC on the same labels shows the ceiling is far above P. The EM correction used temperature scaling only. APTOS validation is the selection set of the P checkpoints. ECE is the top-label ECE of the decoded grade under each rule's distribution.
+
+**Standing.** Rule A stays. No rule is adopted and none was chosen by its EyePACS result. The diagnostic points away from calibration and decoding as the lever and toward what changes the scores under shift; the two changes that have done so in this record are the EyePACS adaptation (§79, §86) and the fundus crop (§90, where every per-cut AUROC rose). No follow-up is approved by this section.
+
+## 93. Joint APTOS + EyePACS training ("J") — pre-run record (2026-10-11; written before any training; nothing run)
+
+**Why.** §92 placed the cross-dataset failure of P in its scores rather than in the decoding, and the two changes that have moved the scores under shift are more diverse training data (§79, §86) and input framing (§90). This experiment tests the first directly: the final grader trained on both development datasets at once, instead of on APTOS alone (P) or on EyePACS and then APTOS (P-EP).
+
+**Decisions taken by the user (2026-10-11).** One APTOS image to two EyePACS images per epoch; batch 16; architecture, preprocessing, augmentation, optimiser and the fixed 0.5 decoding unchanged; a checkpoint-selection metric giving both validation sets equal influence, scored on both full sets every epoch; seed 42 first, seeds 123 and 2026 only under the continuation rule below; no IDRiD or DDR in any setting; the EyePACS held-out test stays closed; an external re-test is a separate, later decision.
+
+**Setup.** ConvNeXt-Tiny from ImageNet (as P — not the EyePACS-adapted encoder), GAP, LayerNorm, CORN; the cached direct-resize 512 frames of both datasets; P's augmentation and per-image random streams; weighted CORN; AdamW 1e-4, weight decay 0.05; up to 50 epochs, early stopping after 12 epochs without improvement, learning-rate reduction after 4; mixed precision on a T4; batch 16. No crop, no new augmentation.
+
+**Data.** Training: the 2,921 APTOS training images and the 31,610 images of the EyePACS adaptation split's training part. Validation, never in a training epoch: APTOS 730, EyePACS 3,512 (1,756 patients, disjoint from the training patients). The trainer refuses any image outside these four parts and checks that no validation image is in a training part.
+
+**Epoch and sampling.** Every epoch holds all 2,921 APTOS training images and 5,842 EyePACS training images — 8,763 images, 548 steps. The EyePACS images are a rotating slice of one shuffle: the 31,610 images are sorted by name and permuted once with a generator seeded from the run seed and a fixed tag (`joint-eyepacs-rotation-v1`); epoch *e* takes the next 5,842 positions, wrapping round. An epoch's content is therefore a function of (seed, epoch) alone — it does not depend on a checkpoint, on earlier epochs having been built, or on resumption. No image appears twice in an epoch; the first five epochs use 29,210 distinct EyePACS images and the sixth completes the set. Within an epoch the order and each image's augmentation are P's (seeded by run seed and epoch).
+
+**Class balance.** The project's convention, unchanged: weighted CORN with weights proportional to (class proportion)^−0.5, normalised so that the proportion-weighted mean weight is 1 (`weighted_corn.class_weights_from_counts`), computed from training counts only. Applied to the expected grade counts of one epoch — APTOS 1,444 / 296 / 791 / 154 / 236 plus EyePACS 23,209 / 2,209 / 4,768 / 782 / 642 scaled by 5,842 / 31,610, i.e. 5,733.4 / 704.3 / 1,672.2 / 298.5 / 354.7 — the weights are **0.6456 / 1.8421 / 1.1954 / 2.8293 / 2.5958**. For comparison: P 0.6919 / 1.5282 / 0.9348 / 2.1186 / 1.7114; EyePACS-only 0.6450 / 2.0906 / 1.4230 / 3.5138 / 3.8780. Verified against the mixture actually sampled: for each of the three seeds the mean per-epoch grade counts over the 50 possible epochs give weights within 0.02 of the recorded ones (the trainer repeats this check and refuses otherwise). No oversampling and no per-source loss weight; the source balance is the 1 : 2 composition.
+
+**Checkpoint selection.** At the end of every epoch both full validation sets are scored with the fixed decode, and the monitored value is the mean of the two QWKs: ½ · QWK(APTOS validation, 730) + ½ · QWK(EyePACS validation, 3,512). BEST is the first epoch with the highest value; early stopping and learning-rate reduction follow the same value. A pooled QWK would have given EyePACS 83 % of the weight; the mean gives each set half. Both per-set values are stored for every epoch.
+
+**Comparisons (three-seed protocol; seed 42 first).** On APTOS validation against P of the same seed, on EyePACS validation against the EyePACS-only adaptation model (§72): QWK difference with the paired grade-stratified bootstrap (2,000 resamples, seed 20260927). Reported for J on both sets: QWK, per-cut AUROC, per-grade recall, referable-DR sensitivity and specificity of the decoded grade, top-label ECE.
+
+**Continuation rule.** Seeds 123 and 2026 are trained only if, for seed 42, QWK on APTOS validation is no more than 0.01 below P (seed 42) **and** QWK on EyePACS validation is no more than 0.02 below the EyePACS-only model. The trainer refuses the later seeds otherwise.
+
+**What this can and cannot show.** It can show whether one jointly trained model keeps the level of each single-source model on that model's own validation set. It cannot show better generalisation: EyePACS validation is in-domain for J, and both validation sets select the checkpoint. The comparison with P also carries the batch-size difference (16 against 2), so a difference from P is not attributable to the joint data alone; the comparison with the EyePACS-only model, trained at batch 16, does not carry it. Evidence about unseen data would need an external test with all settings frozen, which the user will decide separately.
+
+**Compute.** About 62 GiB staged on the T4 (EyePACS frames 51.4, APTOS frames 10.7). About 6.5 minutes per epoch at the adaptation run's measured 26.6 images per second, plus the two validation passes; 2.5 – 3.5 hours expected for seed 42, 5.5 hours at the epoch cap; resumable.
+
+**Implementation.** `joint_train.py`, `tests/test_joint_train.py` (13 tests: the data rules on the real split manifests, the selection metric, the continuation rule, and a two-epoch run plus resume on synthetic frames through the real loop), `colab/notebooks/joint_aptos_eyepacs.ipynb` (training switched off until a flag and a phrase are set).
