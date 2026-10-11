@@ -57,10 +57,19 @@ section numbers below refer to it.
 
 ### Current position
 
-- The strongest defensible claim is mechanistic: image-aligned lesion supervision changes what the grader's
-  features encode, at no measurable grading cost and with no grading gain.
-- The frozen, externally evaluated system is the dual-branch pipeline of §60–§61. E1 is the current research
-  line. No final model has been declared.
+- **Position after the EyePACS phase (2026-10-11; consolidated in
+  `docs/experiments/Final_Comparative_Analysis.md`, research record §68–§80).** Lesion supervision changes what
+  the grader's features encode: expert-annotated lesions (DDR) are more linearly readable from E1 than from P,
+  and from E1-EP than from P-EP (pre-declared criteria met). A shuffled-target control reproduces most of that
+  change, so only a modest, convergence-dependent part is attributable to image-aligned targets. No grading
+  gain from lesion supervision is shown on APTOS or IDRiD.
+- Supervised pre-adaptation on EyePACS (P-EP) shows no grading difference on APTOS validation and a higher QWK
+  than P on IDRiD's 100-image primary set (0.738 against 0.642; +0.097, 95 % interval +0.040 to +0.162), carried
+  mostly by one seed. This is small-sample evidence that needs independent external replication.
+- No arm classifies severe grades reliably on external data; no claim of clinical utility is made.
+- IDRiD's grading test set is consumed (§61, §67, §79) and closed to further evaluation.
+- The frozen, externally evaluated system is the dual-branch pipeline of §60–§61. No final model has been
+  declared.
 - The rule that Stage 3/4 outputs must feed the classifier was lifted by the user on 2026-10-05: an RGB-only
   grading classifier is acceptable, with Stage 3/4 kept as stages (Stage 4 is E1's teacher).
 - APTOS validation is also the checkpoint-selection set; it is not an untouched test.
@@ -87,7 +96,7 @@ section numbers below refer to it.
 9. **E2-EP** only if that criterion is met (enforced in code).
 10. **IDRiD batch 2** for the EP arms.
     Steps 5 - 9 are done and recorded (§72 - §77). Batch 2: protocol locked and evaluator implemented (§78:
-    `idrid_batch2_eval.py`, `idrid_batch2_protocol.json`, `colab/notebooks/idrid_batch2_ep.ipynb`);; run once and recorded (§79).
+    `idrid_batch2_eval.py`, `idrid_batch2_protocol.json`, `colab/notebooks/idrid_batch2_ep.ipynb`); run once and recorded (§79).
     IDRiD's grading test set is fully consumed.
 
 Not planned: any further fusion, gating, routing or graph module; E3; backbone or foundation-model swaps; λ

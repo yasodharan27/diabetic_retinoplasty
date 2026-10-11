@@ -5175,3 +5175,33 @@ QWK P 0.636, P-EP 0.736, E1-EP 0.701, E2-EP 0.663. P-EP − P +0.0998 (+0.044 �
 **Limitations (those of §78).** 100 primary images, 19 of grade 3 and 13 of grade 4; the third use of this test set in the project; Stage 4 was trained on IDRiD's camera domain (affects E1-EP and E2-EP, not P or P-EP); one adapted encoder under all nine models; P from an earlier runtime; APTOS validation selected every checkpoint; the fixed 0.5 decoding is conservative for the severe grades (their recall is 0.19 – 0.44 for every arm while AUROC ≥3 and ≥4 are 0.91 – 0.96); absolute performance on IDRiD remains far below APTOS validation (0.74 against 0.92). Nothing here establishes clinical utility.
 
 **Closed.** IDRiD batch 2 has been used; with it every declared use of IDRiD's grading test set is consumed. It is not rerun. No model, threshold, decoding rule or recorded conclusion is changed on the basis of this result.
+
+
+## 80. Consolidation — final comparative analysis, cross-check of the record, errata (2026-10-11; documentation only; nothing run)
+
+**What this section is.** A pointer and an integrity note. The consolidated comparison of P, E1, E2, P-EP, E1-EP and E2-EP across APTOS, EyePACS, DDR and IDRiD is in `docs/experiments/Final_Comparative_Analysis.md`. It introduces no result: every number in it is taken from §60 – §79 and the stored result files. No evaluation was rerun, no model was loaded, and the IDRiD grading test set was not read.
+
+**Cross-check performed.** The stored result files were read again (APTOS per-image tables and the matched-seed analyses of every arm; the EyePACS adaptation and held-out records; both DDR probe result files and the baseline comparison; the primary and sensitivity results of IDRiD batches 1 and 2) and their headline quantities — per-seed and mean QWK, the paired differences with their intervals and per-seed values, the probe means and contrasts, the tolerance outcomes quoted in the text — were compared with what §63 – §79 state. Per-class values and every confusion matrix were not re-derived. The three locked protocol files, the two EyePACS manifests and the DDR probe manifest have their recorded hashes; the pinned P / E1 / E2 / ImageNet files and the nine EP checkpoints, the adapted encoder and the stored P tables on Drive matched their pins when last checked (§78, 2026-10-11).
+
+**Errata (the original text is left in place; these notes correct it).**
+
+1. **§77, table "Grading on APTOS validation".** E2-EP's mean QWK is **0.9251** (0.925146 from 0.930853 / 0.921814 / 0.922770), not 0.9252; the mean had been taken from the rounded per-seed values. E1-EP's mean is 0.925092. The stated difference E2-EP − E1-EP = +0.0001 and its interval are correct, as are the SD (0.0050) and every reading in §77.
+2. **§79, reading point 3.** "six more of 39 grade-4 decisions" should read **seven more**: over the three seeds E1-EP assigns grade 4 correctly in 3 + 8 + 6 = 17 of 39 cases and P-EP in 2 + 3 + 5 = 10. The recall values 0.44 and 0.26 in the same sentence are correct, and the reading is unchanged.
+
+**Not an error, noted for readers.** §69.5 – §69.8 follow §71 in this file, and §68.1 – §69.3 precede §70: the record is append-only and sections were written in the order of the work; their numbers reflect topic. §75 calls E1-EP "the highest APTOS validation QWK of any arm so far": it was written before E2-EP (§77), which has the same mean. `PROJECT_CODE.md` carried a doubled semicolon in its plan status (corrected) and a "Current position" paragraph that predated the EyePACS phase (brought up to date; the earlier findings it listed are unchanged).
+
+**Evidence status of the research questions** (full table with the numbers: section 7 of the analysis document).
+
+| question | status |
+|---|---|
+| lesion supervision changes the representation — Stage-4 targets on APTOS (§63.2); expert lesions on DDR without (§70) and with adaptation (§76) | supported; pre-declared criteria met |
+| that change is specific to image-aligned targets | not established: absent on the primary probe without adaptation, inconsistent with it; a smaller part (+0.017 to +0.024) separates at convergence in 3 / 3 seeds; descriptive |
+| EyePACS adaptation improves APTOS grading (§74) | inconclusive: no difference shown |
+| EyePACS adaptation improves external grading (§79) | supported on the 100-image IDRiD primary set only (+0.097, +0.040 … +0.162); dominated by one seed; needs independent replication |
+| adaptation alone raises lesion readability (§76) | unsupported: slightly lower; descriptive |
+| lesion supervision improves grading, APTOS or IDRiD (§63, §67, §75, §77, §79) | unsupported |
+| reliable severe-grade classification on external data; clinical utility | unsupported; not claimed |
+
+**Standing constraints after this phase.** IDRiD's grading test set is consumed (§61, §67, §79) and stays closed: no further model, threshold, decoding rule or checkpoint is to be evaluated or chosen on it. The DDR test split has been used for six encoder groups under one fixed method and is likewise not a tuning set. No recorded conclusion is changed by this section.
+
+**Status.** The EyePACS phase and its consolidation are complete. No experiment is pending in this record.
