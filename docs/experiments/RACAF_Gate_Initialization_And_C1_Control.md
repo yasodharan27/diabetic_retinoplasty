@@ -5731,3 +5731,59 @@ QWK 0.9170 → 0.9062: **−0.0108** (−0.017 … −0.005); per seed −0.005 
 ### 94.1 Seeds are trained in sequence (2026-10-12; decided by the user before any later seed was started)
 
 Both arms train their seeds one after another in one runtime — 42, then 123, then 2026 — as every earlier experiment of this record. The phrase "three seeds in parallel on separate runtimes" in the compute paragraph of §94 is withdrawn. The trainer enforces the order (`joint_train.run_arm`; a seed is refused until the seed before it in the same arm is complete), and for the direct arm the sequence still stops after seed 42 if its continuation rule is not met. Time for the cropped arm becomes about 16 hours of T4 for the three seeds, resumable across sessions.
+
+## 95. Joint training, direct arm — seed 42: result and continuation rule (finished 2026-10-12 07:26 UTC; commit `64a4e74`; Colab T4; protocol §93)
+
+**Run.** `experiments/JointAptosEyePACS/j_seed42`. 32 epochs scored; early stopping twelve epochs after the best. BEST = epoch index 19, selection metric 0.8632, weights SHA-256 `b6cc2820…1ef8`. Read back from Drive: both per-image tables recompute to the reported QWK; the weights of the sampled mixture are within 0.001 of the recorded class weights. Not read: EyePACS held-out test, IDRiD, DDR.
+
+| | J (seed 42) | reference | difference (95 % interval) |
+|---|---|---|---|
+| **APTOS validation QWK** (730) | **0.9100** | P seed 42: 0.9184 | −0.0085 (−0.025 … +0.008) |
+| **EyePACS validation QWK** (3,512) | **0.8164** | EyePACS-only model: 0.8274 | −0.0110 (−0.026 … +0.005) |
+
+| J, seed 42 | APTOS validation | EyePACS validation |
+|---|---|---|
+| AUROC ≥1 / ≥2 / ≥3 / ≥4 | 0.998 / 0.987 / 0.948 / 0.941 | 0.919 / 0.957 / 0.973 / 0.972 |
+| recall grades 0 – 4 | 0.978 / 0.568 / 0.818 / 0.564 / 0.638 | 0.949 / 0.297 / 0.655 / 0.637 / 0.500 |
+| referable DR, sensitivity / specificity | 0.956 / 0.938 | 0.778 / 0.973 |
+| top-label ECE | 0.097 | 0.027 |
+
+For comparison on the same images: the EyePACS-only model has AUROC 0.913 / 0.953 / 0.979 / 0.977, referable sensitivity 0.736 and ECE 0.013 on EyePACS validation; P seed 42 has referable sensitivity 0.946 and ECE 0.094 on APTOS validation; P scores 0.438 on EyePACS validation (§90).
+
+**Continuation rule: met.** APTOS −0.0085 (limit −0.01), EyePACS −0.0110 (limit −0.02). The APTOS margin is 0.0015. Seeds 123 and 2026 of the direct arm proceed, in sequence (§94.1).
+
+**Reading.**
+
+1. One model trained on both datasets is within about 0.01 QWK of each single-source model on that model's own validation set; neither difference has an interval that excludes zero, and both point estimates are slightly negative.
+2. On EyePACS validation its ranking matches the EyePACS-only model at the two lower cuts and is slightly lower at the two upper ones; its referable-DR sensitivity at the fixed decode is higher (0.778 against 0.736).
+3. The epoch-to-epoch EyePACS QWK was noisy (0.74 – 0.82 after the fifth epoch), so the selected epoch is one of several near-equal ones (epochs 13, 18, 20, 26, 28 and 30 lie within 0.003 of epoch 19 on the selection metric).
+
+**Limitations (those of §93).** Batch 16 against batch 2 for P, so the APTOS comparison confounds joint data with batch size. Both validation sets selected the checkpoint. EyePACS validation is in-domain for J: nothing here is evidence of generalisation to unseen data. One seed.
+
+## 96. Later stages — plan and prepared code (2026-10-12; written while seed 123 of the direct arm and the cropped frames were in progress; NOTHING below has been run)
+
+**What this section is.** The plan for what follows the two joint arms, fixed before either arm is complete, and the list of files written for it. No external image was read, no model was loaded for these stages, and no number below exists yet.
+
+**Order, once both arms are complete (six runs).**
+
+1. **External re-test** of J and J-crop on DDR and IDRiD (`final_external_eval.py`, `colab/notebooks/final_external_eval.ipynb`).
+2. **Uncertainty** of the three-seed ensembles (`uncertainty_eval.py`; from per-image tables, no GPU).
+3. **Explainability**: Grad-CAM on the grader (`gradcam.py`).
+4. **End-to-end demonstration** on single images (`demo_pipeline.py`, `colab/notebooks/final_pipeline_demo.ipynb`).
+5. Report and patent drafts, written from this record.
+
+**External re-test — the design that will be locked.** A documented re-use of both sets (DDR: second grading use, after §86; IDRiD: fourth, after §61, §67, §79), permitted by the user's instruction of 2026-10-11 (§89). All settings of both arms are frozen on development data first. P and P-EP are not run again: their stored per-image tables are reused after a hash check, on the same images in the same order.
+
+- *Primary, one per dataset:* mean over the three seed-labelled pairs of QWK(J) − QWK(P) on the primary population (DDR 3,540; IDRiD 100); paired grade-stratified bootstrap, 2,000 resamples, seed 20260927; supported only if the interval is wholly above zero; seed-level inconsistency flagged when any difference is not positive.
+- *Secondary, descriptive:* J − P-EP, J-crop − J, J-crop − P; per-cut AUROC, per-grade recall, referable-DR sensitivity and specificity, ECE, the seed ensemble; on DDR the primary contrast inside each file-name family; the broader 3,725 and all 103 as sensitivity sets.
+- *J is the primary model whatever J-crop shows* (§94); the two are not chosen between on these results.
+- *Gate:* every joint model must first reproduce its own stored APTOS validation table from the raw images through the same frame code (logits within 0.05, grades identical). The protocol file is written once, from the six runs' recorded BEST checkpoints, and pins them and the reference tables by SHA-256; each dataset has its own confirmation token and lock.
+- *Limits fixed now:* both sets were used before and their earlier results were known when joint training was chosen; J − P carries the batch-size difference (16 against 2); DDR's source-by-grade structure and missing patient identifiers; 100 images on IDRiD.
+
+**Uncertainty.** ConvNeXt has no dropout, so the method is a deep ensemble of the three seeds, not Monte-Carlo dropout: cumulative probabilities averaged, the fixed 0.5 decode, and three scores — predictive entropy, seed disagreement, margin to the nearest threshold. Usefulness is judged by selective prediction (agreement on the retained images as the most uncertain are referred, against random referral) and by the AUROC for detecting wrong predictions. The earlier, rejected reliability signal (D6) is a different quantity.
+
+**Explainability.** Grad-CAM on the grader's last feature map (16 × 16), for the expected grade or one cumulative cut, through the graph the lesion probes use; an optional overlap measure against expert lesion masks. A saliency map shows where the score is sensitive; it does not show that the model reasons correctly.
+
+**Demonstration.** One image through the frozen Stage 1 (quality), Stage 2, Stage 3 (vessels), Stage 4 (lesions), the three-seed grader, uncertainty and Grad-CAM, written as one picture and one JSON per image. The grade comes from the RGB grader alone; vessel and lesion maps are supporting views. Research prototype, not a medical device. Demonstration images: APTOS validation or the user's own — not DDR or IDRiD test images.
+
+**State of the code.** Written and syntax-checked. `tests/test_later_stages.py` (4 tests, no model) passes: the uncertainty analysis on synthetic tables and the arithmetic helpers of Grad-CAM. **Not yet executed:** the Grad-CAM gradient path on a real grader, the demonstration pipeline, the re-test evaluator and its two notebooks. They are to be smoke-tested once the frame build has released the laptop's CPU, and corrected before any of them is used for a result.
