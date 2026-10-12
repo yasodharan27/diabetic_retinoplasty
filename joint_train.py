@@ -340,10 +340,11 @@ def run_seed(seed, experiments_root, frames, parts, reference_arrays, identities
     if seed not in SEEDS:
         raise ValueError(f"seed must be one of {SEEDS}, got {seed!r}")
     run_dir = run_dir_for(experiments_root, seed, arm)
+    for earlier in SEEDS[:SEEDS.index(seed)]:              # one seed after another: 42, then 123, then 2026
+        if state(run_dir_for(experiments_root, earlier, arm)) != "complete":
+            raise JointError(f"seed {seed} of the {arm} arm starts only after seed {earlier} is complete (seeds are trained in sequence)")
     if seed != SEEDS[0] and ARMS[arm]["continuation_rule"]:
         first = posixpath.join(run_dir_for(experiments_root, SEEDS[0]), "result.json")
-        if not os.path.exists(first):
-            raise JointError(f"seed {seed} needs the result of seed {SEEDS[0]} first")
         with open(first) as fh:
             if not json.load(fh)["continuation"]["continue"]:
                 raise JointError(f"seed {SEEDS[0]} did not meet the continuation rule: seed {seed} is not run")
@@ -380,3 +381,24 @@ def run_seed(seed, experiments_root, frames, parts, reference_arrays, identities
         json.dump(_plain(result), fh, indent=1)
     os.replace(posixpath.join(run_dir, "result.json.tmp"), posixpath.join(run_dir, "result.json"))
     return result
+
+
+def run_arm(arm, experiments_root, frames, parts, reference_arrays_fn, identities, references_fn, *, repo_dir, staging_root, log=print,
+            on_result=None, **kw):
+    """Seeds 42 -> 123 -> 2026 of one arm, ONE AFTER ANOTHER in this process, as every earlier experiment of the
+    project: train (or resume), evaluate BEST, compare, write result.json, then the next seed. A completed seed is
+    returned as recorded. For the direct arm the sequence stops after seed 42 when its continuation rule is not
+    met. `reference_arrays_fn()` returns the ImageNet arrays (called afresh for each seed); `references_fn(seed)`
+    the comparison tables of that seed; `on_result(result)` is called after each seed (e.g. to print it)."""
+    if arm not in ARMS:
+        raise ValueError(f"arm must be one of {tuple(ARMS)}, got {arm!r}")
+    results = {}
+    for seed in SEEDS:
+        results[seed] = run_seed(seed, experiments_root, frames, parts, reference_arrays_fn(), identities, references_fn(seed),
+                                 repo_dir=repo_dir, staging_root=staging_root, log=log, arm=arm, **kw)
+        if on_result:
+            on_result(results[seed])
+        if ARMS[arm]["continuation_rule"] and seed == SEEDS[0] and not results[seed]["continuation"]["continue"]:
+            log(f"seed {seed} did not meet the continuation rule: seeds {SEEDS[1:]} of the {arm} arm are not run")
+            break
+    return results

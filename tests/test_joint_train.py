@@ -219,8 +219,13 @@ class RunTests(unittest.TestCase):
 
     def test_4_later_seeds_wait_for_seed_42_and_its_rule(self):
         root = os.path.join(self.tmp.name, "gate")
-        with self.assertRaises(jt.JointError):                               # no seed-42 result yet
-            jt.run_seed(123, root, self.frames, self.parts, REF_ARRAYS, {}, {}, repo_dir=REPO, staging_root=self.tmp.name)
+        for arm in ("direct", "crop"):                                       # no seed-42 result yet, in either arm
+            with self.assertRaises(jt.JointError):
+                jt.run_seed(123, root, self.frames, self.parts, REF_ARRAYS, {}, {}, repo_dir=REPO, staging_root=self.tmp.name, arm=arm)
+        os.makedirs(jt.run_dir_for(root, 42, "crop"))
+        json.dump({"arm": "crop"}, open(os.path.join(jt.run_dir_for(root, 42, "crop"), "result.json"), "w"))
+        with self.assertRaises(jt.JointError):                               # seed 2026 does not jump over seed 123
+            jt.run_seed(2026, root, self.frames, self.parts, REF_ARRAYS, {}, {}, repo_dir=REPO, staging_root=self.tmp.name, arm="crop")
         first = jt.run_dir_for(root, 42)
         os.makedirs(first)
         json.dump({"continuation": {"continue": False}}, open(os.path.join(first, "result.json"), "w"))
@@ -324,6 +329,56 @@ class CropCacheTests(unittest.TestCase):
         json.dump(index, open(index_path, "w"))
         with self.assertRaises(cf.CropCacheError):                                   # built with another rule
             cf.CropFrames(self.cache, expected, check_hashes=False)
+
+
+class SequenceTests(unittest.TestCase):
+    """run_arm trains one seed after another; the run itself is replaced by stand-ins (mechanics only)."""
+
+    def setUp(self):
+        import multiseed_runs as msr
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.order, self.differences = [], {"aptos": 0.0, "eyepacs": 0.0}
+        self._orig = (jt.check_data, jt.class_weights, jt.compare)
+        jt.check_data = lambda *parts: True
+        jt.class_weights = lambda a, e, seed=None, epochs=None: ([1.0] * 5, list(jt.APPROVED_CLASS_WEIGHTS), {"weights": list(jt.APPROVED_CLASS_WEIGHTS)})
+        jt.compare = lambda joint, reference: {"difference": self.differences["aptos" if "aptos" in joint else "eyepacs"], "ci_95": [0.0, 0.0],
+                                               "joint_qwk": 0.9, "reference_qwk": 0.9}
+
+        def train(run_dir, seed, frames, parts, arrays, weights, mapping, **kw):
+            self.order.append((kw["arm"], seed))
+            os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+            msr.write_stop_decision(run_dir, 1, "epoch_cap")
+        self.kw = dict(repo_dir=REPO, staging_root=self.tmp.name, log=lambda *a: None, train_fn=train,
+                       evaluate_fn=lambda *a: {"checkpoint": {}, "sets": {}})
+        self.parts = ([("a0", 0)], [("a1", 0)], [("1_left.jpeg", 0)], [("2_left.jpeg", 0)])
+
+    def tearDown(self):
+        jt.check_data, jt.class_weights, jt.compare = self._orig
+        self.tmp.cleanup()
+
+    def _arm(self, arm, root):
+        return jt.run_arm(arm, root, None, self.parts, lambda: None, {"aptos": {}, "eyepacs": {}},
+                          lambda seed: {"p_aptos": "p", "eyepacs_only": "e"}, **self.kw)
+
+    def test_seeds_run_in_order_one_after_another_and_finished_seeds_are_kept(self):
+        root = os.path.join(self.tmp.name, "a")
+        results = self._arm("crop", root)
+        self.assertEqual(self.order, [("crop", 42), ("crop", 123), ("crop", 2026)])
+        self.assertEqual(sorted(results), [42, 123, 2026])
+        self.assertTrue(all(r["arm"] == "crop" and "continuation" not in r for r in results.values()))
+        self._arm("crop", root)                                               # a second call trains nothing again
+        self.assertEqual(len(self.order), 3)
+        results = self._arm("direct", root)                                   # the direct arm: rule met, so all three
+        self.assertEqual(self.order[3:], [("direct", 42), ("direct", 123), ("direct", 2026)])
+        self.assertTrue(results[42]["continuation"]["continue"])
+
+    def test_the_direct_arm_stops_after_seed_42_when_its_rule_is_not_met(self):
+        self.differences["eyepacs"] = -0.05
+        results = self._arm("direct", os.path.join(self.tmp.name, "b"))
+        self.assertEqual((self.order, sorted(results)), ([("direct", 42)], [42]))
+        self.assertFalse(results[42]["continuation"]["continue"])
+        with self.assertRaises(ValueError):
+            self._arm("other", self.tmp.name)
 
 
 class ModuleTests(unittest.TestCase):

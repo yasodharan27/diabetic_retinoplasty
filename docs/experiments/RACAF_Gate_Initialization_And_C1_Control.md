@@ -5727,3 +5727,7 @@ QWK 0.9170 → 0.9062: **−0.0108** (−0.017 … −0.005); per seed −0.005 
 **Limitations fixed in advance.** Those of §93 (batch size against P; both validation sets select the checkpoint; no development evidence of generalisation). In addition: the crop rule was chosen before §90 and is not tuned; a difference between J-crop and J on the validation sets is a difference between two in-domain models and says little about external data.
 
 **Compute, from measured rates.** Frames: 38,773 images (35,122 EyePACS, 3,651 APTOS) at 2.5 – 5 s each on the laptop, four workers — about 9 to 11 hours, resumable shard by shard. Upload about 57 GB. Training: about 9 minutes per epoch as observed for J, 5 to 5.5 hours per seed, three seeds in parallel on separate runtimes.
+
+### 94.1 Seeds are trained in sequence (2026-10-12; decided by the user before any later seed was started)
+
+Both arms train their seeds one after another in one runtime — 42, then 123, then 2026 — as every earlier experiment of this record. The phrase "three seeds in parallel on separate runtimes" in the compute paragraph of §94 is withdrawn. The trainer enforces the order (`joint_train.run_arm`; a seed is refused until the seed before it in the same arm is complete), and for the direct arm the sequence still stops after seed 42 if its continuation rule is not met. Time for the cropped arm becomes about 16 hours of T4 for the three seeds, resumable across sessions.
