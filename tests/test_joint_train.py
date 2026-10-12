@@ -232,6 +232,100 @@ class RunTests(unittest.TestCase):
             jt.run_dir_for(root, 7)
 
 
+class ArmTests(unittest.TestCase):
+    def test_the_direct_arm_keeps_the_configuration_seed_42_was_started_with(self):
+        args = (42, jt.APPROVED_CLASS_WEIGHTS, [5733.4, 704.3, 1672.2, 298.5, 354.7], {"fingerprint": "a"}, {"fingerprint": "e"})
+        direct = jt.run_mapping(*args, repo_dir=REPO)
+        self.assertEqual(at.config_hash(direct), "5252d2e9960b1d3097d07eef713e267749d01b3d743078a2a7fa2b0c9d003886")     # as committed in 64a4e74
+        self.assertEqual(direct, jt.run_mapping(*args, repo_dir=REPO, arm="direct"))
+        self.assertNotIn("arm", direct)
+        self.assertEqual(jt.run_dir_for("root", 42), jt.run_dir_for("root", 42, "direct"))
+        self.assertTrue(jt.run_dir_for("root", 42).endswith("JointAptosEyePACS/j_seed42"))
+
+    def test_the_cropped_arm_differs_in_the_frames_only_and_has_its_own_directory(self):
+        import crop_frames as cf
+        import geometry_diagnostic as gd
+        args = (42, jt.APPROVED_CLASS_WEIGHTS, [1.0] * 5, {"fingerprint": "a"}, {"fingerprint": "e"})
+        direct, crop = jt.run_mapping(*args, repo_dir=REPO), jt.run_mapping(*args, repo_dir=REPO, arm="crop")
+        changed = {k for k in crop if crop[k] != direct.get(k)}
+        self.assertEqual(changed, {"arm", "preprocessing", "crop_rule", "crop_frames_version"})
+        self.assertEqual(crop["crop_rule"], {"gray_threshold": gd.GRAY_THRESHOLD, "line_fraction": gd.LINE_FRACTION, "min_side_fraction": gd.MIN_SIDE_FRACTION})
+        self.assertEqual((cf.RULE["gray_threshold"], cf.RULE["line_fraction"], cf.RULE["min_side_fraction"]), (12, 0.02, 0.10))    # the rule fixed in record 89
+        self.assertTrue(jt.run_dir_for("root", 42, "crop").endswith("JointAptosEyePACS/jc_seed42"))
+        self.assertNotEqual(at.config_hash(direct), at.config_hash(crop))
+        with self.assertRaises(ValueError):
+            jt.run_dir_for("root", 42, "other")
+        with self.assertRaises(ValueError):
+            jt.run_mapping(*args, repo_dir=REPO, arm="other")
+        self.assertEqual({a: v["continuation_rule"] for a, v in jt.ARMS.items()}, {"direct": True, "crop": False})
+
+
+class CropCacheTests(unittest.TestCase):
+    """The cropped-frame cache on fabricated images: build, resume, read, refuse."""
+
+    def setUp(self):
+        import cv2
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.raw = os.path.join(self.tmp.name, "raw")
+        os.makedirs(self.raw)
+        rng = np.random.default_rng(0)
+        self.plan = {"train": [], "val": []}
+        for k in range(5):
+            image = np.zeros((120, 180, 3), np.uint8)
+            image[10:110, 40 + k:140 + k] = rng.integers(60, 200, (100, 100, 3))      # a lit block with dark margins
+            name = f"{k}_left.jpeg"
+            cv2.imwrite(os.path.join(self.raw, name), image)
+            self.plan["train" if k < 3 else "val"].append((name, k % 5, os.path.join(self.raw, name)))
+        self.cache = os.path.join(self.tmp.name, "cache")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_build_resume_and_read(self):
+        import crop_frames as cf
+        import geometry_diagnostic as gd
+        index = cf.build(self.plan, self.cache, "toy", workers=1, shard_size=2, log=lambda *a: None)
+        self.assertEqual(sorted(index["shards"]), ["frames_train_000.npy", "frames_train_001.npy", "frames_val_000.npy"])
+        self.assertEqual(index["frames"], {"train": 3, "val": 2})
+        box = index["shards"]["frames_train_000.npy"]["boxes"][0]
+        self.assertTrue(box[2] > 20 and box[3] < 160 and box[0] > 0)                # the dark margins were cut
+        frames = cf.CropFrames(self.cache, {s: [(i, g) for i, g, _ in v] for s, v in self.plan.items()})
+        self.assertEqual(frames.entries("val"), [("3_left.jpeg", 3), ("4_left.jpeg", 4)])
+        frame = frames.frame("0_left.jpeg")
+        self.assertEqual((frame.shape, frame.dtype), ((512, 512, 3), np.float32))
+        direct, crop, _, _ = gd.two_frames(self.plan["train"][0][2])
+        self.assertEqual(float(np.abs(frame - crop.astype(np.float16).astype(np.float32)).max()), 0.0)      # the diagnostic's cropped frame
+        self.assertGreater(float(np.abs(frame - direct).max()), 0.05)
+        self.assertGreater(float(frame.mean()), float(direct.mean()))                # less dark margin in the frame
+        stamp = os.path.getmtime(os.path.join(self.cache, "frames_train_000.npy"))
+        os.remove(os.path.join(self.cache, "frames_val_000.npy"))                   # an interrupted build: one shard missing
+        again = cf.build(self.plan, self.cache, "toy", workers=1, shard_size=2, log=lambda *a: None)
+        self.assertEqual(os.path.getmtime(os.path.join(self.cache, "frames_train_000.npy")), stamp)       # finished shards are kept
+        self.assertEqual(again["shards"]["frames_val_000.npy"]["sha256"], index["shards"]["frames_val_000.npy"]["sha256"])
+        self.assertEqual(cf.summary(again)["left_uncut"], 0)
+
+    def test_a_wrong_or_altered_cache_is_refused(self):
+        import crop_frames as cf
+        cf.build(self.plan, self.cache, "toy", workers=1, shard_size=2, log=lambda *a: None)
+        expected = {s: [(i, g) for i, g, _ in v] for s, v in self.plan.items()}
+        with self.assertRaises(cf.CropCacheError):                                   # other images than the run expects
+            cf.CropFrames(self.cache, {"train": expected["train"][:2], "val": expected["val"]})
+        with self.assertRaises(cf.CropCacheError):
+            cf.CropFrames(self.cache, {"train": list(reversed(expected["train"])), "val": expected["val"]})
+        block = np.load(os.path.join(self.cache, "frames_train_000.npy"), mmap_mode="r+")
+        block[0, 0, 0, 0] = block[0, 0, 0, 0] + np.float16(0.25)
+        block.flush()
+        del block
+        with self.assertRaises(cf.CropCacheError):
+            cf.CropFrames(self.cache, expected)
+        index_path = os.path.join(self.cache, "index.json")
+        index = json.load(open(index_path))
+        index["rule"]["gray_threshold"] = 20
+        json.dump(index, open(index_path, "w"))
+        with self.assertRaises(cf.CropCacheError):                                   # built with another rule
+            cf.CropFrames(self.cache, expected, check_hashes=False)
+
+
 class ModuleTests(unittest.TestCase):
     def test_only_the_data_differs_from_p_and_no_external_or_test_set_is_reachable(self):
         self.assertEqual(jt.PROTOCOL, dict(at.P_PROTOCOL, batch_size=16))
@@ -239,7 +333,7 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(jt.SEEDS, (42, 123, 2026))
         source = open(os.path.join(REPO, "joint_train.py"), encoding="utf-8").read()
         code = source.split('"""', 2)[2]
-        for forbidden in ("idrid", "ddr", "heldout", "read_test", "TEST_MANIFEST", "fundus_box", "evaluate_heldout_test"):
+        for forbidden in ("idrid", "ddr", "heldout", "read_test", "TEST_MANIFEST", "evaluate_heldout_test"):
             self.assertNotIn(forbidden, code.lower() if forbidden.islower() else code, forbidden)
         for reused in ("eat.training_loop(", "eat.build_compiled_model(", "eat.make_epoch_sequence(", "eat.predict_logits(",
                        "weighted_corn.class_weights_from_counts(", "corn.decode_logits("):

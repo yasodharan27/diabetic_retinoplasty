@@ -45,6 +45,11 @@ SELECTION = ("mean of the APTOS validation QWK (730 images) and the EyePACS vali
              "sets, every epoch; first epoch with the highest value")
 APTOS_MARGIN, EYEPACS_MARGIN = 0.01, 0.02       # continuation rule
 VAL_BATCH = 16
+#: The two arms (record §93, §94). "direct" is the primary model and its configuration must not change; "crop"
+#: differs in the frames only (every image cut to the fundus box before the resize) and has no continuation rule.
+ARMS = {"direct": {"prefix": PREFIX, "continuation_rule": True},
+        "crop": {"prefix": "jc", "continuation_rule": False}}
+CROP_PREPROCESSING = "Stage 2 + cut to the fundus bounding box (geometry_diagnostic.fundus_box) + direct resize to 512 (crop_frames cache)"
 
 
 class JointError(RuntimeError):
@@ -169,13 +174,28 @@ def dual_validation_callback(run_dir, frames, aptos_val, eyepacs_val, qwk_fn=val
 
 # --------------------------------------------------------------------------- run identity
 
-def run_dir_for(experiments_root, seed):
+def run_dir_for(experiments_root, seed, arm="direct"):
     if int(seed) not in SEEDS:
         raise ValueError(f"seed must be one of {SEEDS}, got {seed!r}")
-    return posixpath.join(experiments_root, EXPERIMENT, f"{PREFIX}_seed{int(seed)}")
+    if arm not in ARMS:
+        raise ValueError(f"arm must be one of {tuple(ARMS)}, got {arm!r}")
+    return posixpath.join(experiments_root, EXPERIMENT, f"{ARMS[arm]['prefix']}_seed{int(seed)}")
 
 
-def run_mapping(seed, weights, expected_counts, aptos_identity, eyepacs_identity, protocol=PROTOCOL, repo_dir=None):
+def run_mapping(seed, weights, expected_counts, aptos_identity, eyepacs_identity, protocol=PROTOCOL, repo_dir=None, arm="direct"):
+    """Everything that identifies a run. The direct arm's mapping is exactly the one of §93 (a run directory is
+    bound to its configuration, and seed 42 of that arm was started with it); the cropped arm adds its arm name
+    and crop rule and names its preprocessing."""
+    mapping = _direct_mapping(seed, weights, expected_counts, aptos_identity, eyepacs_identity, protocol, repo_dir)
+    if arm == "crop":
+        import crop_frames as cf
+        mapping.update(arm="crop", preprocessing=CROP_PREPROCESSING, crop_rule=dict(cf.RULE), crop_frames_version=cf.VERSION)
+    elif arm != "direct":
+        raise ValueError(f"arm must be one of {tuple(ARMS)}, got {arm!r}")
+    return mapping
+
+
+def _direct_mapping(seed, weights, expected_counts, aptos_identity, eyepacs_identity, protocol=PROTOCOL, repo_dir=None):
     import pl_convnext as pl
     return {"experiment": EXPERIMENT, "arch": "P: convnext_tiny (ImageNet) + GAP + LayerNorm + CORN", "seed": int(seed),
             "encoder_initialisation": "ImageNet (as P); not the EyePACS-adapted encoder", "backbone_weights_sha256": pl.WEIGHTS_SHA256,
@@ -191,7 +211,7 @@ def run_mapping(seed, weights, expected_counts, aptos_identity, eyepacs_identity
 # --------------------------------------------------------------------------- training
 
 def train_seed(run_dir, seed, frames, parts, reference_arrays, weights, mapping, *, repo_dir, staging_dir, protocol=PROTOCOL,
-               log=print, max_epochs=None, mixed_precision=True, image_size=None, workers=2, qwk_fn=validation_qwk):
+               log=print, max_epochs=None, mixed_precision=True, image_size=None, workers=2, qwk_fn=validation_qwk, arm="direct"):
     """One resumable run. `parts` = (APTOS train, APTOS val, EyePACS train, EyePACS val) entries."""
     aptos_train, aptos_val, eyepacs_train, eyepacs_val = parts
     rotation = eyepacs_rotation(eyepacs_train, seed)
@@ -202,7 +222,7 @@ def train_seed(run_dir, seed, frames, parts, reference_arrays, weights, mapping,
         lambda: eat.build_compiled_model(seed, reference_arrays, weights, protocol, mixed_precision, image_size),
         lambda epoch: eat.make_epoch_sequence(frames, epoch_entries(aptos_train, rotation, epoch), epoch, seed, batch, True, workers),
         lambda: eat.make_epoch_sequence(frames, aptos_val, 0, seed, batch, False, workers),
-        experiment_id=f"{EXPERIMENT}/seed_{seed}", dataset_version=f"joint:{mapping['aptos'].get('fingerprint')}:{mapping['eyepacs'].get('fingerprint')}",
+        experiment_id=f"{EXPERIMENT}/seed_{seed}" if arm == "direct" else f"{EXPERIMENT}/{arm}/seed_{seed}", dataset_version=f"joint:{mapping['aptos'].get('fingerprint')}:{mapping['eyepacs'].get('fingerprint')}",
         protocol=protocol, repo_dir=repo_dir, staging_dir=staging_dir, log=log, max_epochs=max_epochs,
         mixed_precision=mixed_precision, wrap_callbacks=dual)
 
@@ -307,17 +327,20 @@ def state(run_dir):
 
 
 def run_seed(seed, experiments_root, frames, parts, reference_arrays, identities, references, *, repo_dir, staging_root, log=print,
-             train_fn=None, evaluate_fn=None, mixed_precision=True, image_size=None, max_epochs=None):
+             train_fn=None, evaluate_fn=None, mixed_precision=True, image_size=None, max_epochs=None, arm="direct"):
     """Train (or resume) one seed, evaluate BEST on both validation sets, compare with the references, write
     result.json. `references`: {'p_aptos': path of P's stored APTOS validation table for this seed,
     'eyepacs_only': path of the EyePACS-only model's stored EyePACS validation table}. Seeds 123 and 2026 are
-    refused unless seed 42 is complete and its continuation rule holds. A completed seed is returned as recorded."""
+    refused unless seed 42 is complete and its continuation rule holds. A completed seed is returned as recorded.
+    `arm="crop"`: `frames` must be the cropped-frame caches; the run has its own directory, no continuation rule,
+    and -- when `references` also names 'joint_aptos' / 'joint_eyepacs' (the direct arm's tables of the same seed)
+    -- is compared with the direct arm as well."""
     import multiseed_runs as msr
     seed = int(seed)
     if seed not in SEEDS:
         raise ValueError(f"seed must be one of {SEEDS}, got {seed!r}")
-    run_dir = run_dir_for(experiments_root, seed)
-    if seed != SEEDS[0]:
+    run_dir = run_dir_for(experiments_root, seed, arm)
+    if seed != SEEDS[0] and ARMS[arm]["continuation_rule"]:
         first = posixpath.join(run_dir_for(experiments_root, SEEDS[0]), "result.json")
         if not os.path.exists(first):
             raise JointError(f"seed {seed} needs the result of seed {SEEDS[0]} first")
@@ -330,11 +353,11 @@ def run_seed(seed, experiments_root, frames, parts, reference_arrays, identities
     check_data(*parts)
     aptos_train, aptos_val, eyepacs_train, eyepacs_val = parts
     expected, weights, sampled = class_weights(aptos_train, eyepacs_train, seed)
-    mapping = run_mapping(seed, weights, expected, identities["aptos"], identities["eyepacs"], repo_dir=repo_dir)
-    log(f"=== joint APTOS + EyePACS, seed {seed}: {state(run_dir)} | {run_dir}")
+    mapping = run_mapping(seed, weights, expected, identities["aptos"], identities["eyepacs"], repo_dir=repo_dir, arm=arm)
+    log(f"=== joint APTOS + EyePACS ({arm}), seed {seed}: {state(run_dir)} | {run_dir}")
     (train_fn or train_seed)(run_dir, seed, frames, parts, reference_arrays, weights, mapping, repo_dir=repo_dir,
-                             staging_dir=posixpath.join(staging_root, f"seed_{seed}"), log=log, mixed_precision=mixed_precision,
-                             image_size=image_size, max_epochs=max_epochs)
+                             staging_dir=posixpath.join(staging_root, f"{arm}_seed_{seed}"), log=log, mixed_precision=mixed_precision,
+                             image_size=image_size, max_epochs=max_epochs, arm=arm)
     if msr.read_stop_decision(run_dir) is None:
         raise JointError(f"{run_dir}: the run returned without a stop decision -- training is not finished")
     build = lambda: eat.build_compiled_model(seed, reference_arrays, weights, PROTOCOL, mixed_precision, image_size)      # noqa: E731
@@ -342,13 +365,16 @@ def run_seed(seed, experiments_root, frames, parts, reference_arrays, identities
     metrics_dir = posixpath.join(run_dir, "metrics")
     comparisons = {"aptos_val_vs_p": compare(posixpath.join(metrics_dir, "per_sample_best_aptos_val.csv"), references["p_aptos"]),
                    "eyepacs_val_vs_eyepacs_only": compare(posixpath.join(metrics_dir, "per_sample_best_eyepacs_val.csv"), references["eyepacs_only"])}
+    for key, name in (("joint_aptos", "aptos_val"), ("joint_eyepacs", "eyepacs_val")):      # the cropped arm against the direct arm
+        if arm == "crop" and references.get(key) and os.path.exists(references[key]):
+            comparisons[f"{name}_vs_direct_arm"] = compare(posixpath.join(metrics_dir, f"per_sample_best_{name}.csv"), references[key])
     history = sorted(os.listdir(posixpath.join(run_dir, "dual_validation"))) if os.path.isdir(posixpath.join(run_dir, "dual_validation")) else []
-    result = {"experiment": EXPERIMENT, "seed": seed, "selection": SELECTION, "class_weights": weights, "sampled_mixture": sampled,
+    result = {"experiment": EXPERIMENT, "arm": arm, "seed": seed, "selection": SELECTION, "class_weights": weights, "sampled_mixture": sampled,
               "best": evaluated, "comparisons": comparisons, "epochs_scored": len(history), "stop": msr.read_stop_decision(run_dir),
               "limitations": ["batch size 16 here against 2 for P: the comparison with P confounds joint data with batch size",
                               "both validation sets selected the checkpoint: their values are selection-set values",
                               "EyePACS validation is in-domain for this model: nothing here is evidence of generalisation to unseen data"]}
-    if seed == SEEDS[0]:
+    if seed == SEEDS[0] and ARMS[arm]["continuation_rule"]:
         result["continuation"] = continuation(comparisons["aptos_val_vs_p"], comparisons["eyepacs_val_vs_eyepacs_only"])
     with open(posixpath.join(run_dir, "result.json.tmp"), "w") as fh:
         json.dump(_plain(result), fh, indent=1)
