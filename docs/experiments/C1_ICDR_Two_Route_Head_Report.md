@@ -1,10 +1,10 @@
 # C1 — ICDR two-route Stage-8 head vs CORN refit on the frozen representation
 
-> **STATUS: PRE-REGISTERED, NOT YET RUN.** The implementation and unit tests are complete. No head
-> has been fitted on real data and **no result exists**. The run needs a Colab T4 with Drive
-> mounted, because the frozen backbones and caches are on Drive. It writes its own full report
-> (`REPORT.md`) and all artifacts to `experiments/C1_ICDRTwoRouteHead/<timestamp>/`. The results
-> sections below are to be transcribed from that run, never estimated.
+> **STATUS: COMPLETED (2026-09-27). Pre-registered verdict: NOT_SUPPORTIVE.**
+> Run: `experiments/C1_ICDRTwoRouteHead/2026-09-27_16-37-56/`, repo commit `1f6644e`. The results
+> below are transcribed from that run's `REPORT.md` and `results.json`. The full detailed analysis
+> (integrity, fit diagnostics, confusion matrices, per-image persistent-21 table) is in that
+> `REPORT.md`. Research record: §20.
 
 **Code**
 - `icdr_two_route_head.py`: the heads, the fitter and the probability construction.
@@ -161,17 +161,81 @@ Guardrails are applied to the 3-seed mean of (H2 − H1), with inclusive bounds:
 
 ## 12–14. Per-seed results, aggregate results, guardrails
 
-**Not yet run.** To be transcribed from the run's `REPORT.md` and `results.json`.
+**Population and integrity**
+- Population: 2,921 train (grades 1444/296/791/154/236) and 730 validation; NPDR route 2,685; PDR
+  route 2,921.
+- Backbone weights and Stage 5–7 + CORN fingerprints unchanged in 3/3 seeds.
+- Logit parity within tolerance: ≤ 7.8e-3 vs saved, ≤ 1.8e-2 for head(E) vs graph.
+- All 24 task fits converged.
+
+**Primary endpoint** (AUROC of each head's P(grade ≥ 3), grade 4 vs 0–2)
+
+| seed | H0 | H1 | H2 | Δ (H2 − H1) | 95 % CI |
+|---|---|---|---|---|---|
+| 42 | 0.9019 | 0.9110 | 0.9120 | +0.0011 | −0.006 to +0.008 |
+| 123 | 0.8907 | 0.9054 | 0.9031 | −0.0022 | −0.010 to +0.005 |
+| 2026 | 0.9059 | 0.9077 | 0.9104 | +0.0027 | −0.002 to +0.007 |
+
+Mean Δ **+0.0005** (SD 0.0025); paired bootstrap 95 % CI of the mean **−0.0044 to +0.0052**;
+positive in 2/3 seeds.
+
+**Secondary endpoints** (3-seed means)
+
+| metric | H0 | H1 | H2 | mean H2 − H1 |
+|---|---|---|---|---|
+| AUROC P(4), grade 4 vs 0–2 | 0.904 | 0.891 | 0.897 | +0.0055 |
+| AUROC P(≥3), grade 3 vs 0–2 | 0.906 | 0.943 | 0.938 | −0.0042 |
+| AUROC P(4), grade 4 vs 3 (descriptive) | 0.577 | 0.591 | 0.596 | +0.0053 |
+| Grade-4 recall | 0.161 | 0.316 | 0.270 | −0.0460 |
+| Grade-4 precision | 0.473 | 0.515 | 0.517 | +0.0013 |
+| Grade-3 recall | 0.436 | 0.479 | 0.385 | −0.0940 |
+| False-urgent rate, grades 0–2 | 0.049 | 0.059 | 0.032 | −0.0274 |
+| QWK | 0.821 | 0.846 | 0.836 | −0.0100 |
+| MAE | 0.350 | 0.317 | 0.312 | −0.0055 |
+| PDR decoded ≤ 2 (of 58) | 31.7 | 25.3 | 33.0 | +7.67 |
+| Persistent-21 still ≤ 2 | 21 | 18.7 | 19.7 | +1.0 |
+
+**Guardrails** (3-seed mean of H2 − H1; all hold):
+- grade-3 recall −0.0940 (bound −0.10; seeds 0.000 / −0.128 / −0.154);
+- grade-3-vs-(0–2) AUROC −0.0042;
+- QWK −0.0100;
+- false-urgent rate −0.0274.
+
+**What changed between H1 and H2.**
+- Grade-4 images moved from ≤ 2 to ≥ 3: **0 / 0 / 0**.
+- Grade-4 images moved from ≥ 3 to ≤ 2: 8 / 8 / 7.
+- Grades 0–2 no longer called urgent: 20 / 20 / 13.
 
 ## 15. Scientific interpretation
 
-**Not yet run.** The permitted wording is fixed in advance:
-- **SUPPORTIVE:** "The experiment supports the hypothesis that the CORN chain structure contributes
-  to PDR under-triage on the frozen representation."
-- **NOT_SUPPORTIVE:** "The experiment does not support the hypothesis that the output structure is
-  the main limiting factor on the frozen representation."
-- **TRADE_OFF / INCONCLUSIVE:** state exactly which endpoint moved and which guardrail or bar
-  prevented a conclusion.
+**The experiment does not support the hypothesis that the output structure is the main limiting
+factor on the frozen representation.**
+- **The null is precise.** The CI on the mean is about ±0.005, far narrower than the 3-vs-4
+  endpoint's noise (research record §17).
+- **The mechanism did not act as hypothesised.**
+  - Removing grade-4 supervision from the NPDR chain and deciding PDR on its own route rescued no
+    gated PDR image.
+  - The dedicated PDR score q, a 4-vs-all classifier fitted directly on E, stays below 0.30 in every
+    seed for 16 of the persistent-21 images.
+  - Only `b3819a805dca` and `6cfb7b44ef6f` exceed 0.5 in any seed. These are the two cases §15.2
+    flagged as having clear laser-scar-like spots.
+- **The failure is therefore located in the representation E, not in the ordinal output structure.**
+  E does not carry recognisable PDR evidence for these eyes.
+- **Refit effect (descriptive, not pre-registered).** H1 − H0: QWK +0.025, grade-4 recall +0.155.
+  This is recorded, not adopted.
+
+## 15a. Negative-result contribution
+
+A pre-registered, capacity-matched, representation-controlled test with a precise bound (±0.005).
+It relocates PDR under-triage from the CORN output structure to the representation. Whether
+end-to-end chain supervision shaped E (Level C) is not tested and remains future work.
+
+**Interpretation correction (2026-09-27; numbers and verdict unchanged).** Where §15 and §15a say the
+failure is "located in the representation E" or that the result "relocates" it there, read instead:
+C1 showed that modifying the Stage 8 output structure did not recover the observed Grade-4
+under-triage from the frozen Stage 5–7 representation. This motivates investigation of the upstream
+representation pathway but does not establish that Stage 5–7 is definitively the bottleneck.
+(Research record §20.1.)
 
 ## 16. Limitations
 
@@ -190,4 +254,9 @@ Guardrails are applied to the 3-seed mean of (H2 − H1), with inclusive bounds:
 
 ## 17. Final verdict
 
-**Not yet run.**
+**NOT_SUPPORTIVE** under the pre-registered rule: mean Δ +0.0005 < +0.01. The guardrails held.
+
+C1 (the output-structure / chain-gating hypothesis on the frozen representation) is **closed**. It
+is not rerun with another head, threshold, L2 or class weights.
+
+DDR was not used in this experiment and remains reserved for later external evaluation.
