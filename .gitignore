@@ -34,3 +34,17 @@ models/**/*.weights.h5
 # TensorFlow models above -- staged from Google Drive per the Colab
 # workflow instead; see SEGMENTATION_ARCHITECTURE.md Sec 6)
 models/vessel_segmentation/best_model.pth
+# Personal documents: reports, paper drafts, presentations, their figures and
+# generation work files -- never pushed
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.pdf
+docs/report/
+reference_report/
+research_papers/
+# review sheets built from dataset images
+research/**/*.png
+# superseded pre-registration (results are in the research record)
+docs/experiments/IDRiD_External_Evaluation_Report.md
