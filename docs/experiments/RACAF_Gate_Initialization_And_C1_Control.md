@@ -5872,3 +5872,21 @@ Descriptive: J-crop − P-EP on APTOS validation −0.0054 (−0.015 … +0.004)
 5. **The pre-declared order is unchanged.** J (direct) is the primary model; J-crop is the ablation (§94). The two are reported side by side on the external re-test and are not chosen between on it.
 
 **Status.** Both joint arms are complete: six pinned BEST checkpoints. The later stages (§96) can begin, starting with the external re-test protocol, which needs the user's approval before it is locked.
+
+## 99. External re-test of both joint arms on DDR and IDRiD — protocol (2026-10-14; written before any joint model has seen a DDR or IDRiD image; not run)
+
+**Decision taken by the user (2026-10-14).** Neither joint arm is pre-declared as the final model: "We will decide after reviewing the results." This replaces the declaration of §94 that J (direct) is primary. Consequence, stated now: both arms are compared with P with equal standing, and if one is later chosen as the final model from these external results, the choice is post hoc and the chosen arm's external estimate is optimistically biased; the paper must report it so.
+
+**Protocol.** `ddr_idrid_retest_protocol_v1.json`, SHA-256 `5fbc616b8eef3f7e6a4ab596b2e4cc6e1f3813aea873cf51db90a8ef33b47cc8`, written from the six runs' recorded BEST checkpoints with every checkpoint and reference-table hash read from Drive. The evaluator (`final_external_eval.py`) and notebook (`colab/notebooks/final_external_eval.ipynb`) load this file and re-verify every hash before any prediction.
+
+- **Use of the test sets.** A documented re-use: DDR's second grading use (after §86), IDRiD's fourth (after §61, §67, §79).
+- **Models.** J seeds 42 / 123 / 2026 (BEST epoch indices 19 / 18 / 29) and J-crop seeds 42 / 123 / 2026 (23 / 23 / 24), run here; P and P-EP from their stored per-image tables on the same images in the same order, not run again.
+- **Populations.** DDR: the pinned lists of `ddr_grading_protocol_v1.json` — primary 3,540, broader 3,725 as sensitivity (not untouched). IDRiD: the 103 images of `idrid_grading_protocol.json` — primary 100, all 103 as sensitivity.
+- **Preprocessing.** Each arm's own, unchanged from training: direct resize for J, the §89 crop rule for J-crop; both frames from one Stage-2 pass of each raw image. T4, mixed_float16, batch 8; CORN decode at 0.5; no test-time augmentation, threshold fitting or recalibration.
+- **Comparisons.** Main, equal standing: J − P and J-crop − P. Secondary, descriptive: J − P-EP, J-crop − P-EP, J-crop − J. Each main contrast is the mean over the three seed-labelled pairs of the QWK difference on the primary population, with a paired grade-stratified bootstrap (2,000 resamples, seed 20260927; one resample set for all tables of a population). Reading, per contrast: supported if the interval is wholly above zero, reversed if wholly below, otherwise no difference shown; seed-level inconsistency flagged. Two main contrasts per dataset, intervals not adjusted.
+- **Also reported.** Per-seed and mean QWK, per-cut AUROC, per-grade recall, referable-DR sensitivity and specificity, ECE, seed ensembles; on DDR both main contrasts inside each file-name family.
+- **Order.** Parity first: every joint model must reproduce its own stored APTOS validation table from the raw images through the same frame code (logits within 0.05, grades identical). Then DDR, then IDRiD, each once with its own confirmation token and lock.
+
+**What is fixed before the external data are read, and checked.** The checkpoints were chosen during training by the mean of the two development validation QWKs (§97, §98). The decode is the fixed 0.5 rule. Each arm's preprocessing is its training preprocessing. The populations and exclusions are those of the earlier protocols. No threshold, checkpoint, seed, crop parameter or preprocessing step can be set from an external result: the evaluator has no parameter for any of them. The EyePACS held-out test is not read.
+
+**Tests.** `tests/test_later_stages_models.py` and `tests/test_later_stages.py`: 9 passed (protocol written once and pinning every file, refusal of an unfinished run or a changed checkpoint, predictions for both arms from one Stage-2 pass, reference tables required to be the same images in the same order, the analysis with both main contrasts and the family split).

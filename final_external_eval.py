@@ -4,11 +4,13 @@ protocol file is written from their recorded checkpoints, and the user authorise
 
 This is a documented RE-USE of both test sets (DDR: second grading use, after §86; IDRiD: fourth, after §61, §67,
 §79). All settings are frozen on development data before either set is read again; nothing is selected or tuned
-on them, and J is the pre-declared primary model whatever J-crop shows (§94).
+on them. Neither joint arm is pre-declared primary (user decision of 2026-10-14, replacing §94): both are compared
+with P with equal standing, and any later choice between them made from these results is post hoc.
 
 Order, enforced:
-  1. `make_protocol`  -- after the six joint runs are complete: pins their BEST checkpoints (from each run's
-                         result.json) and the stored P / P-EP per-image tables of the earlier runs by SHA-256.
+  1. the protocol   -- `ddr_idrid_retest_protocol_v1.json` in the repository, written once from the six runs'
+                         recorded BEST checkpoints and the stored P / P-EP tables (all by SHA-256), committed before
+                         any external image is read (`build_protocol`; `make_protocol` does the same on Colab).
   2. `parity`         -- every joint model must reproduce its own stored APTOS validation table from the RAW
                          images through the same frame code used for the external images. No external image read.
   3. `run_ddr` / `run_idrid` -- once each, with the dataset's confirmation token; a lock is written before any
@@ -33,13 +35,15 @@ import idrid_grading_eval as ig
 import joint_train as jt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROTOCOL_PATH = os.path.join(HERE, "final_external_protocol_v1.json")
+PROTOCOL_PATH = os.path.join(HERE, "ddr_idrid_retest_protocol_v1.json")
 SEEDS = jt.SEEDS
 ARMS = {"j": "direct", "jc": "crop"}                       # model name -> joint arm
 REFERENCES = ("p", "p_ep")                                 # reused from the earlier runs' stored tables, not run again
 MODELS = REFERENCES + tuple(ARMS)
-CONTRASTS = {"j_minus_p": ("j", "p"), "j_minus_p_ep": ("j", "p_ep"), "jc_minus_j": ("jc", "j"), "jc_minus_p": ("jc", "p")}
-PRIMARY = "j_minus_p"
+CONTRASTS = {"j_minus_p": ("j", "p"), "jc_minus_p": ("jc", "p"), "j_minus_p_ep": ("j", "p_ep"), "jc_minus_p_ep": ("jc", "p_ep"),
+             "jc_minus_j": ("jc", "j")}
+MAIN = ("j_minus_p", "jc_minus_p")                         # both joint arms against P, equal standing; no single primary
+PRIMARY = MAIN                                             # (name kept for the metric block's role labels)
 TOKENS = {"ddr": "RETEST_DDR_WITH_THE_JOINT_MODELS_ONCE", "idrid": "RETEST_IDRID_WITH_THE_JOINT_MODELS_ONCE"}
 OUT = {"ddr": "experiments/DDRGrading", "idrid": "experiments/IDRiDGrading"}
 PREFIX = "final_external_v1_"
@@ -64,8 +68,8 @@ def _root(drive_root, rel):
 # --------------------------------------------------------------------------- protocol (written once, after training)
 
 def make_protocol(drive_root, path=PROTOCOL_PATH):
-    """Writes the protocol from what the six joint runs recorded. Refuses unless every run is complete, and
-    refuses to overwrite an existing protocol file."""
+    """Writes the protocol from what the six joint runs recorded (on a mounted Drive). Refuses unless every run is
+    complete, and refuses to overwrite an existing protocol file."""
     if os.path.exists(path):
         raise ProtocolError(f"{path} already exists; a protocol is written once")
     experiments = _root(drive_root, "experiments")
@@ -86,42 +90,58 @@ def make_protocol(drive_root, path=PROTOCOL_PATH):
         raise ProtocolError("seed 42 of the direct arm did not meet its continuation rule")
     stored = {name: {f"{m}_seed{s}": {"path": STORED[name][m].format(seed=s), "sha256": ig.sha256_file(_root(drive_root, STORED[name][m].format(seed=s)))}
                      for m in REFERENCES for s in SEEDS} for name in STORED}
+    protocol = build_protocol(checkpoints, stored, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"))
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(protocol, fh, indent=1, ensure_ascii=False)
+        fh.write("\n")
+    return protocol, ig.sha256_file(path)
+
+
+def build_protocol(checkpoints, stored, prepared):
+    """The protocol from the six pinned checkpoints and the stored reference tables (both already verified)."""
     ddr_protocol, ddr_sha, parent = ev.load_protocol()
-    protocol = {
+    return {
         "name": "External re-test of the frozen joint graders J and J-crop on DDR and IDRiD", "version": 1,
-        "prepared": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"), "research_record_section": "§96",
+        "prepared": prepared, "research_record_section": "§99 (plan: §96)",
         "parent_protocols": {"ddr_grading_protocol_v1.json": ddr_sha, "idrid_grading_protocol.json": ddr_protocol["parent_protocol"]["sha256"]},
         "seeds": list(SEEDS), "checkpoints": checkpoints, "stored_reference_tables": stored,
         "models": {"p": "ImageNet ConvNeXt-Tiny + CORN, APTOS only; stored predictions reused, not run",
                    "p_ep": "EyePACS-adapted encoder, APTOS fine-tuned; stored predictions reused, not run",
-                   "j": "joint APTOS + EyePACS, direct-resize frames (record 93) -- the pre-declared primary model",
-                   "jc": "joint APTOS + EyePACS, fundus-cropped frames (record 94) -- ablation"},
+                   "j": "joint APTOS + EyePACS, direct-resize frames (record 93, 97)",
+                   "jc": "joint APTOS + EyePACS, fundus-cropped frames (record 94, 98)"},
         "pipeline": {"direct": "Stage 2 once, full-frame resize to 512", "crop": "Stage 2 once, cut to the fundus box (rule of record 89), resize to 512",
                      "inference": "the parent protocol's settings (T4, mixed_float16, batch 8); CORN decode at 0.5; no TTA, no threshold fitting, no recalibration"},
         "populations": {"ddr": "the pinned lists of ddr_grading_protocol_v1.json: primary 3,540; broader 3,725 as sensitivity",
                         "idrid": "the 103 images of idrid_grading_protocol.json: primary 100; all 103 as sensitivity"},
-        "comparisons": {"primary": [PRIMARY], "secondary_descriptive": [c for c in CONTRASTS if c != PRIMARY]},
-        "analysis": {"primary_estimate": "mean over the three seed-labelled pairs of QWK(J) - QWK(P), on each dataset's primary population",
+        "comparisons": {"main": list(MAIN), "secondary_descriptive": [c for c in CONTRASTS if c not in MAIN],
+                        "standing": "the two main contrasts have equal standing; neither joint arm is the pre-declared final model",
+                        "multiplicity": "two main contrasts per dataset; intervals are not adjusted for multiplicity and are reported as such"},
+        "analysis": {"main_estimate": "for each joint arm: mean over the three seed-labelled pairs of QWK(arm) - QWK(P), on each dataset's primary population",
                      "bootstrap": {"method": "paired, grade-stratified over images", "n_boot": ph.N_BOOT, "seed": ph.BOOT_SEED},
-                     "reading": "supported if the 95 % interval lies wholly above zero; reversed if wholly below; otherwise no difference shown. "
-                                "Seed-level inconsistency is flagged when any of the three differences is not positive",
+                     "reading": "for each main contrast separately: supported if the 95 % interval lies wholly above zero; reversed if wholly below; "
+                                "otherwise no difference shown. Seed-level inconsistency is flagged when any of the three differences is not positive",
+                     "pairing": "every model is scored on the same images in the same order; seed-labelled pairs (42, 123, 2026); one set of bootstrap "
+                                "resamples is applied to all tables of a population",
                      "also_reported": "per-seed and mean QWK, per-cut AUROC, per-grade recall, referable-DR sensitivity and specificity, ECE, seed ensemble; "
-                                      "on DDR the primary contrast inside each file-name family"},
+                                      "on DDR both main contrasts inside each file-name family"},
+        "what_is_fixed_beforehand": ["the six checkpoints: BEST by the mean of the APTOS and EyePACS validation QWK, chosen during training (records 97, 98)",
+                                     "the decode: CORN, cumulative probability above 0.5; no threshold is fitted on any external image",
+                                     "the preprocessing of each arm: unchanged from training (direct resize, or the record-89 crop rule)",
+                                     "the populations and their exclusions: those of the earlier protocols, unchanged",
+                                     "P and P-EP: their stored predictions, unchanged"],
         "disclosures": [
             "This is a re-use of both test sets: DDR was used once for grading (record 86), IDRiD three times (records 61, 67, 79).",
             "The earlier results on both sets were known when joint training was chosen; the audits that led to it drew on DDR's failure pattern.",
             "No setting of J or J-crop was chosen on either set; both were trained and selected on APTOS and EyePACS development data only.",
-            "J is the pre-declared primary model; J-crop is reported as an ablation and is not preferred on the basis of these results.",
+            "Neither joint arm is pre-declared primary (user decision, 2026-10-14, replacing the J-primary declaration of record 94). If one arm is later "
+            "chosen as the final model from these results, that choice is post hoc and the chosen arm's external estimate is optimistically biased.",
+            "The EyePACS held-out test is not read by this evaluation.",
             "P's batch size was 2 and the joint models' 16: J - P confounds joint data with batch size.",
             "On DDR, file-name family is tied to grade; DDR has no patient identifiers; intervals are conditional on the fixed checkpoints.",
             "IDRiD's primary set has 100 images.", "No clinical-utility, equivalence or non-inferiority claim is made."],
         "rules": ["evaluation only", "no tuning", "no threshold changes", "no checkpoint or seed selection", "one run per dataset",
                   "a rerun only for a technical failure, with the reason recorded"],
         "confirmation_tokens": dict(TOKENS)}
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(protocol, fh, indent=1, ensure_ascii=False)
-        fh.write("\n")
-    return protocol, ig.sha256_file(path)
 
 
 def load_protocol(path=PROTOCOL_PATH):
@@ -129,7 +149,7 @@ def load_protocol(path=PROTOCOL_PATH):
     expected = {f"{m}_seed{s}" for m in ARMS for s in SEEDS}
     if set(protocol["checkpoints"]) != expected or len({e["sha256"] for e in protocol["checkpoints"].values()}) != len(expected):
         raise ProtocolError("the protocol must pin exactly the six joint checkpoints")
-    if protocol["comparisons"]["primary"] != [PRIMARY] or protocol["confirmation_tokens"] != TOKENS:
+    if protocol["comparisons"]["main"] != list(MAIN) or protocol["confirmation_tokens"] != TOKENS:
         raise ProtocolError("the protocol is not this evaluation's")
     ddr_protocol, ddr_sha, parent = ev.load_protocol()
     if protocol["parent_protocols"]["ddr_grading_protocol_v1.json"] != ddr_sha:
@@ -218,7 +238,7 @@ def analyse(tables, frames, mask, families=None):
         contrasts[name] = d
     ensemble = {m: ev.ensemble_table(tables, m) for m in MODELS}
     out = {"n": int(mask.sum()), "grade_counts": np.bincount(grades, minlength=5).tolist(), "contrasts_qwk": contrasts,
-           "metric_block": b1.summarise(tables, mask, models=MODELS, contrasts=CONTRASTS, primary=(PRIMARY,)),
+           "metric_block": b1.summarise(tables, mask, models=MODELS, contrasts=CONTRASTS, primary=MAIN),
            "seed_ensemble_qwk": {m: ph._fast_qwk(grades, ensemble[m]["pred"][mask]) for m in MODELS},
            "referable_dr": {m: {str(s): ev.referable(ev.subset(tables[s][m], mask)) for s in SEEDS} for m in MODELS},
            "calibration": {m: {str(s): ev.calibration(frames[(m, s)][mask]) for s in SEEDS} for m in MODELS}}
@@ -226,8 +246,8 @@ def analyse(tables, frames, mask, families=None):
         out["by_family"] = {}
         for family in ("timestamp", "007"):
             inside = mask & (families == family)
-            out["by_family"][family] = {"n": int(inside.sum()),
-                                        PRIMARY: ev.qwk_difference(tables, "j", "p", inside, ph.bootstrap_indices(tables[SEEDS[0]]["p"]["grade"][inside]))}
+            family_indices = ph.bootstrap_indices(tables[SEEDS[0]]["p"]["grade"][inside])
+            out["by_family"][family] = {"n": int(inside.sum()), **{name: ev.qwk_difference(tables, *CONTRASTS[name], inside, family_indices) for name in MAIN}}
         out["by_family"]["limit"] = "grade 0 and grade 4 are never in both families: this cannot show independence of source"
     return out
 

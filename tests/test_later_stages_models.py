@@ -99,7 +99,9 @@ class ExternalEvalTests(unittest.TestCase):
     def test_the_protocol_is_written_once_from_the_six_runs_and_pins_everything(self):
         protocol, sha = fx.make_protocol(self.drive, self.protocol_path)
         self.assertEqual(sorted(protocol["checkpoints"]), sorted(f"{m}_seed{s}" for m in fx.ARMS for s in fx.SEEDS))
-        self.assertEqual(protocol["comparisons"]["primary"], ["j_minus_p"])
+        self.assertEqual(protocol["comparisons"]["main"], ["j_minus_p", "jc_minus_p"])
+        self.assertIn("equal standing", protocol["comparisons"]["standing"])
+        self.assertTrue(any("post hoc" in d for d in protocol["disclosures"]))
         self.assertTrue(any("re-use" in d for d in protocol["disclosures"]))
         with self.assertRaises(fx.ProtocolError):                         # written once
             fx.make_protocol(self.drive, self.protocol_path)
@@ -141,6 +143,9 @@ class ExternalEvalTests(unittest.TestCase):
         self.assertEqual(sorted(out["contrasts_qwk"]), sorted(fx.CONTRASTS))
         self.assertIn(out["contrasts_qwk"]["j_minus_p"]["reading"].split(":")[0], ("supported", "reversed", "no difference shown"))
         self.assertEqual(out["metric_block"]["paired_differences"]["j_minus_p"]["role"], "primary")
+        self.assertEqual(out["metric_block"]["paired_differences"]["jc_minus_p"]["role"], "primary")
+        self.assertEqual(out["metric_block"]["paired_differences"]["jc_minus_j"]["role"], "secondary, descriptive")
+        self.assertEqual(sorted(out["by_family"]["007"]), ["j_minus_p", "jc_minus_p", "n"])
         self.assertEqual(sorted(out["by_family"]), ["007", "limit", "timestamp"])
         with self.assertRaises(fx.ProtocolError):                         # stored tables of other images
             fx._tables(self.drive, protocol, "ddr", list(reversed(self.ids)), self.grades, logits)

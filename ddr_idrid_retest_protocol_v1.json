@@ -1,0 +1,194 @@
+{
+ "name": "External re-test of the frozen joint graders J and J-crop on DDR and IDRiD",
+ "version": 1,
+ "prepared": "2026-10-14",
+ "research_record_section": "§99 (plan: §96)",
+ "parent_protocols": {
+  "ddr_grading_protocol_v1.json": "38eb810f05d427c2585a0bf24aae493ee0407727935d9594f8e926773ec9c192",
+  "idrid_grading_protocol.json": "f93c1237eb81ab20397dea8bc6d9079871d6308578304f793dfabee17938587e"
+ },
+ "seeds": [
+  42,
+  123,
+  2026
+ ],
+ "checkpoints": {
+  "j_seed42": {
+   "arm": "direct",
+   "seed": 42,
+   "path": "experiments/JointAptosEyePACS/j_seed42/checkpoints/best_a/model.weights.h5",
+   "sha256": "b6cc2820de99a34969459c251336c5e80d2a277eca995cf8489b20c2b8881ef8",
+   "run_dir": "experiments/JointAptosEyePACS/j_seed42",
+   "best_epoch_index": 19,
+   "validation_table": "experiments/JointAptosEyePACS/j_seed42/metrics/per_sample_best_aptos_val.csv"
+  },
+  "j_seed123": {
+   "arm": "direct",
+   "seed": 123,
+   "path": "experiments/JointAptosEyePACS/j_seed123/checkpoints/best_b/model.weights.h5",
+   "sha256": "ec286b4bb613c647e097d3095388c736308a6b0ebe5ce0ee5e58e0bae931e203",
+   "run_dir": "experiments/JointAptosEyePACS/j_seed123",
+   "best_epoch_index": 18,
+   "validation_table": "experiments/JointAptosEyePACS/j_seed123/metrics/per_sample_best_aptos_val.csv"
+  },
+  "j_seed2026": {
+   "arm": "direct",
+   "seed": 2026,
+   "path": "experiments/JointAptosEyePACS/j_seed2026/checkpoints/best_a/model.weights.h5",
+   "sha256": "cd60d3afa990a8db0852e47845582860eeb153cc75dd63e223f20095d76612bc",
+   "run_dir": "experiments/JointAptosEyePACS/j_seed2026",
+   "best_epoch_index": 29,
+   "validation_table": "experiments/JointAptosEyePACS/j_seed2026/metrics/per_sample_best_aptos_val.csv"
+  },
+  "jc_seed42": {
+   "arm": "crop",
+   "seed": 42,
+   "path": "experiments/JointAptosEyePACS/jc_seed42/checkpoints/best_b/model.weights.h5",
+   "sha256": "28288ab4e8e1e08dbf6b5e6506a5f8ec4a7a6e98f0e9a2001d1ad64e823d9f2d",
+   "run_dir": "experiments/JointAptosEyePACS/jc_seed42",
+   "best_epoch_index": 23,
+   "validation_table": "experiments/JointAptosEyePACS/jc_seed42/metrics/per_sample_best_aptos_val.csv"
+  },
+  "jc_seed123": {
+   "arm": "crop",
+   "seed": 123,
+   "path": "experiments/JointAptosEyePACS/jc_seed123/checkpoints/best_a/model.weights.h5",
+   "sha256": "d8451f3dc89a33fa9bb670f16af6f7748225f71b31ee6d71a8b758623e4393e9",
+   "run_dir": "experiments/JointAptosEyePACS/jc_seed123",
+   "best_epoch_index": 23,
+   "validation_table": "experiments/JointAptosEyePACS/jc_seed123/metrics/per_sample_best_aptos_val.csv"
+  },
+  "jc_seed2026": {
+   "arm": "crop",
+   "seed": 2026,
+   "path": "experiments/JointAptosEyePACS/jc_seed2026/checkpoints/best_a/model.weights.h5",
+   "sha256": "c0194f0528e0e9185f5d12470e84d5d65b11d4e929c824f810d3d498234040a8",
+   "run_dir": "experiments/JointAptosEyePACS/jc_seed2026",
+   "best_epoch_index": 24,
+   "validation_table": "experiments/JointAptosEyePACS/jc_seed2026/metrics/per_sample_best_aptos_val.csv"
+  }
+ },
+ "stored_reference_tables": {
+  "ddr": {
+   "p_seed42": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_seed42.csv",
+    "sha256": "389cfd63d3822dade24e61aa88f4a0d0b71ef84c6eb97ccc0ae9489cffbf8b32"
+   },
+   "p_seed123": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_seed123.csv",
+    "sha256": "5375d44d9dbf91f7038c75b1fd47126cdc13978afe2ba6859320237d3db9a5cd"
+   },
+   "p_seed2026": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_seed2026.csv",
+    "sha256": "3448263346c1c142fe482c8b26cb4ce306a6e3d2807d921b0959f4d6d5d3681d"
+   },
+   "p_ep_seed42": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_ep_seed42.csv",
+    "sha256": "20aa84e46df5ef5f5a584b3ac589b03c0fd083722199aa10b1be44cd654e0e4d"
+   },
+   "p_ep_seed123": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_ep_seed123.csv",
+    "sha256": "b2a90d2f519680416cc6c4f96f714ef03760128d7668d15d59d0e3a8a56a95eb"
+   },
+   "p_ep_seed2026": {
+    "path": "experiments/DDRGrading/ddr_grading_v1_38eb810f05d4_2026-10-11_12-50-12/per_image_p_ep_seed2026.csv",
+    "sha256": "fe3ead63e391056a49e05f6f99160b3e450c063174cfa3b3d8c814edd96faa8a"
+   }
+  },
+  "idrid": {
+   "p_seed42": {
+    "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed42.csv",
+    "sha256": "579d4079d1df8912c800d0c0ea25a4021d2230bf71c8da54511a956ce5b47822"
+   },
+   "p_seed123": {
+    "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed123.csv",
+    "sha256": "070f15898b6694f03d1b4dd0574ae3001fbd5d7d0276b460e6f4a79855ac4aa9"
+   },
+   "p_seed2026": {
+    "path": "experiments/IDRiDGrading/idrid_grading_f93c1237eb81_2026-10-05_13-28-16/per_image_p_seed2026.csv",
+    "sha256": "cedd6563278e164c425091f0f08e5d449faef065c34c1d850b29d2cea6cc99b0"
+   },
+   "p_ep_seed42": {
+    "path": "experiments/IDRiDGrading/idrid_batch2_ep_5ea937c4edb8_2026-10-11_07-24-10/per_image_p_ep_seed42.csv",
+    "sha256": "6a38159d2022046af01e63faa403e448b31bb618428225e70d437b9fdaddae25"
+   },
+   "p_ep_seed123": {
+    "path": "experiments/IDRiDGrading/idrid_batch2_ep_5ea937c4edb8_2026-10-11_07-24-10/per_image_p_ep_seed123.csv",
+    "sha256": "29ed66c14d68ee97e0e94c8adeded368ef66539ba7f90a2d6ac7741bd72fbd50"
+   },
+   "p_ep_seed2026": {
+    "path": "experiments/IDRiDGrading/idrid_batch2_ep_5ea937c4edb8_2026-10-11_07-24-10/per_image_p_ep_seed2026.csv",
+    "sha256": "f7653e223dab97a433fb9bfe738181b803c36b2bd5d605aefba2945309b456e1"
+   }
+  }
+ },
+ "models": {
+  "p": "ImageNet ConvNeXt-Tiny + CORN, APTOS only; stored predictions reused, not run",
+  "p_ep": "EyePACS-adapted encoder, APTOS fine-tuned; stored predictions reused, not run",
+  "j": "joint APTOS + EyePACS, direct-resize frames (record 93, 97)",
+  "jc": "joint APTOS + EyePACS, fundus-cropped frames (record 94, 98)"
+ },
+ "pipeline": {
+  "direct": "Stage 2 once, full-frame resize to 512",
+  "crop": "Stage 2 once, cut to the fundus box (rule of record 89), resize to 512",
+  "inference": "the parent protocol's settings (T4, mixed_float16, batch 8); CORN decode at 0.5; no TTA, no threshold fitting, no recalibration"
+ },
+ "populations": {
+  "ddr": "the pinned lists of ddr_grading_protocol_v1.json: primary 3,540; broader 3,725 as sensitivity",
+  "idrid": "the 103 images of idrid_grading_protocol.json: primary 100; all 103 as sensitivity"
+ },
+ "comparisons": {
+  "main": [
+   "j_minus_p",
+   "jc_minus_p"
+  ],
+  "secondary_descriptive": [
+   "j_minus_p_ep",
+   "jc_minus_p_ep",
+   "jc_minus_j"
+  ],
+  "standing": "the two main contrasts have equal standing; neither joint arm is the pre-declared final model",
+  "multiplicity": "two main contrasts per dataset; intervals are not adjusted for multiplicity and are reported as such"
+ },
+ "analysis": {
+  "main_estimate": "for each joint arm: mean over the three seed-labelled pairs of QWK(arm) - QWK(P), on each dataset's primary population",
+  "bootstrap": {
+   "method": "paired, grade-stratified over images",
+   "n_boot": 2000,
+   "seed": 20260927
+  },
+  "reading": "for each main contrast separately: supported if the 95 % interval lies wholly above zero; reversed if wholly below; otherwise no difference shown. Seed-level inconsistency is flagged when any of the three differences is not positive",
+  "pairing": "every model is scored on the same images in the same order; seed-labelled pairs (42, 123, 2026); one set of bootstrap resamples is applied to all tables of a population",
+  "also_reported": "per-seed and mean QWK, per-cut AUROC, per-grade recall, referable-DR sensitivity and specificity, ECE, seed ensemble; on DDR both main contrasts inside each file-name family"
+ },
+ "what_is_fixed_beforehand": [
+  "the six checkpoints: BEST by the mean of the APTOS and EyePACS validation QWK, chosen during training (records 97, 98)",
+  "the decode: CORN, cumulative probability above 0.5; no threshold is fitted on any external image",
+  "the preprocessing of each arm: unchanged from training (direct resize, or the record-89 crop rule)",
+  "the populations and their exclusions: those of the earlier protocols, unchanged",
+  "P and P-EP: their stored predictions, unchanged"
+ ],
+ "disclosures": [
+  "This is a re-use of both test sets: DDR was used once for grading (record 86), IDRiD three times (records 61, 67, 79).",
+  "The earlier results on both sets were known when joint training was chosen; the audits that led to it drew on DDR's failure pattern.",
+  "No setting of J or J-crop was chosen on either set; both were trained and selected on APTOS and EyePACS development data only.",
+  "Neither joint arm is pre-declared primary (user decision, 2026-10-14, replacing the J-primary declaration of record 94). If one arm is later chosen as the final model from these results, that choice is post hoc and the chosen arm's external estimate is optimistically biased.",
+  "The EyePACS held-out test is not read by this evaluation.",
+  "P's batch size was 2 and the joint models' 16: J - P confounds joint data with batch size.",
+  "On DDR, file-name family is tied to grade; DDR has no patient identifiers; intervals are conditional on the fixed checkpoints.",
+  "IDRiD's primary set has 100 images.",
+  "No clinical-utility, equivalence or non-inferiority claim is made."
+ ],
+ "rules": [
+  "evaluation only",
+  "no tuning",
+  "no threshold changes",
+  "no checkpoint or seed selection",
+  "one run per dataset",
+  "a rerun only for a technical failure, with the reason recorded"
+ ],
+ "confirmation_tokens": {
+  "ddr": "RETEST_DDR_WITH_THE_JOINT_MODELS_ONCE",
+  "idrid": "RETEST_IDRID_WITH_THE_JOINT_MODELS_ONCE"
+ }
+}
