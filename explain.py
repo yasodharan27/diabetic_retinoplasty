@@ -57,7 +57,7 @@ def p_model_fn(p_model, batch_size=16):
 
 # --------------------------------------------------------------------------- Integrated Gradients
 
-def integrated_gradients(grad_model, rgb, cut=None, steps=32, baseline=None, batch=8):
+def integrated_gradients(grad_model, rgb, cut=None, steps=32, baseline=None, batch=2):
     """Integrated Gradients (Sundararajan et al., 2017) from `baseline` (default: black) with a midpoint Riemann sum
     of `steps` points. Returns (attribution (H, W, 3) for ONE image, completeness gap = |sum(attr) - (s(x) - s(x0))|,
     map (H, W) = sum over channels of |attr|, scaled to [0, 1])."""
