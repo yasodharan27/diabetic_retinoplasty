@@ -1,401 +1,207 @@
-# Diabetic Retinopathy Detection
+# Diabetic Retinopathy Grading from Fundus Photographs
 
-[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.9%2B-FF6F00?style=flat-square&logo=tensorflow)](https://www.tensorflow.org/)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
-[![Deep Learning](https://img.shields.io/badge/Deep%20Learning-AI-9cf?style=flat-square&logo=pytorch)](https://github.com/yourusername/diabetic-retinopathy-detection)
+A staged pipeline that grades diabetic retinopathy (ICDR grades 0–4) from a single colour fundus photograph,
+together with an image-quality check, vessel and lesion maps, a seed-ensemble uncertainty estimate and
+explanation maps. The grader is a ConvNeXt-Tiny with a CORN ordinal head, trained jointly on APTOS 2019 and
+EyePACS and tested externally on DDR and IDRiD.
 
-A hybrid deep learning framework for automated diabetic retinopathy detection with uncertainty quantification and explainability.
+This repository is the full research workspace: every model, experiment, protocol and result of the project,
+including the lines of work that were tested and not adopted. The complete chronological evidence is the
+research record, [`docs/experiments/RACAF_Gate_Initialization_And_C1_Control.md`](docs/experiments/RACAF_Gate_Initialization_And_C1_Control.md).
 
-![Diabetic Retinopathy System](assets/research_summary_dashboard.png)
+> Research prototype. It is not a medical device and its output is not a diagnosis.
 
-> **Repository status:** this repository contains two things side by side -- the **original
-> baseline** (documented in the sections below: APTOS-only, Ben Graham preprocessing, the
-> EfficientNet+Swin hybrid model, GAN augmentation, MC Dropout, Grad-CAM) and the **actively
-> developed target architecture**, an 11-stage pipeline being built out incrementally per
-> `PROJECT_CODE.md`. See [Repository Status & Target Architecture](#-repository-status--target-architecture)
-> below for what's real today versus planned, before relying on anything described further down.
+## Contents
+- [Pipeline](#pipeline)
+- [Results](#results)
+- [Datasets](#datasets)
+- [Repository layout](#repository-layout)
+- [Running it](#running-it)
+- [What was tested and not adopted](#what-was-tested-and-not-adopted)
+- [Limitations](#limitations)
+- [References](#references)
 
-## 📋 Table of Contents
-
-- [Repository Status & Target Architecture](#-repository-status--target-architecture)
-  - [Master Pipeline](#master-pipeline)
-  - [Dataset Summary](#dataset-summary)
-  - [Folder Structure](#folder-structure)
-  - [Development Workflow](#development-workflow)
-  - [Training Workflow](#training-workflow)
-  - [Experiment Workflow](#experiment-workflow)
-  - [Current Implementation Status](#current-implementation-status)
-  - [Future Roadmap](#future-roadmap)
-- [Baseline Overview](#-overview)
-- [Baseline Features](#-features)
-- [Baseline Model Architecture](#-model-architecture)
-- [Baseline Dataset](#-dataset)
-- [Installation](#-installation)
-- [Baseline Usage](#-usage)
-- [Baseline Results](#-results)
-- [Future Work (baseline)](#-future-work)
-- [References](#-references)
-- [Contributing](#-contributing)
-
----
-
-## 🏛️ Repository Status & Target Architecture
-
-> **Status (updated 2026-10-08).** Stages 1–4 are built and frozen (Stage 4 as the v2 SE-ResNet-101 U-Net).
-> The original Stage 5–8 design below (multi-kernel CNN, Swin, cross-attention, RACAF) was implemented and
-> trained; RACAF closed without a supported benefit. The reference grader is now **P** (ImageNet ConvNeXt-Tiny +
-> CORN, RGB; APTOS validation QWK 0.917) and the current research model is **E1** (P + an auxiliary lesion head
-> trained on Stage-4 targets; QWK 0.918, comparable to P, with a demonstrated change in the representation).
-> The authoritative summary of results and the approved plan is `PROJECT_CODE.md`, section "Current Project State
-> and Plan"; the full evidence is `docs/experiments/RACAF_Gate_Initialization_And_C1_Control.md`.
-
-The target architecture is an 11-stage, end-to-end diabetic retinopathy pipeline -- full detail
-in `PROJECT_CODE.md` (rules and target design), `PROJECT_STRUCTURE.md` (master architectural
-reference: every folder's purpose, every stage's input/output/dataset/status, output locations,
-and the project rules), and `SEGMENTATION_ARCHITECTURE.md` (Vessel/Lesion Segmentation design,
-including tensor contracts). This section is a summary; those documents are authoritative.
-
-### Master Pipeline
-
-This is the repository's single, canonical end-to-end architecture diagram — every other document
-references this one rather than repeating a diverging copy. It shows the **original design**; the pipeline as
-built is given directly after it.
+## Pipeline
 
 ```
- [1] Image Quality Assessment  --(Good/Usable only)-->  [2] Image Preprocessing
-                                                                  |
+ fundus photograph
+   |
+ [1] Image quality      EfficientNet-B0 trained on EyeQ (Good / Usable / Reject)
+ [2] Preprocessing      gamma 1.2, then CLAHE (clip 2.0, 8 x 8 tiles) on the LAB lightness channel;
+                        fundus bounding-box crop; resize to 512 x 512
+   |------------------------------.------------------------------.
+ [3] Vessel map                [4] Lesion maps                    |
+     pretrained LWNet              SE-ResNet-101 U-Net:            |
+     (inference only)              microaneurysms, haemorrhages,  |
+                                   hard and soft exudates         |
+     (shown as supporting outputs; the grade does not use them)   |
                                                                   v
-                                          [3] Vessel Segmentation (pretrained LWNet, inference only)
-                                                                  |
-                                                                  v
-                                          [4] Lesion Segmentation (trained on IDRiD)
-                                                                  |
-                        +-----------------------------------------+
-                        v                                         v
-        [5] Local Feature Extraction              [6] Global Feature Extraction
-           (Adaptive Multi-Kernel CNN)               (Dual-Scale Swin Transformer)
-                        |                                         |
-                        +-----------------> [7] Feature Fusion <--+
-                                          (Adaptive Cross-Attention)
-                                                    |
-                                                    v
-                                    [8] CORN Ordinal Classification
-                                        (trained on APTOS 2019)
-                        +---------------------------+---------------------------+
-                        v                                                       v
-        [9] Uncertainty Estimation                                [10] Explainability
-           (Monte Carlo Dropout)                          (Grad-CAM++, SHAP, Attention Rollout)
-                        |                                                       |
-                        +---------------------------+---------------------------+
-                                                    v
-                                          [11] Evaluation
-                                (end-to-end, held-out test set, real metrics only)
+ [5] Grader             ConvNeXt-Tiny (ImageNet) + CORN ordinal head, three seeds (42, 123, 2026)
+ [6] Uncertainty        three-seed ensemble entropy and disagreement; test-time augmentation (8 flips/rotations)
+ [7] Explanations       Grad-CAM, Integrated Gradients, Occlusion; superpixel Kernel SHAP for figures
 ```
 
-Every stage depends only on the stage(s) immediately before it — no stage bypasses another. See `PROJECT_STRUCTURE.md`'s "Stage Dependencies" section for the explicit dependency chain.
+**Grader training.** Joint APTOS 2019 + EyePACS training with two EyePACS images per APTOS image in every
+epoch (2,921 + 5,842), batch 16, AdamW (learning rate 1e-4, weight decay 0.05), class-weighted CORN loss,
+early stopping, and checkpoint selection on the mean of the APTOS-validation QWK (730 images) and the
+EyePACS-validation QWK (3,512 images). Two input variants were trained with three seeds each: the full frame
+resized to 512 (**J**) and the fundus bounding box cropped first (**J-crop**). The decoded grade is the number
+of CORN cumulative probabilities above 0.5.
 
-**Pipeline as built (2026-10-08):**
+**Final model.** J-crop, chosen after the external re-test below (see [Limitations](#limitations)).
 
-```
- [1] IQA (EfficientNetB0, frozen; not in the grading graph)
- [2] Preprocessing: gamma + CLAHE, once, native size  -->  full-frame resize to 512 x 512 RGB
-        |                                   |
-        |                                   +--> [3] LWNet vessel map (frozen)      } teachers / inputs of the
-        |                                   +--> [4] Stage-4 v2 lesion maps (frozen) } segmentation-based models
-        v
- Graders (CORN ordinal decoding):
-   P   ConvNeXt-Tiny on RGB                                              reference baseline
-   E1  P + 1x1 lesion head on the final feature map, Stage-4 targets     current research model
-   E2  E1 with shuffled lesion targets                                   control
-   (earlier lines, completed: original Stage 5-8 +/- RACAF, PL, Architecture 1, pathology grader, fixed fusions)
- [9]-[11] uncertainty, explainability, final evaluation: not started for the current models
-```
+## Results
 
-### Dataset Summary
+### Development (validation sets, mean of three seeds)
 
-| Dataset | Used by | Status |
+| Model | APTOS validation QWK | EyePACS validation QWK |
 |---|---|---|
-| **EyeQ** | Stage 1 (Image Quality Assessment) — used only for Stage 1 | Local copy present, verified (`colab/common/verify_dataset.py`) |
-| **APTOS 2019** | All grading models (fixed split 2,921 / 730); also the pre-refactor baseline below | Local copy present |
-| **IDRiD** | Segmentation set: Stage 4 training and its one-time test gate. Grading test set: evaluation only | Local copy present. Grading test used once (frozen pipeline); two further pre-declared batches allowed |
-| **TJDR** | Stage 4 v2 training only | Local copy present, verified |
-| **EyePACS** | Reconstruction of EyeQ; approved 2026-10-08 as a controlled factor for grading (supervised adaptation, held-out labelled test subset) | Local copy present under `datasets/EyePACS`; not yet preprocessed or used for grading |
-| **DDR** | Planned ground-truth for the lesion probe (757 expert-annotated images) | Approved, not yet downloaded |
+| J (full frame) | 0.913 | 0.817 |
+| **J-crop** | **0.916** | **0.827** |
 
-Stage 3 (Vessel Segmentation) needs no project dataset: it integrates a pretrained, externally-sourced model (LWNet) for inference only, not trained within this project. DRIVE and CHASE_DB1 were approved under an earlier, since-superseded design that trained Vessel Segmentation within this project; neither is a project dataset today. See `PROJECT_STRUCTURE.md`'s Dataset Organization for current usage per dataset, and `SEGMENTATION_ARCHITECTURE.md`'s design-history appendix for why this reversal happened.
+### External test
 
-### Folder Structure
+Quadratic weighted kappa, mean of three seeds; differences with 95 % intervals from a paired, grade-stratified
+bootstrap (2,000 resamples). P is the earlier APTOS-only ConvNeXt-Tiny + CORN grader; P-EP is P adapted to EyePACS.
 
-```
-diabetic_retinoplasty/
-├── *.py                    # flat top-level pipeline modules (no src/ layout)
-├── training/                # reusable training framework (Trainer, callbacks, losses, metrics)
-├── evaluation/               # reusable evaluation framework (Evaluator, metrics, visualization)
-├── pipeline/                  # ABC contracts for future trainable/inference stages
-├── datasets/                   # EyeQ/, APTOS2019/, IDRiD/ -- raw/ is read-only, never
-│                                 modified. Vessel Segmentation uses a vendored pretrained
-│                                 checkpoint, not a dataset here.
-├── colab/                        # official Colab training infrastructure
-│   ├── common/                    # setup, verification, experiment management (shared by every stage)
-│   └── notebooks/                  # stage01_iqa.ipynb (implemented) + stage02-11 (templates)
-├── tests/                          # pytest unit tests, synthetic/temporary data only
-├── docs/                            # operational runbooks (e.g. FIRST_TRAINING_CHECKLIST.md)
-├── research_papers/                  # background reading
-├── PROJECT_CODE.md                    # target architecture + development rules (canonical)
-├── PROJECT_STRUCTURE.md                # master architectural reference (this summary's source)
-├── IMPLEMENTATION_PLAN.md               # baseline-vs-target gap analysis
-└── SEGMENTATION_ARCHITECTURE.md          # Vessel/Lesion Segmentation design
-```
+| Model | DDR (3,540 images) | IDRiD (100 images) |
+|---|---|---|
+| P | 0.509 | 0.642 |
+| P-EP | 0.593 | 0.738 |
+| J | 0.800 | 0.704 |
+| **J-crop** | **0.811** | **0.788** |
+| J − P | +0.290 (+0.270 … +0.311) | +0.062 (−0.004 … +0.129) |
+| J-crop − P | +0.301 (+0.281 … +0.323) | +0.146 (+0.078 … +0.223) |
+| J-crop − J | +0.011 (+0.003 … +0.020) | +0.084 (+0.037 … +0.141) |
 
-### Development Workflow
+On DDR, referable-DR sensitivity at the fixed decoding rises from 0.31 (P) to 0.70–0.71 at specificity
+0.985–0.988, and the calibration error falls from 0.35 to 0.06–0.07.
 
-Per `PROJECT_CODE.md`: understand the existing implementation, explain why it needs to change,
-propose a plan, wait for approval, implement one module at a time, verify integration, stop.
-Local development happens in VS Code (+ Claude Code for structured implementation work); all real
-model training happens in Google Colab. See `PROJECT_STRUCTURE.md`'s Local Development Workflow
-section for how these tools interact.
+### Uncertainty
 
-### Training Workflow
+The three-seed ensemble's entropy separates wrong from correct grades with AUROC 0.77–0.87 on the APTOS,
+EyePACS and DDR sets (0.69 on IDRiD), and referring the 20 % least certain images raises the QWK of the rest
+above what random referral gives on every set.
 
-1. Implement/verify a stage's dataset loader, model, and training entry point locally (small
-   real-data smoke tests only -- no local GPU, no fabricated results).
-2. Open the matching `colab/notebooks/stageNN_*.ipynb` in Google Colab.
-3. Run it top to bottom: Setup -> Verification -> Dataset Loading -> Model Creation -> Training ->
-   Evaluation -> Export (see `colab/README.md`).
-4. Review results locally; commit the exported model deliberately (never automatically).
+### Explanations
 
-### Experiment Workflow
+Agreement of each explanation map with the expert lesion masks of 60 DDR lesion-segmentation training images
+(none in the DDR grading test list); lesions cover a median of 0.2–0.3 % of the pixels.
 
-Every Colab training run gets its own isolated, timestamped folder on Google Drive under
-`experiments/<Module>/<timestamp>/` (`checkpoints/`, `logs/`, `tensorboard/`, `evaluation/`,
-`predictions/`, `metadata.json`) -- never overwritten, resumable by pointing a later run at the
-same folder. See `colab/README.md`'s "How experiments are organized".
+| J-crop | Pointing game | Top-10 % lesion precision | AUROC |
+|---|---|---|---|
+| Grad-CAM | 0.07 | 0.024 | 0.82 |
+| Integrated Gradients | 0.40 | 0.039 | 0.94 |
+| Occlusion (20 images) | 0.05 | 0.015 | 0.82 |
+| uniform map | 0.008 | 0.008 | 0.50 |
 
-### Current Implementation Status
+### Stage 1 (image quality)
 
-| Stage | Status |
+Held-out EyeQ test split, 16,249 images: accuracy 88.05 %, F1 86.12 %, AUC 96.48 %, QWK 0.8987.
+
+## Datasets
+
+| Dataset | Used for |
 |---|---|
-| 1. Image Quality Assessment | **Completed -- Verified -- Baseline Established.** Trained end-to-end in Google Colab; see Stage 1 Baseline Results below. |
-| 2. Image Preprocessing | **Complete, frozen.** RGB → Gamma Correction → CLAHE only (`image_preprocessing.py`); applied once per dataset. |
-| 3. Vessel Segmentation | **Complete, frozen.** Pretrained LWNet, inference only. |
-| 4. Lesion Segmentation | **Complete, frozen (v2).** SE-ResNet-101 U-Net for MA / HE / EX / SE, trained on IDRiD + TJDR; one-time IDRiD gate passed. The earlier Attention U-Net is superseded. |
-| 5–8. Grading | **Original design implemented, trained and closed** (RACAF not supported). **Current graders:** P (QWK 0.917), E1 (0.918), E2 control (0.914) on APTOS validation; frozen dual-branch pipeline evaluated once on IDRiD (QWK 0.629; P 0.642). |
-| 9–11. Uncertainty, explainability, evaluation | Not started for the current models. |
+| [EyeQ](https://github.com/HzFu/EyeQ) | Stage 1 training and test |
+| [APTOS 2019](https://www.kaggle.com/c/aptos2019-blindness-detection) | grader training and validation (fixed split 2,921 / 730) |
+| [EyePACS](https://www.kaggle.com/c/diabetic-retinopathy-detection) | grader training and validation; a labelled held-out subset is kept unused |
+| [IDRiD](https://idrid.grand-challenge.org/) | Stage 4 training (lesion-segmentation training images, 44 / 10 split); external grading test |
+| [TJDR](https://github.com/NekoPii/TJDR) | Stage 4 training |
+| [DDR](https://github.com/nkicsl/DDR-dataset) | external grading test; lesion masks for the explanation check |
 
-### Stage 1 Baseline Results
+Images are not included in this repository; the fixed splits are in [`dataset_splits/`](dataset_splits/).
 
-Held-out EyeQ test split (16,249 images, never used in training or validation), from the
-completed and verified Stage 1 run (`colab/notebooks/stage01_iqa.ipynb`, experiment
-`2026-08-05_09-11-28`):
+## Repository layout
 
-| Metric | Value |
+```
+*.py                         pipeline modules, flat at the top level
+  image_quality_*.py           Stage 1
+  image_preprocessing.py       Stage 2
+  geometry_diagnostic.py,
+  crop_frames.py               fundus bounding-box crop
+  vessel_segmentation_*.py     Stage 3 (LWNet)
+  stage4_v2*.py                Stage 4 lesion model and training
+  pl_convnext.py, corn.py,
+  weighted_corn.py             grader and ordinal loss
+  joint_train.py               joint APTOS + EyePACS training (J and J-crop)
+  final_external_eval.py       DDR / IDRiD external re-test
+  uncertainty_eval.py          ensemble uncertainty, selective prediction, test-time augmentation
+  explain.py, gradcam.py       explanation maps and the localisation check
+  demo_app.py, demo_pipeline.py  local web demo and one-image summary
+*_protocol*.json             frozen evaluation protocols (paths and checksums of every model used)
+colab/                       Colab setup (common/) and the notebooks that ran every experiment
+dataset_splits/              fixed train / validation / test splits
+docs/experiments/            the research record and per-experiment reports
+research/                    architecture audits and analysis scripts
+tests/                       CPU unit tests
+```
+
+## Running it
+
+All training and the external evaluations ran on Google Colab (T4 GPU) from the notebooks in
+[`colab/notebooks/`](colab/notebooks/), reading datasets and writing outputs to Google Drive:
+
+| Step | Notebook |
 |---|---|
-| Accuracy | 88.05% |
-| F1 Score | 86.12% |
-| AUC | 96.48% |
-| Quadratic Weighted Kappa (QWK) | 0.8987 |
+| Stage 1 | `stage01_iqa.ipynb` |
+| Stage 3 | `stage03_vessel_segmentation.ipynb` |
+| Stage 4 | `stage4_v2_training_cache.ipynb`, `stage4_v2_training.ipynb` |
+| Grader (J, J-crop) | `joint_aptos_eyepacs.ipynb`, `joint_aptos_eyepacs_crop.ipynb` |
+| External re-test and uncertainty | `final_external_eval.ipynb` |
+| Explanations | `explanations.ipynb` |
 
-EfficientNetB0 (ImageNet-pretrained) with mixed precision (`mixed_float16`); best validation
-checkpoint occurred at Epoch 2, `ReduceLROnPlateau` reduced the learning rate twice, and
-`EarlyStopping` (patience 8) stopped training at Epoch 10 and restored the Epoch 2 weights -- the
-exported model is that Epoch 2 checkpoint, not the final epoch's. Full detail, including exact
-output locations on Google Drive, is recorded in `colab/notebooks/stage01_iqa.ipynb`'s Section 7
-and `docs/FIRST_TRAINING_CHECKLIST.md`'s completed-run record. No metrics beyond the four above
-are claimed as part of this baseline.
-
-### Future Roadmap
-
-The approved next phase (2026-10-08), in order: IDRiD batch 1 (E1 and E2 on the locked protocol); DDR
-download and a ground-truth lesion probe on P / E1 / E2; one supervised EyePACS adaptation run; P-EP and E1-EP on
-APTOS; a conditional shuffled control; one-shot evaluations of the adapted models. Details and rules are in
-`PROJECT_CODE.md` ("Current Project State and Plan") and research record §65. `IMPLEMENTATION_PLAN.md` describes
-the original build order and is kept as history.
-
----
-
-## 🔍 Overview
-
-Diabetic Retinopathy (DR) is a diabetes complication that affects the eyes and can lead to blindness if left untreated. Early detection is crucial for effective treatment, but manual screening by ophthalmologists is time-consuming and subject to variability.
-
-This project implements a hybrid deep learning approach that:
-
-1. **Accurately classifies** retinal images into 5 severity levels of DR
-2. **Quantifies uncertainty** in predictions using Bayesian methods
-3. **Explains decisions** through gradient-based visualization techniques
-4. **Addresses class imbalance** through focal loss and weighting strategies
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| 📊 **Preprocessing Pipeline** | Ben Graham's technique with green channel extraction, CLAHE, and denoising |
-| 🧠 **Hybrid Architecture** | EfficientNetB0 + Swin Transformer for improved feature representation |
-| 🔍 **Bayesian Uncertainty** | Monte Carlo Dropout for confidence estimation and uncertainty quantification |
-| 👁️ **Explainable AI** | Grad-CAM visualizations showing which retinal regions influence decisions |
-| ⚖️ **Class Imbalance Handling** | Focal Loss and class weighting techniques to handle unbalanced datasets |
-
-## 🏗️ Model Architecture
-
-![Architecture](assets/hybrid_model_architecture.png)
-
-Our hybrid architecture combines:
-- **EfficientNetB0**: Pre-trained CNN for efficient feature extraction
-- **Swin Transformer**: Attention-based refinement of features with hierarchical window partitioning
-- **Monte Carlo Dropout**: Bayesian approximation for uncertainty estimation
-- **Grad-CAM**: Class activation mapping for model explainability
-
-## 📊 Dataset
-
-The model is trained and evaluated on the [APTOS 2019 Diabetic Retinopathy Detection](https://www.kaggle.com/c/aptos2019-blindness-detection) dataset, which contains retinal fundus photographs labeled with DR severity levels:
-
-| Class | Severity Level | Description | Visual Signs |
-|-------|---------------|-------------|--------------|
-| 0 | No DR | No signs of diabetic retinopathy | Normal retina |
-| 1 | Mild | Microaneurysms only | Small red dots |
-| 2 | Moderate | More than microaneurysms but less than severe | Red lesions, hard exudates |
-| 3 | Severe | Extensive hemorrhages and venous beading | Cotton wool spots, venous beading |
-| 4 | Proliferative | Abnormal blood vessel growth and potential retinal detachment | Neovascularization, preretinal hemorrhage |
-
-## 🔧 Installation
+Local web demo (CPU), with the trained models placed under `trained_models/demo/`:
 
 ```bash
-# Clone the repository
-git clone https://github.com/romilagarwal/diabetic_retinoplasty.git
-cd diabetic_retinopathy
-
-# Create and activate virtual environment
-python -m venv env
-source env/bin/activate  
-# On Windows use: env\Scripts\activate
-
-# Install dependencies from requirements
-pip install -r [requirements.txt]
-```
-Additionally, Graphviz must be installed on your system for model visualization.
-
-
-## 🚀 Usage
-
-1. Data Preprocessing
-```bash
-python pre_process_with_dataset_download.py
-```
-<details> <summary><b>Preprocessing Details</b></summary>
-This script:
-
-Downloads the dataset (if not already present)
-Applies Ben Graham's preprocessing technique with green channel extraction
-Enhances images with CLAHE (Contrast Limited Adaptive Histogram Equalization)
-Applies denoising filters
-Resizes images to 224×224
-Organizes processed images into class folders
-</details>
-
-2. Base Model Training
-```bash
-python efficientnet_model.py
-```
-Trains a baseline EfficientNetB0 model with transfer learning from ImageNet weights.
-
-3. Hybrid Model Training
-```bash
-python train_hybrid_model.py
-```
-<details> <summary><b>Training Parameters</b></summary>
-The hybrid model training uses:
-
- · Focal loss for class imbalance
- · Mixed precision for memory efficiency
- · Class weighting for balanced learning
- · Learning rate scheduling
- · Early stopping to prevent overfitting
-</details>
-
-4. Model Evaluation
-```bash
-# Test the base model
-python testing_efficientnet_model.py
-
-# Test the hybrid model
-python test_hybrid_model.py
+pip install -r requirements.txt
+python demo_app.py          # then open http://localhost:8501
 ```
 
-5.Bayesian Uncertainty Estimation
-```bash
-python bayesian_inference.py
-```
-<details> <summary><b>Uncertainty Metrics</b></summary>
-The Bayesian component performs:
+Upload a fundus photograph or pick a demo image; each stage is shown as it finishes. Tests: `python -m pytest tests`.
 
- · Monte Carlo Dropout inference with multiple forward passes
- · Confidence score calculation
- · Uncertainty estimation (standard deviation of predictions)
- · Predictive entropy calculation
- · Reliability diagram generation
-</details>
+## What was tested and not adopted
 
-6.Explainable AI Visualizations
-```bash
-python explainable_ai.py
-```
-Generates Generates Grad-CAM visualizations highlighting regions that influence the model's decisions.
+Each of these was implemented, trained and evaluated under a fixed protocol, and is documented with its
+results in the research record:
 
-7. Generate Visualizations for Publication
-```bash
-python generate_all_visualizations.py
-```
-Creates comprehensive visualizations for research papers or presentations.
+- the original Stage 5–8 design (adaptive multi-kernel CNN, dual-scale Swin transformer, cross-attention
+  fusion) with the reliability-aware fusion gate RACAF, which showed no supported benefit;
+- feeding or supervising the grader with the Stage 3 / 4 maps (pathology-grader fusions, an auxiliary lesion
+  head), which gave no grading gain over the RGB grader;
+- selective-prediction and operating-point rules on the earlier graders, and a generic vessel route for
+  proliferative DR;
+- Monte Carlo dropout, which does not apply to this grader (it has no dropout layers); the seed ensemble is
+  used instead.
 
-> **Note:** Steps 1–7 above describe the **pre-refactor baseline** scripts, unchanged and still present at the repository root. They are unrelated to the target 11-stage pipeline's Stage 02 (`image_preprocessing.py`, RGB → Gamma → CLAHE only, no green-channel extraction, Ben Graham, or denoising) -- see [Repository Status & Target Architecture](#-repository-status--target-architecture) above for which one actually reflects the current, frozen architecture.
+## Limitations
 
-## 📈 Results
+- **J-crop was chosen after the external re-test.** Neither variant was declared final in advance, so J-crop's
+  DDR and IDRiD results are those of the variant that looked better on them and are optimistic; they are not an
+  unbiased estimate for a model selected beforehand.
+- DDR and IDRiD had been used in earlier evaluations of this project before this re-test.
+- DDR has no patient identifiers, and its image source is confounded with grade; IDRiD's test set is small
+  (100 images), so its intervals are wide.
+- Overlap of an explanation map with lesions shows where the grade score is sensitive; it does not show that
+  the grader detects lesions.
+- Nothing here is a clinical-utility claim.
 
-> **Note:** The table below matches the placeholder/sample values hardcoded as fallback data in `Visualization_Scripts/create_publication_tables.py` (used when no real `model_comparison.csv` is present) rather than a verified `classification_report` run on held-out test data. Treat these numbers as illustrative until they are regenerated from an actual evaluation run.
+## References
 
-Performance Metrics
-|Model        | No DR  | Mild	| Moderate | Severe | Proliferative | Average |
-|-------------|--------|--------|----------|--------|---------------|---------|
-|EfficientNet | 0.76   | 0.70	|  0.72	   |  0.65	|     0.63	    |   0.69  |
-|Hybrid Model |	0.82   | 0.75	|  0.79	   |  0.73	|     0.71	    |   0.76  |
-
-Key Improvements
-· +7% Average F1 Score improvement over baseline EfficientNet
-· Better Generalization across all DR severity classes
-· Enhanced Performance on minority classes (Severe and Proliferative)
-· Reduced Uncertainty in predictions compared to baseline
-
-## 👁️ Visualizations
-
-<h3>Grad-CAM Explainability</h3>
-<img alt="Grad-CAM" src="assets\explainability_summary.png">
-
-<h3>Uncertainty Analysis</h3>
-
-<img alt="Uncertainty" src="assets\uncertainty_processed.png">
-
-
-## 🔮 Future Work
-
-1. DR-GAN++: Implementation of Generative Adversarial Networks for synthetic data generation to further address class imbalance
-2. Ensemble Methods: Combining multiple models for improved performance
-3. Clinical Integration: Development of a user-friendly interface for clinical use
-4. Mobile Deployment: Optimization for edge devices to enable screening in remote areas
-Multimodal Learning: Integrating patient metadata with retinal images
-
-
-## 📚 References
-
-1. Huang, G., Liu, Z., Van Der Maaten, L., & Weinberger, K. Q. (2017). Densely connected convolutional networks. Proceedings of the IEEE conference on computer vision and pattern recognition, 4700-4708.
-
-2. Liu, Z., Lin, Y., Cao, Y., Hu, H., Wei, Y., Zhang, Z., ... & Guo, B. (2021). Swin transformer: Hierarchical vision transformer using shifted windows. Proceedings of the IEEE/CVF International Conference on Computer Vision, 10012-10022.
-
-3. Gal, Y., & Ghahramani, Z. (2016). Dropout as a Bayesian approximation: Representing model uncertainty in deep learning. International conference on machine learning, 1050-1059.
-
-4. Selvaraju, R. R., Cogswell, M., Das, A., Vedantam, R., Parikh, D., & Batra, D. (2017). Grad-cam: Visual explanations from deep networks via gradient-based localization. Proceedings of the IEEE international conference on computer vision, 618-626.
-
-5. Lin, T. Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal loss for dense object detection. Proceedings of the IEEE international conference on computer vision, 2980-2988.
-
-
-## 👥 Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+- Liu, Z. et al. A ConvNet for the 2020s. CVPR 2022 (ConvNeXt).
+- Shi, X., Cao, W., Raschka, S. Deep neural networks for rank-consistent ordinal regression based on conditional
+  probabilities. Pattern Analysis and Applications 26, 2023 (CORN).
+- Tan, M., Le, Q. EfficientNet: Rethinking model scaling for convolutional neural networks. ICML 2019.
+- Galdran, A. et al. State-of-the-art retinal vessel segmentation with minimalistic models. Scientific Reports 12, 2022 (LWNet).
+- Hu, J., Shen, L., Sun, G. Squeeze-and-excitation networks. CVPR 2018 (SE-ResNet).
+- Ronneberger, O., Fischer, P., Brox, T. U-Net. MICCAI 2015.
+- Lakshminarayanan, B., Pritzel, A., Blundell, C. Simple and scalable predictive uncertainty estimation using deep
+  ensembles. NeurIPS 2017.
+- Selvaraju, R. R. et al. Grad-CAM. ICCV 2017.
+- Sundararajan, M., Taly, A., Yan, Q. Axiomatic attribution for deep networks. ICML 2017 (Integrated Gradients).
+- Zeiler, M. D., Fergus, R. Visualizing and understanding convolutional networks. ECCV 2014 (occlusion).
+- Lundberg, S. M., Lee, S.-I. A unified approach to interpreting model predictions. NeurIPS 2017 (SHAP).
+- Fu, H. et al. Evaluation of retinal image quality assessment networks in different color-spaces. MICCAI 2019 (EyeQ).
+- Porwal, P. et al. IDRiD: Diabetic Retinopathy – Segmentation and Grading Challenge. Medical Image Analysis 59, 2020.
+- Li, T. et al. Diagnostic assessment of deep learning algorithms for diabetic retinopathy screening.
+  Information Sciences 501, 2019 (DDR).
