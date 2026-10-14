@@ -39,15 +39,34 @@ def score_from_logits(logits, cut=None):
     return tf.reduce_sum(p, axis=1) if cut is None else p[:, int(cut)]
 
 
+_COMPILED = {}
+
+
+def compiled_gradients(grad_model, wrt, cut=None):
+    """One traced function per (model, wrt, cut), reused for every call: rgb -> (features, logits, d score / d wrt),
+    `wrt` = "features" (Grad-CAM; d score per image) or "input" (Integrated Gradients; d sum(score) / d rgb).
+    Calling the model eagerly instead makes Keras compile a NEW XLA function for every grouped (depthwise)
+    convolution on every call, and host memory grows until the session dies."""
+    import tensorflow as tf
+    key = (id(grad_model), wrt, cut)
+    if key not in _COMPILED:
+        def run(rgb):
+            with tf.GradientTape() as tape:
+                tape.watch(rgb)                # the model is frozen (no trainable variable): watching the input records the graph
+                features, logits = grad_model({"rgb": rgb}, training=False)
+                score = score_from_logits(logits, cut)
+                if wrt == "input":
+                    score = tf.reduce_sum(score)
+            return features, logits, tape.gradient(score, features if wrt == "features" else rgb)
+        _COMPILED[key] = (grad_model, tf.function(run, input_signature=[tf.TensorSpec([None, None, None, 3], tf.float32)]))
+    return _COMPILED[key][1]
+
+
 def grad_cam(grad_model, rgb, cut=None):
     """rgb: (N, 512, 512, 3) float32 in [0, 1] -> (maps (N, 512, 512) in [0, 1], logits (N, 4))."""
     import tensorflow as tf
     rgb = tf.convert_to_tensor(np.asarray(rgb, np.float32))
-    with tf.GradientTape() as tape:
-        tape.watch(rgb)                        # the model is frozen (no trainable variable): watching the input records the graph
-        features, logits = grad_model({"rgb": rgb}, training=False)
-        score = score_from_logits(logits, cut)
-    gradients = tape.gradient(score, features)   # with respect to the feature map itself, an intermediate of that call
+    features, logits, gradients = compiled_gradients(grad_model, "features", cut)(rgb)   # with respect to the feature map itself
     if gradients is None:
         raise RuntimeError("no gradient reached the feature map")
     features, gradients = tf.cast(features, tf.float32), tf.cast(gradients, tf.float32)

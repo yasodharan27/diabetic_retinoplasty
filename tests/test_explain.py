@@ -157,6 +157,35 @@ class LocalisationTests(unittest.TestCase):
         self.assertLessEqual(abs(int(cols(cropped)[0]) - round((200 - 75) / 300 * 64)), 1)  # the cut shifts them by 75, then 64 / 300
         self.assertGreater(cropped.sum(), direct.sum())                    # and the lesion is larger in the cropped frame
 
+    def test_the_study_writes_each_image_to_disk_and_resumes_after_a_crash(self):
+        from unittest import mock
+
+        import geometry_diagnostic as gd
+        import gradcam
+        frame = np.zeros((512, 512, 3), np.float32)
+        mask = np.zeros((512, 512), bool)
+        mask[:64, :64] = True
+        heat = np.zeros((512, 512), np.float32)
+        heat[10, 10] = 1.0
+        calls = []
+
+        def cam(g, rgb, cut=None):
+            calls.append(1)
+            if len(calls) == 3:
+                raise MemoryError("the session dies on the third image")
+            return heat[None], None
+        items = [(f"im{k}.jpg", f"im{k}.jpg", {}) for k in range(4)]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gd, "two_frames", return_value=(frame, frame, None, None)), \
+                mock.patch.object(ex, "union_mask", return_value=mask), mock.patch.object(ex, "frame_mask", return_value=mask), \
+                mock.patch.object(gradcam, "grad_cam", side_effect=cam):
+            progress = os.path.join(tmp, "rows.csv")
+            with self.assertRaises(MemoryError):
+                ex.localisation_study(items, "crop", [None], [None], methods=("grad_cam",), progress_csv=progress, log=lambda *a: None)
+            rows = ex.localisation_study(items, "crop", [None], [None], methods=("grad_cam",), progress_csv=progress, log=lambda *a: None)
+        self.assertEqual(len(calls), 5)                                    # 2 before the crash, the failed one, then only the 2 left
+        self.assertEqual([r["image"] for r in rows], ["im0.jpg", "im1.jpg", "im2.jpg", "im3.jpg"])
+        self.assertTrue(all(r["pointing_hit"] for r in rows))
+
 
 if __name__ == "__main__":
     unittest.main()

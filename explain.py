@@ -67,18 +67,15 @@ def integrated_gradients(grad_model, rgb, cut=None, steps=32, baseline=None, bat
         raise ValueError("one image (H, W, 3) at a time")
     x0 = np.zeros_like(x) if baseline is None else np.asarray(baseline, np.float32)
     alphas = (np.arange(steps, dtype=np.float32) + 0.5) / steps
+    import gradcam
+    run = gradcam.compiled_gradients(grad_model, "input", cut)          # traced once per model (see gradcam)
     total = np.zeros_like(x, dtype=np.float64)
     for s in range(0, steps, batch):
         a = alphas[s:s + batch][:, None, None, None]
-        path = tf.convert_to_tensor(x0[None] + a * (x - x0)[None])
-        with tf.GradientTape() as tape:
-            tape.watch(path)
-            _, logits = grad_model({"rgb": path}, training=False)
-            value = tf.reduce_sum(_tf_score(logits, cut))
-        total += np.asarray(tape.gradient(value, path), np.float64).sum(axis=0)
+        total += np.asarray(run(tf.convert_to_tensor(x0[None] + a * (x - x0)[None]))[2], np.float64).sum(axis=0)
     attribution = (x - x0).astype(np.float64) * total / steps
     ends = np.stack([x0, x])
-    _, end_logits = grad_model({"rgb": tf.convert_to_tensor(ends)}, training=False)
+    end_logits = run(tf.convert_to_tensor(ends))[1]
     s0, s1 = score(np.asarray(end_logits, np.float64), cut)
     gap = float(abs(attribution.sum() - (s1 - s0)))
     heat = np.abs(attribution).sum(axis=-1)
@@ -220,15 +217,25 @@ def union_mask(mask_paths):
 
 
 def localisation_study(items, arm, grad_models, model_fns, methods=("grad_cam", "integrated_gradients"),
-                       occlusion_images=20, ig_steps=32, log=print):
+                       occlusion_images=20, ig_steps=32, log=print, progress_csv=None):
     """Each method's map (the mean over the seeds' maps) against the union of the expert lesion masks, per image,
-    in the grader's frame for `arm`. Occlusion runs on the first `occlusion_images` images only."""
-    import cv2
+    in the grader's frame for `arm`. Occlusion runs on the first `occlusion_images` images only.
+    With `progress_csv` each image's rows are appended to that file as soon as they exist, and images already in it
+    for this arm are skipped, so a crashed session resumes where it stopped."""
+    import csv
+    import os
 
     import geometry_diagnostic as gd
     import gradcam
+    done = set()
+    if progress_csv and os.path.exists(progress_csv):
+        with open(progress_csv, newline="") as fh:
+            done = {r["image"] for r in csv.DictReader(fh) if r["arm"] == arm}
+        log(f"  {arm}: {len(done)} images already in {progress_csv}; resuming")
     rows = []
     for k, (name, image_path, masks) in enumerate(items):
+        if name in done:
+            continue
         direct, crop, box, native = gd.two_frames(image_path)
         rgb = direct if arm == "direct" else crop
         mask = frame_mask(union_mask(masks), None if arm == "direct" else box)
@@ -239,8 +246,18 @@ def localisation_study(items, arm, grad_models, model_fns, methods=("grad_cam", 
             maps["integrated_gradients"] = np.mean([integrated_gradients(g, rgb, steps=ig_steps)[2] for g in grad_models], axis=0)
         if "occlusion" in methods and k < occlusion_images:
             maps["occlusion"] = np.mean([occlusion(f, rgb)[1] for f in model_fns], axis=0)
-        for method, heat in maps.items():
-            rows.append({"image": name, "arm": arm, "method": method, **localisation(heat, mask)})
+        new = [{"image": name, "arm": arm, "method": method, **localisation(heat, mask)} for method, heat in maps.items()]
+        rows += new
+        if progress_csv:
+            first = not os.path.exists(progress_csv)
+            with open(progress_csv, "a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(new[0]))
+                if first:
+                    writer.writeheader()
+                writer.writerows(new)
         if (k + 1) % 10 == 0:
             log(f"  {arm}: {k + 1}/{len(items)} images")
+    if progress_csv:
+        import pandas as pd
+        return pd.read_csv(progress_csv).query("arm == @arm").to_dict("records")
     return rows
