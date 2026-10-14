@@ -5787,3 +5787,88 @@ For comparison on the same images: the EyePACS-only model has AUROC 0.913 / 0.95
 **Demonstration.** One image through the frozen Stage 1 (quality), Stage 2, Stage 3 (vessels), Stage 4 (lesions), the three-seed grader, uncertainty and Grad-CAM, written as one picture and one JSON per image. The grade comes from the RGB grader alone; vessel and lesion maps are supporting views. Research prototype, not a medical device. Demonstration images: APTOS validation or the user's own — not DDR or IDRiD test images.
 
 **State of the code.** Written and syntax-checked. `tests/test_later_stages.py` (4 tests, no model) passes: the uncertainty analysis on synthetic tables and the arithmetic helpers of Grad-CAM. **Not yet executed:** the Grad-CAM gradient path on a real grader, the demonstration pipeline, the re-test evaluator and its two notebooks. They are to be smoke-tested once the frame build has released the laptop's CPU, and corrected before any of them is used for a result.
+
+## 97. Joint training, direct arm ("J") — three seeds: result (finished 2026-10-13 08:34 UTC; Colab T4; protocol §93, §94.1)
+
+**Correction to §96.** Its heading says seed 123 of the direct arm was in progress when it was written; that was an assumption, not something checked. The section's content is unaffected.
+
+**Runs.** `experiments/JointAptosEyePACS/j_seed{42,123,2026}`, trained in sequence. Seed 42 ran at commit `64a4e74`, seeds 123 and 2026 at `845181b`; the direct arm's configuration is identical at both (its hash is pinned by a test). Read back from Drive: every BEST is the first maximum of that run's recorded selection metric; all stopped by early stopping; class weights are the recorded ones. Epoch indices below are 0-based (Keras prints them one higher).
+
+| seed | BEST epoch index | epochs scored | selection metric | BEST weights SHA-256 |
+|---|---|---|---|---|
+| 42 | 19 | 32 | 0.8632 | `b6cc2820de99…` |
+| 123 | 18 | 31 | 0.8660 | `ec286b4bb613…` |
+| 2026 | 29 | 42 | 0.8657 | `cd60d3afa990…` |
+
+### Against the single-source models (paired on the same images; grade-stratified bootstrap of the three-seed mean, 2,000 resamples, seed 20260927)
+
+| | J, seeds 42 / 123 / 2026 | J mean ± SD | reference mean | difference (95 % interval) | per seed |
+|---|---|---|---|---|---|
+| **APTOS validation QWK** (730) | 0.9100 / 0.9164 / 0.9122 | **0.9128 ± 0.0033** | P (same seeds) 0.9170 | −0.0041 (−0.017 … +0.009) | −0.0085 / +0.0016 / −0.0055 |
+| **EyePACS validation QWK** (3,512) | 0.8164 / 0.8156 / 0.8192 | **0.8171 ± 0.0019** | EyePACS-only model 0.8274 | −0.0103 (−0.023 … +0.003) | −0.0110 / −0.0118 / −0.0082 |
+
+Descriptive, APTOS validation: J − P-EP = −0.0088 (−0.019 … +0.002); P-EP mean 0.9216.
+
+| three-seed means | J, APTOS | P, APTOS | J, EyePACS | EyePACS-only, EyePACS |
+|---|---|---|---|---|
+| AUROC ≥1 / ≥2 / ≥3 / ≥4 | 0.999 / 0.986 / 0.950 / 0.946 | 0.998 / 0.991 / 0.953 / 0.937 | 0.917 / 0.953 / 0.971 / 0.971 | 0.913 / 0.953 / 0.980 / 0.977 |
+| recall grades 0 – 4 | 0.98 / 0.57 / 0.81 / 0.48 / 0.63 | 0.98 / 0.61 / 0.83 / 0.55 / 0.57 | 0.94 / 0.34 / 0.66 / 0.59 / 0.52 | 0.96 / 0.32 / 0.62 / 0.52 / 0.59 |
+| referable DR, sensitivity / specificity | 0.962 / 0.939 | 0.950 / 0.949 | 0.793 / 0.969 | 0.736 / 0.983 |
+| top-label ECE | 0.104 | 0.061 | 0.023 | 0.013 |
+| MAE | 0.202 | 0.190 | 0.210 | 0.193 |
+
+Seed ensemble (cumulative probabilities averaged, same decode): APTOS 0.9089, EyePACS 0.8322; the three seeds decode different grades for 14.4 % of APTOS and 13.5 % of EyePACS validation images.
+
+### Reading
+
+1. **One model holds both levels to within about 0.01 QWK.** On each validation set J is slightly below the model trained on that dataset alone, and neither interval excludes zero. On EyePACS the three per-seed differences are all negative and close together (−0.008 to −0.012); they share one reference model, so they are not three independent comparisons.
+2. **Seed-to-seed spread is small** (SD 0.003 on APTOS, 0.002 on EyePACS), smaller than the epoch-to-epoch movement of EyePACS QWK inside a run (roughly 0.74 – 0.82 after the first epochs).
+3. **Where J differs in kind.** On EyePACS it calls more referable disease than the EyePACS-only model at the fixed decode (sensitivity 0.793 against 0.736, specificity 0.969 against 0.983) with the same ranking at the two lower cuts and slightly lower ranking at the two upper ones. On APTOS it is less well calibrated than P (ECE 0.104 against 0.061) and has lower grade-3 recall (0.48 against 0.55) with higher grade-4 recall (0.63 against 0.57) — the grade-3 / grade-4 trade recorded for every adapted model so far.
+4. **The ensemble is not a comparison.** Three J seeds averaged reach 0.832 on EyePACS, above the single EyePACS-only model; that sets an ensemble against one model. On APTOS the ensemble (0.909) is below J's own per-seed mean.
+5. **What this does not show.** Whether J generalises better than P or P-EP to data from neither source. Both validation sets are in-domain for J and both selected its checkpoints. The comparison with P carries the batch-size difference (16 against 2). That question belongs to the external re-test of §96, which has not been run.
+
+**Status.** The direct arm is complete: three pinned BEST checkpoints. J is the pre-declared primary model (§94). The cropped arm is in progress; the later stages wait for it.
+
+## 98. Joint training, cropped arm ("J-crop") — three seeds: result, and the comparison with the direct arm (finished 2026-10-14 04:49 UTC; commit `845181b`; Colab T4; protocol §94, §94.1)
+
+**Runs.** `experiments/JointAptosEyePACS/jc_seed{42,123,2026}`, trained in sequence. Read back from Drive: arm "crop" recorded in each result; every BEST is the first maximum of the run's selection metric; all stopped by early stopping; class weights are the recorded ones. Epoch indices are 0-based.
+
+| seed | BEST epoch index | epochs scored | selection metric | BEST weights SHA-256 |
+|---|---|---|---|---|
+| 42 | 23 | 36 | 0.8736 | `28288ab4e8e1…` |
+| 123 | 23 | 36 | 0.8691 | `d8451f3dc89a…` |
+| 2026 | 24 | 37 | 0.8721 | `c0194f0528e0…` |
+
+### Against the single-source models (paired, grade-stratified bootstrap of the three-seed mean, 2,000 resamples, seed 20260927)
+
+| | J-crop, seeds 42 / 123 / 2026 | mean ± SD | reference mean | difference (95 % interval) | per seed |
+|---|---|---|---|---|---|
+| **APTOS validation QWK** | 0.9194 / 0.9107 / 0.9185 | **0.9162 ± 0.0048** | P 0.9170 | −0.0007 (−0.010 … +0.008) | +0.0010 / −0.0041 / +0.0009 |
+| **EyePACS validation QWK** | 0.8278 / 0.8275 / 0.8256 | **0.8269 ± 0.0012** | EyePACS-only 0.8274 | −0.0005 (−0.015 … +0.014) | +0.0004 / 0.0000 / −0.0018 |
+
+Descriptive: J-crop − P-EP on APTOS validation −0.0054 (−0.015 … +0.004).
+
+### Against the direct arm (same seed, same images)
+
+| | J-crop − J (95 % interval) | per seed | per-cut AUROC change ≥1 / ≥2 / ≥3 / ≥4 |
+|---|---|---|---|
+| **APTOS validation** | +0.0034 (−0.004 … +0.011) | +0.0095 / −0.0057 / +0.0064 | −0.000 / −0.001 / −0.000 / +0.005 |
+| **EyePACS validation** | **+0.0099 (+0.000 … +0.019)** | +0.0114 / +0.0118 / +0.0063 | +0.012 / +0.005 / +0.001 / −0.004 |
+
+| three-seed means | J-crop, APTOS | J-crop, EyePACS |
+|---|---|---|
+| AUROC ≥1 / ≥2 / ≥3 / ≥4 | 0.998 / 0.985 / 0.950 / 0.951 | 0.929 / 0.958 / 0.973 / 0.967 |
+| recall grades 0 – 4 | 0.98 / 0.62 / 0.86 / 0.43 / 0.65 | 0.94 / 0.39 / 0.67 / 0.52 / 0.52 |
+| referable DR, sensitivity / specificity | 0.960 / 0.943 | 0.780 / 0.975 |
+| top-label ECE / MAE | 0.092 / 0.187 | 0.021 / 0.198 |
+| seed ensemble QWK; seeds disagreeing on the decoded grade | 0.921; 12.9 % | 0.844; 12.0 % |
+
+### Reading
+
+1. **J-crop reaches each single-source model on its own validation set.** On EyePACS it equals the EyePACS-only model in all three seeds (−0.002 to +0.000); on APTOS it is within 0.001 of P on average, with the seeds on both sides. Neither difference has an interval that excludes zero, in either direction.
+2. **Against the direct arm, the EyePACS difference is consistent; the APTOS difference is not.** On EyePACS validation J-crop is higher in all three seeds (+0.006 to +0.012) and the interval of the mean just excludes zero; the gain sits at the lowest cut (AUROC any-DR +0.012), the cut where cropping helped P most in §90. On APTOS the seeds disagree in sign.
+3. **What the J-crop − J difference is.** Both validation sets are in-domain for both arms and both selected every checkpoint, so this is a difference between two in-domain models on their selection sets. It says little about unseen data. It is consistent with §90 — removing the dark margins gives the model more fundus per pixel — but it is not evidence of better generalisation.
+4. **Unchanged weaknesses.** APTOS calibration remains worse than P's (ECE 0.092 against 0.061); grade-3 recall on APTOS stays low (0.43 against 0.55 for P) with grade-4 recall higher (0.65 against 0.57) — the trade seen in every adapted or joint model.
+5. **The pre-declared order is unchanged.** J (direct) is the primary model; J-crop is the ablation (§94). The two are reported side by side on the external re-test and are not chosen between on it.
+
+**Status.** Both joint arms are complete: six pinned BEST checkpoints. The later stages (§96) can begin, starting with the external re-test protocol, which needs the user's approval before it is locked.
