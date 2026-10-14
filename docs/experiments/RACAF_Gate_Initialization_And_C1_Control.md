@@ -5890,3 +5890,72 @@ Descriptive: J-crop − P-EP on APTOS validation −0.0054 (−0.015 … +0.004)
 **What is fixed before the external data are read, and checked.** The checkpoints were chosen during training by the mean of the two development validation QWKs (§97, §98). The decode is the fixed 0.5 rule. Each arm's preprocessing is its training preprocessing. The populations and exclusions are those of the earlier protocols. No threshold, checkpoint, seed, crop parameter or preprocessing step can be set from an external result: the evaluator has no parameter for any of them. The EyePACS held-out test is not read.
 
 **Tests.** `tests/test_later_stages_models.py` and `tests/test_later_stages.py`: 9 passed (protocol written once and pinning every file, refusal of an unfinished run or a changed checkpoint, predictions for both arms from one Stage-2 pass, reference tables required to be the same images in the same order, the analysis with both main contrasts and the family split).
+
+### 99.1 Parity gate: PASS (2026-10-14; Colab T4; commit `24ea5a8`; protocol `5fbc616b…7cc8`; no DDR or IDRiD image read)
+
+All six joint runs complete and every pinned hash re-verified on Drive. Each joint model, run on the 730 APTOS validation images from the raw files through the re-test's own frame code (both frames from one Stage-2 pass), reproduces the validation table its run stored: decoded grades identical for all six; largest logit difference 0.0078 (J seeds 42, 123) and 0.0156 (J seed 2026, J-crop seeds 42, 123, 2026), within the tolerance of 0.05. The gate is valid only in the runtime, commit and protocol in which it passed.
+
+## 100. External re-test of both joint arms on DDR and IDRiD — result (DDR run 2026-10-14 06:28 UTC, IDRiD 08:00 UTC; commit `24ea5a8`; protocol `5fbc616b…7cc8`; Colab T4; read under §99)
+
+**Runs.** `experiments/DDRGrading/final_external_v1_5fbc616b8eef_2026-10-14_06-28-17` and `experiments/IDRiDGrading/final_external_v1_5fbc616b8eef_2026-10-14_08-00-35`. One run each; no earlier output, no technical rerun; parity passed in the same runtime (§99.1). Read back from Drive: every output file equals its recorded hash. P and P-EP are their stored predictions (records 86 and 61 / 79); nothing was tuned. DDR's second grading use; IDRiD's fourth.
+
+### DDR — primary population, 3,540 images (1,846 / 159 / 1,224 / 57 / 254)
+
+| model | QWK, seeds 42 / 123 / 2026 | mean | AUROC ≥1 / ≥2 / ≥3 / ≥4 | recall grades 0 – 4 | referable sens / spec | ECE | seed ensemble |
+|---|---|---|---|---|---|---|---|
+| P | 0.511 / 0.529 / 0.488 | 0.509 | 0.891 / 0.900 / 0.946 / 0.960 | 1.00 / 0.04 / 0.10 / 0.47 / 0.36 | 0.306 / 0.996 | 0.350 | 0.508 |
+| P-EP | 0.632 / 0.545 / 0.601 | 0.593 | 0.908 / 0.907 / 0.946 / 0.956 | 1.00 / 0.07 / 0.21 / 0.34 / 0.54 | 0.369 / 0.998 | 0.288 | 0.590 |
+| **J** | 0.791 / 0.810 / 0.798 | **0.800** | 0.938 / 0.931 / 0.926 / 0.938 | 0.98 / 0.44 / 0.50 / 0.61 / 0.72 | 0.704 / 0.985 | 0.069 | 0.810 |
+| **J-crop** | 0.803 / 0.803 / 0.826 | **0.811** | 0.957 / 0.953 / 0.937 / 0.941 | 0.99 / 0.54 / 0.54 / 0.55 / 0.72 | 0.710 / 0.988 | 0.060 | 0.819 |
+
+| contrast | QWK difference (95 % interval) | per seed | reading | mean per-cut AUROC difference |
+|---|---|---|---|---|
+| **J − P** (main) | **+0.290 (+0.270 … +0.311)** | +0.280 / +0.281 / +0.311 | supported | +0.009 (−0.001 … +0.019) |
+| **J-crop − P** (main) | **+0.301 (+0.281 … +0.323)** | +0.292 / +0.274 / +0.338 | supported | +0.023 (+0.014 … +0.031) |
+| J − P-EP | +0.207 (+0.189 … +0.226) | +0.159 / +0.264 / +0.197 | supported (descriptive) | |
+| J-crop − P-EP | +0.218 (+0.199 … +0.236) | +0.171 / +0.258 / +0.225 | supported (descriptive) | |
+| J-crop − J | +0.011 (+0.003 … +0.020) | +0.012 / −0.007 / +0.028 | supported (descriptive), **seed-level inconsistency** | +0.014 (+0.008 … +0.019) |
+
+Inside the file-name families (primary population): timestamp-named (2,765; grades 0 – 3) J − P +0.583, J-crop − P +0.600; `007`-named (775; grades 1 – 4) J − P +0.138, J-crop − P +0.144; every interval excludes zero and every seed is positive. Broader 3,725 (not untouched): J − P +0.296, J-crop − P +0.308, J-crop − J +0.012, the same readings.
+
+### IDRiD — primary population, 100 images (34 / 5 / 29 / 19 / 13)
+
+| model | QWK, seeds 42 / 123 / 2026 | mean | AUROC ≥1 / ≥2 / ≥3 / ≥4 | referable sens / spec | ECE | seed ensemble |
+|---|---|---|---|---|---|---|
+| P | 0.538 / 0.702 / 0.685 | 0.642 | 0.888 / 0.895 / 0.893 / 0.861 | 0.836 / 0.735 | 0.300 | 0.637 |
+| P-EP | 0.783 / 0.699 / 0.733 | 0.738 | 0.922 / 0.901 / 0.926 / 0.945 | 0.738 / 0.949 | 0.325 | 0.765 |
+| **J** | 0.665 / 0.736 / 0.710 | **0.704** | 0.925 / 0.923 / 0.911 / 0.954 | 0.891 / 0.692 | 0.301 | 0.727 |
+| **J-crop** | 0.786 / 0.795 / 0.782 | **0.788** | 0.953 / 0.919 / 0.946 / 0.969 | 0.842 / 0.803 | 0.274 | 0.800 |
+
+| contrast | QWK difference (95 % interval) | per seed | reading |
+|---|---|---|---|
+| **J − P** (main) | +0.062 (−0.004 … +0.129) | +0.127 / +0.033 / +0.025 | **no difference shown** |
+| **J-crop − P** (main) | **+0.146 (+0.078 … +0.223)** | +0.248 / +0.093 / +0.097 | **supported** |
+| J − P-EP | −0.035 (−0.103 … +0.031) | −0.118 / +0.037 / −0.023 | no difference shown (descriptive), seed-level inconsistency |
+| J-crop − P-EP | +0.050 (−0.005 … +0.109) | +0.003 / +0.097 / +0.049 | no difference shown (descriptive) |
+| J-crop − J | +0.084 (+0.037 … +0.141) | +0.121 / +0.060 / +0.072 | supported (descriptive) |
+
+All 103 (sensitivity): J − P +0.065 (+0.001 … +0.133), J-crop − P +0.147, J-crop − J +0.082.
+
+### Uncertainty of the three-seed ensembles (§96; full tables: DDR 3,725, IDRiD 103)
+
+| set | ensemble QWK, J / J-crop | entropy detects wrong grades (AUROC), J / J-crop | QWK on the 80 % most certain, J / J-crop (all images: random referral leaves it unchanged) |
+|---|---|---|---|
+| APTOS validation | 0.909 / 0.921 | 0.867 / 0.839 | 0.953 / 0.954 |
+| EyePACS validation | 0.832 / 0.844 | 0.795 / 0.810 | 0.890 / 0.889 |
+| DDR | 0.815 / 0.825 | 0.766 / 0.794 | 0.857 / 0.875 |
+| IDRiD | 0.724 / 0.796 | 0.691 / 0.689 | 0.734 / 0.814 |
+
+### Reading
+
+1. **Joint training changes DDR completely.** Both joint arms reach a QWK of about 0.80 – 0.81 on the 3,540 DDR images where P scored 0.51 and P-EP 0.59, in every seed and inside both file-name families. Referable-DR sensitivity at the fixed decode rises from 0.31 to 0.70 – 0.71 at specificity 0.985 – 0.988, and calibration error falls from 0.35 to 0.06 – 0.07. The ranking moves far less (mean per-cut AUROC +0.009 for J, +0.023 for J-crop; at the two upper cuts J ranks slightly lower than P): on DDR the gain is mainly where the decoded grades fall — the part of the failure §92 could not settle for DDR. Joint training, unlike the decoding rules of §92, moved it.
+2. **On IDRiD the picture is smaller and differs by arm.** J-crop − P is supported (+0.146, every seed positive); J − P is not shown (+0.062, interval reaching −0.004). Neither arm is shown to differ from P-EP, which was already 0.738 on these 100 images.
+3. **J-crop is at least as good as J on every set,** and better on IDRiD (+0.084, all seeds) and DDR (+0.011; one seed negative). With EyePACS validation (+0.010, §98) the direction is the same on three sets.
+4. **The ensemble's uncertainty is informative.** On every set, referring the 20 % least certain images raises the QWK of the rest above what random referral gives; the entropy separates wrong from right grades with AUROC 0.77 – 0.87 except on IDRiD (0.69).
+5. **Qualifications that belong to every number here.** Both sets were used before, and the earlier results on them were known when joint training was chosen. Neither arm was pre-declared as final (§99): if J-crop is now chosen as the final model, that choice is made after seeing these results and its external estimates are optimistic. J − P also carries the batch-size difference (16 against 2). On DDR, source and grade are confounded and there are no patient identifiers; IDRiD's primary set has 100 images and its intervals are wide. Nothing here is a clinical-utility claim.
+
+**Status.** The external re-test is complete. Remaining: the explanation analysis, the demonstration, and the user's choice of final model, to be reported as post hoc.
+
+### 100.1 Preferred candidate: the cropped joint arm — a post hoc choice (2026-10-14; decided by the user after reading §100)
+
+The cropped joint arm (J-crop, seeds 42 / 123 / 2026, BEST epoch indices 23 / 23 / 24) is the current preferred candidate for the final model, and it is the default of the demonstration. This choice was made **after** the external re-test had been read. Neither arm had been pre-declared as final (§99), so J-crop's DDR and IDRiD results in §100 are those of the arm that looked better on them: they are **not** an unbiased estimate of the performance of a model selected in advance, and they are reported as such wherever they are used. What can be said without that bias: both arms were fixed before either external set was read again; J-crop was at least as good as J on every set, including EyePACS validation, which was read before the re-test (§98); and the pre-registered main contrasts of §99 are reported for both arms. The direct arm stays available, and nothing in the protocol, the checkpoints or the results of §99 – §100 is changed.

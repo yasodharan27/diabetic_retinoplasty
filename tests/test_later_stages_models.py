@@ -158,8 +158,10 @@ class DemoFigureTests(unittest.TestCase):
         result = {"image": "x.png", "grade": 2, "grade_name": demo.GRADES[2], "class_probabilities": [0.1, 0.2, 0.5, 0.1, 0.1], "referable": True,
                   "per_seed_grades": {"42": 2, "123": 2, "2026": 3}, "uncertainty": {"entropy": 1.2, "seed_disagreement": 0.3, "seeds_agree": False},
                   "quality": {"label": "Good"}, "flag_for_review": True}
+        overlay = (rng.random((64, 64, 3)) * 255).astype(np.uint8)
         views = {"frame": rng.random((64, 64, 3)), "vessel": rng.random((64, 64)), "lesion_max": rng.random((64, 64, 4)),
-                 "grad_cam": rng.random((64, 64)), "overlay": (rng.random((64, 64, 3)) * 255).astype(np.uint8)}
+                 "explanations": {name: overlay for name in demo.EXPLANATIONS}}
+        result["uncertainty"]["tta_expected_grade_sd"] = 0.1
         with tempfile.TemporaryDirectory() as tmp:
             path = demo.figure(result, views, os.path.join(tmp, "x.png"))
             self.assertGreater(os.path.getsize(path), 10_000)

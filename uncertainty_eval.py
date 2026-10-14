@@ -118,3 +118,26 @@ def run(sets, out_dir):
     with open(os.path.join(out_dir, "uncertainty_results.json"), "w") as fh:
         json.dump(ph._jsonable(results), fh, indent=1)
     return results
+
+
+# --------------------------------------------------------------------------- test-time augmentation (a separate uncertainty method)
+
+def dihedral(rgb, k):
+    """The k-th of the 8 flips / quarter turns (k = 0 is the identity) -- the transformations seen in training."""
+    x = np.rot90(np.asarray(rgb), k % 4, axes=(-3, -2))
+    return np.flip(x, axis=-2) if k >= 4 else x
+
+
+def tta_logits(model_fn, rgb):
+    """`model_fn(rgb (N, H, W, 3)) -> logits (N, 4)` on each of the 8 transformations: logits (8, N, 4). The grade is
+    orientation-free, so the transformations should agree; their spread is the uncertainty."""
+    return np.stack([np.asarray(model_fn(np.ascontiguousarray(dihedral(rgb, k))), np.float64) for k in range(8)])
+
+
+def tta_summary(logits_tta):
+    """For logits (T, N, 4) of one model under T transformations: the TTA-mean grade, the standard deviation of
+    the expected grade across transformations, and how often the decoded grade differs between them."""
+    p = np.stack([cumulative(z) for z in logits_tta])
+    grades = (p > 0.5).sum(axis=2)
+    return {"pred": (p.mean(axis=0) > 0.5).sum(axis=1).astype(int), "expected_grade_sd": p.sum(axis=2).std(axis=0),
+            "grade_changes": grades.min(axis=0) != grades.max(axis=0)}
