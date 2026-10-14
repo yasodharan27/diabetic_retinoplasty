@@ -1,0 +1,36 @@
+{
+ "source": "three-seed ensemble on the APTOS 2019 validation split (730) and the EyePACS validation split (3,512), pooled",
+ "note": "these validation sets also selected the checkpoints, so the rates are optimistic for new images",
+ "arms": {
+  "crop": {
+   "coverage": 0.8,
+   "entropy_threshold": 0.7038427433141097,
+   "images": 4242,
+   "certain": {
+    "images": 3393,
+    "exact": 0.9213085764809903,
+    "within_one": 0.9790745652814619
+   },
+   "uncertain": {
+    "images": 849,
+    "exact": 0.6195524146054181,
+    "within_one": 0.9069493521790342
+   }
+  },
+  "direct": {
+   "coverage": 0.8,
+   "entropy_threshold": 0.7322768770252267,
+   "images": 4242,
+   "certain": {
+    "images": 3393,
+    "exact": 0.9151193633952255,
+    "within_one": 0.9770114942528736
+   },
+   "uncertain": {
+    "images": 849,
+    "exact": 0.607773851590106,
+    "within_one": 0.8833922261484098
+   }
+  }
+ }
+}

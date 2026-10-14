@@ -39,6 +39,55 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(all(os.path.exists(os.path.join(app.DEMO_DIR, d["file"])) for d in demos))
         self.assertFalse([d for d in demos if "DDR" in d["source"] or "test" in d["original_path"].lower().replace("testing", "test") and "IDRiD" in d["source"]])
 
+    def test_reliability_flags_each_failed_check_and_uses_the_validation_band(self):
+        cal = {"coverage": 0.8, "entropy_threshold": 0.7, "certain": {"exact": 0.92, "within_one": 0.98, "images": 10},
+               "uncertain": {"exact": 0.62, "within_one": 0.91, "images": 3}}
+        review, reasons, rates = app.reliability("Good", [2, 2, 2], False, 0.3, cal)
+        self.assertFalse(review)
+        self.assertEqual((reasons, rates["exact"]), ([], 0.92))
+        review, reasons, rates = app.reliability("Reject", [2, 4, 2], True, 0.9, cal)
+        self.assertTrue(review)
+        self.assertEqual(len(reasons), 4)
+        self.assertEqual(rates["exact"], 0.62)
+        self.assertTrue(app.reliability("Usable", [3, 3, 3], False, 0.71, cal)[0])       # entropy alone
+
+    def test_map_on_lesions_is_the_top_decile_share_beside_the_chance_share(self):
+        heat = np.zeros((10, 10))
+        heat[0, :] = 1.0                                                  # the top 10 % = the first row
+        mask = np.zeros((10, 10), bool)
+        mask[0, :5] = True
+        self.assertEqual(app.map_on_lesions(heat, mask), (0.5, 0.05))
+
+    def test_the_written_summary_states_only_what_the_outputs_say(self):
+        rates = {"exact": 0.92, "within_one": 0.98, "images": 3393}
+        probs = [0.0, 0.0, 0.76, 0.0, 0.24]
+        lines = app.written_summary(2, probs, {"MA": 0.0, "HE": 0.003, "EX": 0.018, "SE": 0.0}, {"Grad-CAM": (0.35, 0.02)},
+                                    False, [], rates, "optimistic")
+        text = " ".join(lines)
+        self.assertIn("Grade 2 - Moderate NPDR", text)
+        self.assertIn("76 %", text)
+        self.assertLess(text.index("hard exudates"), text.index("haemorrhages"))   # largest area first
+        self.assertNotIn("microaneurysms (", text)                       # not found -> not listed
+        self.assertIn("35 % of its most influential area", text)
+        self.assertIn("No reliability flag", text)
+        self.assertIn("exact in 92 %", text)
+        lines = app.written_summary(3, [0, 0, 0.1, 0.9, 0], {k: 0.0 for k in app.LESIONS}, {}, True, ["the three models give different grades [3, 2, 3]"], rates, "x")
+        text = " ".join(lines)
+        self.assertIn("Stage 4 marks no lesions", text)
+        self.assertIn("worth a closer look", text)
+        self.assertIn("Review recommended", text)
+
+    def test_the_reliability_calibration_file_matches_the_validation_tables_it_came_from(self):
+        cal = json.load(open(app.RELIABILITY_PATH, encoding="utf-8"))
+        for arm in ("crop", "direct"):
+            c = cal["arms"][arm]
+            self.assertEqual((c["images"], c["certain"]["images"] + c["uncertain"]["images"]), (4242, 4242))
+            self.assertGreater(c["certain"]["exact"], c["uncertain"]["exact"])
+        tables = [os.path.join(app.HERE, "results", "FinalExternal", "uncertainty", f"uncertainty_jc_{s}_val.csv") for s in ("aptos", "eyepacs")]
+        if all(os.path.exists(p) for p in tables):
+            import uncertainty_eval as ue
+            self.assertEqual(ue.reliability_calibration(tables), cal["arms"]["crop"])
+
     def test_the_default_arm_is_the_post_hoc_preferred_candidate(self):
         self.assertEqual(app.DEFAULT_ARM, "crop")
         self.assertIn("not a medical device", app.NOTICE)

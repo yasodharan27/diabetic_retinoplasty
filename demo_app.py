@@ -79,6 +79,74 @@ def lesion_overlay(rgb, lesion_max):
     return out
 
 
+# --------------------------------------------------------------------------- written explanation and reliability
+
+#: ICDR severity scale (Wilkinson et al., Ophthalmology 2003), as wording for the predicted grade.
+ICDR = ("no apparent retinopathy",
+        "microaneurysms only",
+        "more than microaneurysms only, but less than severe non-proliferative DR",
+        "severe non-proliferative DR: many intraretinal haemorrhages in all four quadrants, venous beading, or "
+        "intraretinal microvascular abnormalities, without signs of proliferation",
+        "proliferative DR: neovascularisation, or vitreous / preretinal haemorrhage")
+LESION_FOUND = 1e-4                  # a lesion class counts as found when it covers at least 0.01 % of the frame
+RELIABILITY_PATH = os.path.join(HERE, "demo_reliability_v1.json")
+
+
+def reliability(quality_label, seed_grades, tta_grade_changes, entropy, calibration):
+    """The demonstration's reliability statement: "review recommended" when any of four checks fails -- Stage 1
+    rated the image Reject, the three seeds give different grades, a flip / rotation changes a seed's grade, or the
+    ensemble entropy is above the validation threshold (the 20 % least certain validation images). Returns
+    (review: bool, reasons: list of str, rates: the validation exact / within-one rates of this certainty band)."""
+    reasons = []
+    if quality_label == "Reject":
+        reasons.append("Stage 1 rated the image quality Reject")
+    if len(set(seed_grades)) > 1:
+        reasons.append(f"the three models give different grades {list(seed_grades)}")
+    if tta_grade_changes:
+        reasons.append("flipping or rotating the image changes the grade of at least one model")
+    certain = entropy <= calibration["entropy_threshold"]
+    if not certain:
+        reasons.append(f"the ensemble is less certain (entropy {entropy:.2f}) than {100 * calibration['coverage']:.0f} % of the validation images")
+    return bool(reasons), reasons, calibration["certain" if certain else "uncertain"]
+
+
+def map_on_lesions(heat, lesion_mask, top_fraction=0.1):
+    """The share of the map's most influential `top_fraction` of pixels that falls on Stage-4 lesions, and the lesion
+    share of the frame (what a map with no relation to the lesions would give)."""
+    heat, mask = np.asarray(heat, np.float64), np.asarray(lesion_mask, bool)
+    k = max(1, int(round(top_fraction * heat.size)))
+    top = np.argsort(heat, axis=None, kind="stable")[-k:]
+    return float(mask.reshape(-1)[top].mean()), float(mask.mean())
+
+
+def written_summary(grade, probabilities, lesion_area, overlaps, review, reasons, rates, calibration_note):
+    """Plain-language lines for the final stage, built only from this image's outputs and the validation rates."""
+    lines = [f"<b>Grade {grade} - {GRADES[grade]}</b> ({ICDR[grade]}). The ensemble gives this grade a probability of "
+             f"{100 * probabilities[grade]:.0f} %" + ("" if grade == 0 and probabilities[0] > 0.5 else
+                                                     f"; referable (grade 2 or worse): {'yes' if grade >= 2 else 'no'}") + "."]
+    found = {k: v for k, v in lesion_area.items() if v >= LESION_FOUND}
+    if found:
+        lines.append("Stage 4 marks " + ", ".join(f"{LESION_NAMES[k]} ({100 * v:.2f} % of the frame)" for k, v in
+                                                 sorted(found.items(), key=lambda kv: -kv[1])) + ".")
+    else:
+        lines.append("Stage 4 marks no lesions.")
+    if grade >= 2 and not found:
+        lines.append("The grade and the lesion maps disagree (a referable grade with no marked lesion): worth a closer look.")
+    if grade == 0 and found and sum(found.values()) >= 10 * LESION_FOUND:
+        lines.append("The grade and the lesion maps disagree (grade 0 with marked lesions): worth a closer look.")
+    for name, (on, chance) in overlaps.items():
+        lines.append(f"{name}: {100 * on:.0f} % of its most influential area lies on Stage-4 lesions "
+                     f"(a map unrelated to the lesions would give about {100 * chance:.1f} %).")
+    lines.append(("<b>Review recommended</b>: " + "; ".join(reasons) + "." if review else
+                  "<b>No reliability flag</b>: image quality acceptable, the three models agree, the grade is stable under "
+                  "flips and rotations, and the certainty is in the upper 80 % of the validation images."))
+    lines.append(f"On validation images in this certainty band the grade was exact in {100 * rates['exact']:.0f} % and within one "
+                 f"grade in {100 * rates['within_one']:.0f} % ({rates['images']} images; {calibration_note}).")
+    lines.append("The grade comes from the RGB grader alone; the lesion maps and explanation maps are supporting views, "
+                 "and overlap with lesions does not show that the grader detected them.")
+    return lines
+
+
 # --------------------------------------------------------------------------- models (loaded once, hash-checked)
 
 class Engine:
@@ -103,6 +171,8 @@ class Engine:
             {"stage3_lwnet": local(parent["checkpoints"]["stage3_lwnet"]), "stage4_unet": local(parent["checkpoints"]["stage4_unet"])}, self.settings)
         log("loading Stage 1 (image quality) ...")
         self.iqa = iqa.load_iqa_model(os.path.join(MODEL_ROOT, "exported_models", "IQA", "best_model.keras"))
+        with open(RELIABILITY_PATH, encoding="utf-8") as fh:
+            self.reliability = json.load(fh)
         self._local, self._protocol = local, protocol
         self._arrays = pl.load_reference(local(parent["checkpoints"]["convnext_pretrained"]))[1]
         self.arm, self.graders = None, {}
@@ -209,6 +279,11 @@ def run_pipeline(engine, image_path, arm, explanations, emit, reference=None):
 
     titles = {"grad_cam": "Grad-CAM (3 seeds)","integrated_gradients": "Integrated Gradients (seed 42, 16 steps)",
               "occlusion": "Occlusion sensitivity (seed 42, 64-pixel patches)"}
+    names = {"grad_cam": "Grad-CAM", "integrated_gradients": "Integrated Gradients", "occlusion": "Occlusion"}
+    lesions_native = cv2.resize((lesion_max > 0.5).any(axis=-1).astype(np.uint8), (native.shape[1], native.shape[0]),
+                                interpolation=cv2.INTER_NEAREST)
+    lesions_frame = explain.frame_mask(lesions_native, None if arm == "direct" else box)   # Stage-4 lesions in the grader's frame
+    overlaps = {}
     for k, name in enumerate(explanations):
         t = time.time()
         if name == "grad_cam":
@@ -219,9 +294,17 @@ def run_pipeline(engine, image_path, arm, explanations, emit, reference=None):
             heat = explain.occlusion(fns[0], frame, patch=64, stride=64)[1]
         else:
             continue
+        overlaps[names[name]] = map_on_lesions(heat, lesions_frame)
         stage(8 + k / 10, f"Why this grade - {titles[name]}",
               "Where the model's expected grade is most sensitive (red = high). This shows sensitivity, not that the model detected lesions.",
               [{"caption": titles[name], "png": png(gradcam.overlay(frame, heat), size=420)}, {"caption": "map", "png": png(heat, "inferno", size=200)}], t)
+
+    t = time.time()
+    calibration = engine.reliability["arms"][arm]
+    review, reasons, rates = reliability(q["label"], seeds, tta_change, float(e["entropy"][0]), calibration)
+    lines = written_summary(grade, [float(p) for p in probs], burden, overlaps, review, reasons, rates, engine.reliability["note"])
+    stage(9, "Summary - written explanation and reliability", "<br>".join(lines), [], t,
+          {"review_recommended": review, "reasons": reasons, "validation_rates": rates, "map_on_lesions": overlaps})
     emit({"number": 99, "title": "Done", "text": NOTICE, "images": [], "seconds": None, "data": {}})
 
 
