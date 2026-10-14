@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import cv2
 import os
@@ -73,7 +74,7 @@ def create_gradcam_overlay(img_path, heatmap, alpha=0.4):
     img = np.expand_dims(img, axis=-1)
     img = np.concatenate([img, img, img], axis=-1)
     heatmap = np.uint8(255 * heatmap)
-    jet = plt.cm.get_cmap("jet")
+    jet = matplotlib.colormaps["jet"]
     jet_colors = jet(np.arange(256))[:, :3]
     jet_heatmap = jet_colors[heatmap]
     jet_heatmap = jet_heatmap * 255

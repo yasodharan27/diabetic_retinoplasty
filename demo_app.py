@@ -55,11 +55,10 @@ def png(array, cmap=None, vmin=0.0, vmax=1.0, size=None):
     """A base64 PNG of an image (H, W, 3 in [0, 1] or uint8) or a map (H, W) through a colormap."""
     import matplotlib
     matplotlib.use("Agg")
-    from matplotlib import cm
     from PIL import Image
     a = np.asarray(array)
     if a.ndim == 2:
-        a = cm.get_cmap(cmap or "inferno")(np.clip((a.astype(np.float64) - vmin) / max(vmax - vmin, 1e-12), 0, 1))[..., :3]
+        a = matplotlib.colormaps[cmap or "inferno"](np.clip((a.astype(np.float64) - vmin) / max(vmax - vmin, 1e-12), 0, 1))[..., :3]
     if a.dtype != np.uint8:
         a = (np.clip(a, 0, 1) * 255).astype(np.uint8)
     im = Image.fromarray(a)
