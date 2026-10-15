@@ -5995,3 +5995,29 @@ Median per-image lift of the top-10 % precision over the image's lesion share: G
 ### 100.3 Correction of two rounded values in section 100 (2026-10-15)
 
 Read back from the result JSONs (`result_primary_3540.json`, `result_primary_100.json`), the authoritative values are: **IDRiD primary, J: mean QWK 0.703** (0.70347; the table of section 100 gave 0.704), and **DDR primary, J-crop − J: +0.011 (+0.003 … +0.019)** (interval +0.0026 … +0.0195; the table gave an upper bound of +0.020). Nothing else in section 100 changes: the per-seed values, the contrasts, the readings and the post hoc qualification (section 100.1) are as written. Use 0.703 and +0.019 wherever those two values are quoted.
+
+## 102. Demonstration: written explanation and reliability statement (commits `a1789c1`, `c0478c1`; checked 2026-10-15)
+
+**What it is.** A final stage of the local demonstration (`demo_app.py`), "Summary - written explanation and reliability", built only from the image's own outputs. It is a demonstration feature, not an evaluated method.
+
+- **Written summary.** The grade with its ICDR wording (Wilkinson et al., Ophthalmology 2003) and the ensemble probability; referable yes / no; the Stage-4 lesion classes found (a class counts at ≥ 0.01 % of the frame), largest first; for each explanation map shown, the share of its top 10 % pixels that lie on Stage-4 lesions beside the chance share (the lesion share of the frame); a "worth a closer look" note when grade and lesion maps disagree (a referable grade with no marked lesion, or grade 0 with ≥ 0.1 % marked). The overlap uses the Stage-4 model's maps, not expert masks, and does not show lesion detection.
+- **Reliability.** "Review recommended" when any check fails: Stage 1 rates the image Reject; the three seeds give different grades; a flip or rotation (8 dihedral views) changes a seed's grade; the ensemble entropy exceeds the threshold of the 20 % least certain validation images. Otherwise "No reliability flag".
+- **Threshold and quoted rates** (`uncertainty_eval.reliability_calibration`, `demo_reliability_v1.json`), from the stored per-image validation ensemble tables, APTOS validation 730 + EyePACS validation 3,512 = 4,242 images per arm, entropy threshold = 80th percentile:
+
+| arm | threshold | certain band | uncertain band |
+|---|---|---|---|
+| J-crop | 0.704 | 3,393 images: exact 92.1 %, within one grade 97.9 % | 849 images: exact 62.0 %, within one 90.7 % |
+| J | 0.732 | 3,393 images: exact 91.5 %, within one 97.7 % | 849 images: exact 60.8 %, within one 88.3 % |
+
+- **Qualifications.** These validation sets also selected the checkpoints, so the rates are optimistic for new images; images from other cameras or clinics can be less reliable (a sentence added in `c0478c1` after an IDRiD image was graded 2 with probability 0.96 against a reference of 0). The rule was designed after the results and was not evaluated on a test set; it is a wording aid, not a validated reliability method. The quoted rate belongs to the entropy band only: an image can sit in the certain band and still be flagged by the seed or flip checks (the APTOS example below).
+
+**Checks.** `tests/test_demo_app.py`: 9 pass (4 new: the reliability checks, the overlap measure, the written summary, and that the calibration file equals the validation tables it came from). End-to-end on real models (cropped arm, CPU, Grad-CAM and Occlusion, one process, 169 – 201 s per image):
+
+| image | reference | grade (probability) | seeds | flag | Grad-CAM overlap (chance) |
+|---|---|---|---|---|---|
+| IDRiD_001 (IDRiD training set) | 3 | 3 (0.48) | – | review: flip / rotation changes a grade; entropy 1.04 above the threshold | 10 % (6.9 %) |
+| APTOS validation 032d7b0b4bf6 | 2 | 2 (0.76) | 2 / 4 / 2 | review: seeds differ; flip / rotation changes a grade | 3 % (0.6 %) |
+
+The same logic was ported independently to the public repository and reproduced these summaries (its Phase 2b report: IDRiD_001 identical).
+
+**Status.** Demonstration only; nothing in sections 93 – 101 changes.
