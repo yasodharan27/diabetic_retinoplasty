@@ -84,7 +84,7 @@ def lesion_overlay(rgb, lesion_max):
 #: ICDR severity scale (Wilkinson et al., Ophthalmology 2003), as wording for the predicted grade.
 ICDR = ("no apparent retinopathy",
         "microaneurysms only",
-        "more than microaneurysms only, but less than severe non-proliferative DR",
+        "signs beyond the first microaneurysms, such as haemorrhages or hard exudates, but not yet severe",
         "severe non-proliferative DR: many intraretinal haemorrhages in all four quadrants, venous beading, or "
         "intraretinal microvascular abnormalities, without signs of proliferation",
         "proliferative DR: neovascularisation, or vitreous / preretinal haemorrhage")
@@ -140,8 +140,12 @@ def written_summary(grade, probabilities, lesion_area, overlaps, review, reasons
     lines.append(("<b>Review recommended</b>: " + "; ".join(reasons) + "." if review else
                   "<b>No reliability flag</b>: image quality acceptable, the three models agree, the grade is stable under "
                   "flips and rotations, and the certainty is in the upper 80 % of the validation images."))
-    lines.append(f"On validation images in this certainty band the grade was exact in {100 * rates['exact']:.0f} % and within one "
-                 f"grade in {100 * rates['within_one']:.0f} % ({rates['images']} images; {calibration_note}). "
+    band = (f"Its certainty band alone (not the flags above): on validation images in this band the grade was exact in "
+            f"{100 * rates['exact']:.0f} % and within one grade in {100 * rates['within_one']:.0f} % "
+            if review else
+            f"On validation images in this certainty band the grade was exact in {100 * rates['exact']:.0f} % and within one "
+            f"grade in {100 * rates['within_one']:.0f} % ")
+    lines.append(f"{band}({rates['images']} images; {calibration_note}). "
                  "Images from other cameras or clinics than the APTOS and EyePACS validation sets can be less reliable than this.")
     lines.append("The grade comes from the RGB grader alone; the lesion maps and explanation maps are supporting views, "
                  "and overlap with lesions does not show that the grader detected them.")

@@ -66,7 +66,7 @@ class HelperTests(unittest.TestCase):
         text = " ".join(lines)
         self.assertIn("Grade 2 - Moderate NPDR", text)
         self.assertIn("76 %", text)
-        self.assertLess(text.index("hard exudates"), text.index("haemorrhages"))   # largest area first
+        self.assertLess(text.index("Stage 4 marks hard exudates"), text.index("haemorrhages (0"))   # largest area first
         self.assertNotIn("microaneurysms (", text)                       # not found -> not listed
         self.assertIn("35 % of its most influential area", text)
         self.assertIn("No reliability flag", text)
