@@ -5996,7 +5996,7 @@ Median per-image lift of the top-10 % precision over the image's lesion share: G
 
 Read back from the result JSONs (`result_primary_3540.json`, `result_primary_100.json`), the authoritative values are: **IDRiD primary, J: mean QWK 0.703** (0.70347; the table of section 100 gave 0.704), and **DDR primary, J-crop − J: +0.011 (+0.003 … +0.019)** (interval +0.0026 … +0.0195; the table gave an upper bound of +0.020). Nothing else in section 100 changes: the per-seed values, the contrasts, the readings and the post hoc qualification (section 100.1) are as written. Use 0.703 and +0.019 wherever those two values are quoted.
 
-## 102. Demonstration: written explanation and reliability statement (commits `a1789c1`, `c0478c1`; checked 2026-10-15)
+## 102. Demonstration: written explanation and reliability statement (commits `e86ad93`, `9051ca1`; checked 2026-10-15; the two commits were re-stamped with the GitHub noreply address before the push, so they were `a1789c1` and `c0478c1` locally and in earlier notes)
 
 **What it is.** A final stage of the local demonstration (`demo_app.py`), "Summary - written explanation and reliability", built only from the image's own outputs. It is a demonstration feature, not an evaluated method.
 
