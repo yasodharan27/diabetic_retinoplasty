@@ -5991,3 +5991,7 @@ Median per-image lift of the top-10 % precision over the image's lesion share: G
 4. **SHAP figures** (APTOS validation, one image each of grades 1 – 4; three-seed mean; 50 superpixels, 512 samples): illustrative only. In the one figure inspected for this record (`0104b032c141`, grade 3), superpixels over the exudate area both raise and lower the expected grade, the optic disc lowers it strongly in the direct frame, and the direct and cropped maps of the same image differ visibly, as expected for a coarse sampled estimate (§100.2). The figures are not summarised quantitatively.
 
 **Status.** The explanation analysis is complete. Remaining for the project: the paper (and, later, packaging of the demonstration).
+
+### 100.3 Correction of two rounded values in section 100 (2026-10-15)
+
+Read back from the result JSONs (`result_primary_3540.json`, `result_primary_100.json`), the authoritative values are: **IDRiD primary, J: mean QWK 0.703** (0.70347; the table of section 100 gave 0.704), and **DDR primary, J-crop − J: +0.011 (+0.003 … +0.019)** (interval +0.0026 … +0.0195; the table gave an upper bound of +0.020). Nothing else in section 100 changes: the per-seed values, the contrasts, the readings and the post hoc qualification (section 100.1) are as written. Use 0.703 and +0.019 wherever those two values are quoted.

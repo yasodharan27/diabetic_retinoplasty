@@ -68,11 +68,11 @@ bootstrap (2,000 resamples). P is the earlier APTOS-only ConvNeXt-Tiny + CORN gr
 |---|---|---|
 | P | 0.509 | 0.642 |
 | P-EP | 0.593 | 0.738 |
-| J | 0.800 | 0.704 |
+| J | 0.800 | 0.703 |
 | **J-crop** | **0.811** | **0.788** |
 | J − P | +0.290 (+0.270 … +0.311) | +0.062 (−0.004 … +0.129) |
 | J-crop − P | +0.301 (+0.281 … +0.323) | +0.146 (+0.078 … +0.223) |
-| J-crop − J | +0.011 (+0.003 … +0.020) | +0.084 (+0.037 … +0.141) |
+| J-crop − J | +0.011 (+0.003 … +0.019) | +0.084 (+0.037 … +0.141) |
 
 On DDR, referable-DR sensitivity at the fixed decoding rises from 0.31 (P) to 0.70–0.71 at specificity
 0.985–0.988, and the calibration error falls from 0.35 to 0.06–0.07.
